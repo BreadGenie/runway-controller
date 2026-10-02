@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 GUEST_PROGRAM = r'''
-import json, os, subprocess, sys
+import json, os, shutil, stat, subprocess, sys
 from datetime import UTC, datetime
 from pathlib import Path
 payload = json.load(sys.stdin)
@@ -20,6 +20,11 @@ action = payload['action']
 name = payload['runner_name']
 marker = Path('/var/lib/runway/bootstrap.json')
 runner = Path('/home/runner/actions-runner')
+sudoers = Path('/etc/sudoers.d/runway-runner')
+sudoers_rule = 'runner ALL=(ALL) NOPASSWD: ALL\n'
+# Absolute lookup: a non-interactive ssh command inherits no operator PATH, and
+# preparation must not depend on one.
+root_path = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 def call(argv):
     return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
 def state():
@@ -38,8 +43,73 @@ def state():
     if (runner / '.runner').exists() or not (runner / 'bin/Runner.Listener').is_file():
         return 'unknown'
     return 'installed' if call(['runuser', '-u', 'runner', '--', 'docker', 'info']).returncode == 0 else 'unknown'
+def grant_runner_sudo():
+    """Give a fresh disposable guest's runner account passwordless sudo, opt-in only.
+
+    Nothing is installed or downloaded: the baked image must already carry sudo(8) and
+    visudo(8), so an image without them fails preparation instead of being mutated.
+    """
+    sudo = shutil.which('sudo', path=root_path)
+    visudo = shutil.which('visudo', path=root_path)
+    if sudo is None or visudo is None:
+        return False
+    try:
+        recorded = os.lstat(sudoers)
+    except FileNotFoundError:
+        recorded = None
+    except OSError:
+        return False
+    if recorded is None:
+        try:
+            directory = os.lstat(sudoers.parent)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(directory.st_mode):
+            return False
+        try:
+            # O_EXCL|O_NOFOLLOW creates a fresh regular file: never write through a
+            # symlink, never truncate, and never reuse a file another account planted.
+            handle = os.open(sudoers, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o440)
+        except OSError:
+            return False
+        with os.fdopen(handle, 'w') as stream:
+            # open() applies the umask; set the exact mode and owner sudo(8) requires.
+            os.fchmod(stream.fileno(), 0o440)
+            os.fchown(stream.fileno(), 0, 0)
+            stream.write(sudoers_rule)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            recorded = os.lstat(sudoers)
+        except OSError:
+            return False
+    elif not stat.S_ISREG(recorded.st_mode):
+        # A symlink, directory or device is refused rather than read: lstat never
+        # followed it here, and sudo(8) would.
+        return False
+    # sudo(8) skips a drop-in that group or world can write, not one it can read, so the
+    # conventional root-owned 0440 mode is correct here; refuse any extra bit and any
+    # owner but root. A re-prepared guest re-validates the identical rule instead of
+    # rewriting a foreign one.
+    if recorded.st_mode & 0o7777 != 0o440 or recorded.st_uid != 0:
+        return False
+    try:
+        if sudoers.read_text() != sudoers_rule:
+            return False
+    except OSError:
+        return False
+    if call([visudo, '-c', '-f', str(sudoers)]).returncode != 0:
+        return False
+    # Prove the effective rule, not just the file: sudo must succeed with no password.
+    return call(['runuser', '-u', 'runner', '--', sudo, '-n', 'true']).returncode == 0
 if action in ('status', 'prepare'):
     current = state()
+    if action == 'prepare' and current == 'installed' and payload.get('allow_guest_sudo'):
+        # Operator opt-in, and only while this is an unregistered fresh clone: the
+        # resulting root is the disposable Firecracker guest's, never Metal's.
+        if not grant_runner_sudo():
+            print(json.dumps({'state': 'unknown'}))
+            sys.exit(1)
     print(json.dumps({'state': current}))
     sys.exit(0 if action == 'status' or current == 'installed' else 1)
 if action == 'collect':
@@ -112,6 +182,12 @@ def main() -> int:
     parser.add_argument('--key-file', required=True, help='Guest administrative key on Metal')
     parser.add_argument('--known-hosts', required=True, help='Dedicated per-VM known-hosts prefix on Metal')
     parser.add_argument('action', choices=('prepare', 'status', 'bootstrap', 'collect', 'stop'))
+    # Explicit operator opt-in, applied by the guest program during prepare only, and
+    # only on an unregistered fresh clone. The passwordless sudo it grants is the
+    # disposable Firecracker guest's own root: it reaches no Metal host path, no
+    # network namespace and no control-plane or GitHub credential.
+    parser.add_argument('--allow-guest-sudo', action='store_true',
+                        help='Give a fresh guest runner account passwordless sudo inside that guest')
     parser.add_argument('--vm-id', required=True)
     parser.add_argument('--runner-name', required=True)
     parser.add_argument('--deadline', help='Absolute RFC3339 deadline for bootstrap')
@@ -139,7 +215,7 @@ def main() -> int:
         parser.error('Expected one JIT configuration on stdin')
     payload = dict(action=args.action, runner_name=args.runner_name, vm_id=args.vm_id,
                    key_file=args.key_file, known_hosts=args.known_hosts + '-' + args.vm_id,
-                   guest_program=GUEST_PROGRAM)
+                   allow_guest_sudo=args.allow_guest_sudo, guest_program=GUEST_PROGRAM)
     if args.deadline:
         payload['deadline'] = args.deadline
     if args.action == 'bootstrap':
