@@ -44,6 +44,40 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(transport.main(), 1)
             self.assertEqual(json.loads(output.getvalue()), {'state': 'unknown'})
 
+    def test_outer_ssh_refuses_agent_forwarding_to_metal(self):
+        with (patch.object(transport.sys, 'argv', self.arguments('status')),
+              patch.object(transport.sys, 'stdout', io.StringIO()),
+              patch.object(transport.subprocess, 'run') as run):
+            run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+            self.assertEqual(transport.main(), 0)
+            argv = run.call_args.args[0]
+            # Command-line -o is parsed before ~/.ssh/config, so the operator's own
+            # ForwardAgent yes cannot enable forwarding across this hop.
+            self.assertEqual(argv[argv.index('ForwardAgent=no') - 1], '-o')
+            self.assertNotIn('ForwardAgent=yes', argv)
+
+    def test_host_program_ssh_pins_guest_key_and_blocks_forwarded_agent(self):
+        request = {'vm_id': 'vm-123', 'key_file': '/keys/admin',
+                   'known_hosts': '/keys/known-vm-123', 'guest_program': transport.GUEST_PROGRAM}
+        with (patch.object(transport.sys, 'stdin', io.StringIO(json.dumps(request))),
+              patch.object(transport.sys, 'stdout', io.StringIO()) as output,
+              patch.object(transport.subprocess, 'run') as run):
+            run.return_value = subprocess.CompletedProcess([], 0, '{"state":"running"}')
+            with self.assertRaises(SystemExit) as stopped:
+                exec(transport.HOST_PROGRAM, {})
+            self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(output.getvalue(), '{"state":"running"}')
+            argv = run.call_args.args[0]
+            # The netns and destination are unchanged; only agent trust is tightened.
+            self.assertEqual(argv[:5], ['ip', 'netns', 'exec', 'metal-vm-123', 'ssh'])
+            self.assertEqual(argv[argv.index('-i') + 1], '/keys/admin')
+            self.assertEqual(argv[argv.index('UserKnownHostsFile=/keys/known-vm-123') - 1], '-o')
+            self.assertIn('root@172.16.0.2', argv)
+            for option in ('ForwardAgent=no', 'IdentitiesOnly=yes'):
+                self.assertEqual(argv[argv.index(option) - 1], '-o', option)
+            self.assertNotIn('ForwardAgent=yes', argv)
+            self.assertNotIn('IdentitiesOnly=no', argv)
+
     def test_guest_marker_without_started_service_is_not_completed(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / 'bootstrap.json'

@@ -693,10 +693,10 @@ index 0000000..1497f64
 +};
 diff --git a/central/infrastructure/runway.py b/central/infrastructure/runway.py
 new file mode 100644
-index 0000000..9997153
+index 0000000..5ba74dc
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,263 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -954,7 +954,10 @@ index 0000000..9997153
 +			if lease.get(field) and str(lease.get(field)) != str(value):
 +				frappe.throw(_("Runner job identity changed within a lease."))
 +			lease.set(field, value)
-+	lease.last_error = str(error)[:1000]
++	# The lease is a durable audit record. An event that carries no new error must keep the
++	# recorded retirement reason or the failure to collect job diagnostics.
++	if error:
++		lease.last_error = str(error)[:1000]
 +	save_internal(lease)
 +	return lease_snapshot(lease)
 diff --git a/central/integrations/runway.py b/central/integrations/runway.py
@@ -1177,10 +1180,10 @@ index ae9cdee..0af37f5 100644
 +	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
 diff --git a/central/tests/test_runway.py b/central/tests/test_runway.py
 new file mode 100644
-index 0000000..40d5d94
+index 0000000..0c56a68
 --- /dev/null
 +++ b/central/tests/test_runway.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,317 @@
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
 +from types import SimpleNamespace
@@ -1419,6 +1422,55 @@ index 0000000..40d5d94
 +		with patch.object(regional, "client_for_pool", return_value=client):
 +			regional.reconcile_lease(self.pool, lease["id"])
 +		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "jit_state"), "removed")
++
++	def test_retirement_reason_survives_runner_removed_and_cleanup(self):
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], {"vm_id": "vm-42", "phase": "running"})
++		frappe.db.commit()
++		reason = "JIT registration outcome uncertain; registration requires cleanup"
++		retirement = runway.update_lease(
++			self.pool.name, self.owner, self.fence, lease["id"], "failed", error=reason
++		)
++		self.assertEqual(retirement["phase"], "deleting")
++		self.assertEqual(retirement["last_error"], reason)
++		client = Mock()
++		client.get_vm.return_value = {"current_state": "running", "network": {}}
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.reconcile_lease(self.pool, lease["id"])
++			client.get_vm.side_effect = AtlasResourceGone("scoped 404")
++			regional.reconcile_lease(self.pool, lease["id"])
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "phase"), "deleted")
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "last_error"), reason)
++		removed = runway.update_lease(self.pool.name, self.owner, self.fence, lease["id"], "runner_removed")
++		self.assertEqual(removed["jit_state"], "removed")
++		self.assertEqual(removed["last_error"], reason)
++
++	def test_completion_diagnostic_failure_survives_runner_removed(self):
++		lease = self.reserve()
++		reason = "Job log upload failed; diagnostics are incomplete"
++		completed = runway.update_lease(
++			self.pool.name,
++			self.owner,
++			self.fence,
++			lease["id"],
++			"completed",
++			result="success",
++			error=reason,
++		)
++		self.assertEqual(completed["last_error"], reason)
++		removed = runway.update_lease(self.pool.name, self.owner, self.fence, lease["id"], "runner_removed")
++		self.assertEqual(removed["jit_state"], "removed")
++		self.assertEqual(removed["last_error"], reason)
++		# A later error is new evidence, so it replaces the stored diagnostic failure.
++		replaced = runway.update_lease(
++			self.pool.name,
++			self.owner,
++			self.fence,
++			lease["id"],
++			"failed",
++			error="Runner cleanup verification timed out",
++		)
++		self.assertEqual(replaced["last_error"], "Runner cleanup verification timed out")
 +
 +	def test_unknown_create_cannot_be_declared_deleted(self):
 +		lease = self.reserve()

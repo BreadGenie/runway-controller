@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -84,6 +85,31 @@ type centralRPC struct {
 	http                                      *http.Client
 }
 
+// Every call carries the pool's API credentials, so TLS is required unless
+// the endpoint is an exact loopback host used by local testing and tunnels.
+// Names and addresses that only resemble loopback are not loopback.
+func validateCentralEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return errors.New("central_url must be an endpoint without credentials, query or fragment")
+	}
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return errors.New("central_url must not target an unspecified address")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return errors.New("central_url requires HTTPS unless it is localhost, 127.0.0.1 or [::1]")
+	default:
+		return errors.New("central_url must be an HTTP(S) endpoint")
+	}
+}
+
 func loadControllerConfig(path string) (controllerConfig, error) {
 	var cfg controllerConfig
 	data, err := os.ReadFile(path)
@@ -95,9 +121,8 @@ func loadControllerConfig(path string) (controllerConfig, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return cfg, errors.New("invalid controller configuration")
 	}
-	u, err := url.Parse(cfg.CentralURL)
-	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
-		return cfg, errors.New("central_url must be an HTTP(S) endpoint without credentials or query")
+	if err := validateCentralEndpoint(cfg.CentralURL); err != nil {
+		return cfg, err
 	}
 	if cfg.Pool == "" || cfg.CredentialFile == "" || len(cfg.TransportCommand) == 0 || cfg.TransportCommand[0] == "" {
 		return cfg, errors.New("controller requires pool, central_credential_file and transport_command")
@@ -112,6 +137,11 @@ func loadControllerConfig(path string) (controllerConfig, error) {
 }
 
 func newCentralRPC(cfg controllerConfig) (*centralRPC, error) {
+	// Re-check here so no caller can attach the token to an endpoint the
+	// configuration loader would have refused.
+	if err := validateCentralEndpoint(cfg.CentralURL); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(cfg.CredentialFile)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("Central credential must be a private regular file")

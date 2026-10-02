@@ -89,8 +89,12 @@ sys.exit(started.returncode)
 HOST_PROGRAM = r'''
 import json, shlex, subprocess, sys
 payload = json.load(sys.stdin)
+# Trust boundary: the guest is reachable only with the pool-pinned administrative key.
+# ForwardAgent=no keeps any agent offered by Metal's user ssh config out of the guest,
+# and IdentitiesOnly=yes stops that agent's or Metal's default keys authenticating here.
 command = ['ip', 'netns', 'exec', 'metal-' + payload['vm_id'], 'ssh',
-           '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+           '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no', '-o', 'IdentitiesOnly=yes',
+           '-o', 'StrictHostKeyChecking=accept-new',
            '-o', 'ConnectTimeout=10', '-o', 'UserKnownHostsFile=' + payload['known_hosts'],
            '-i', payload['key_file'], 'root@172.16.0.2',
            shlex.join(['python3', '-c', payload.pop('guest_program')])]
@@ -141,7 +145,11 @@ def main() -> int:
     if args.action == 'bootstrap':
         payload.update(jit=secret, wrapper=(Path(__file__).resolve().parents[1] / 'guest/guest-runner.sh').read_text())
     try:
-        result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+        # Trust boundary: the operator's agent authenticates us to Metal, but must never
+        # reach it. Command-line -o is read before ~/.ssh/config and wins, so an operator
+        # ForwardAgent yes cannot carry the agent across this hop.
+        result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no',
+                                 '-o', 'ConnectTimeout=10',
                                  args.host, shlex.join(['python3', '-c', HOST_PROGRAM])],
                                 input=json.dumps(payload), text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, timeout=75)

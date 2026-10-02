@@ -71,6 +71,14 @@ Create a private configuration file using deployment-specific absolute paths:
 
 `key-file` and `known-hosts` are paths on Metal; `diagnostics-dir` is local to the controller. Known-host files are separated by VM ID. The transport requires Python 3 on the controller, Metal and guest, plus working SSH and `ip netns` on Metal. Keep configuration and diagnostic directories private. Diagnostics can contain workflow output and must be handled as sensitive logs.
 
+`central_url` must use `https`: every call sends the service user's `api_key:api_secret` in an `Authorization` header, so plaintext HTTP is refused except for a literal `localhost`, `127.0.0.1` or `[::1]` endpoint. Hosts are matched after parsing, so lookalikes such as `localhost.example.com` and `127.0.0.1.example.com` are refused, as are userinfo, query strings, fragments and unspecified addresses like `0.0.0.0` and `[::]`. Central must not redirect to another host; a redirect is reported as a rejected call. To test against a remote Central, forward a port to a loopback backend on the Central host and point `central_url` at it:
+
+```sh
+ssh -N -L 127.0.0.1:8003:127.0.0.1:8000 operator@central.example.com
+```
+
+Set `"central_url": "http://127.0.0.1:8003"` and, when the backend routes by virtual host, `"central_host": "central.example.com"` to match the configured site. Never forward to a non-loopback backend port.
+
 The controller uses the same GitHub authentication as the other CLI commands: the current `gh` credential, or `RUNWAY_GITHUB_APP_CLIENT_ID`, `RUNWAY_GITHUB_APP_INSTALLATION_ID`, and `RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE`. GitHub App and Central credentials remain outside guests. JIT material travels through stdin to the guest and is consumed by its runner wrapper.
 
 ```sh
