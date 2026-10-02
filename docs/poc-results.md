@@ -1,6 +1,6 @@
 # Proof of concept results
 
-On 2026-10-02, two real GitHub workflows passed on separate fresh Atlas/Firecracker VMs. Each exercised a Docker Redis service and a Python Redis protocol probe. The final listener replay persisted successful completion before acknowledging GitHub. All trial VMs, GitHub runners, and the temporary scale set were removed.
+In the initial execution experiment on 2026-10-02, two real GitHub workflows passed on separate fresh Atlas/Firecracker VMs. Each exercised a Docker Redis service and a Python Redis protocol probe. The final listener replay persisted successful completion before acknowledging GitHub. All trial VMs, GitHub runners, and the temporary scale set were removed.
 
 The evidence below comes from a private scratch repository. Links require access; it was not a migration of a Frappe-owned CI workflow.
 
@@ -26,6 +26,16 @@ Atlas cleanup initially needed scheduler registration repaired after an interrup
 
 Separate checks confirmed zero remaining GitHub runners, scale-set absence, and no trial Metal guest namespaces or VM datasets. Earlier infrastructure checks also verified SSH, outbound HTTPS, daemon restart survival, VM reboot, and persistent guest disk data.
 
+## Durable pilot restart
+
+The [durable controller run](https://github.com/BreadGenie/fc-ci-dogfood-spike/actions/runs/36980664391) passed using a baked runner image. The controller was killed with `SIGKILL` during a two-minute workflow step, then restarted with the same pool owner identity. Central incremented the ownership fence, and the controller resumed the existing lease and VM without a second reservation or JIT registration.
+
+The stale GitHub message session briefly prevented reconnecting. Retrying recovered in about a minute in this trial; this is an observation, not a documented expiration guarantee. The job completed successfully, Central persisted `success`, the GitHub registration was removed, and the VM reached `deleted`. No trial guest namespace remained. A bounded guest journal was collected into a private file before deletion.
+
+The image was built from a fresh, never-registered guest and separately verified before this run. Boot required no package installation. The published raw image is 4 GiB, with SHA256 `59def4967c665821432a612beb679f7543d984a9b4677e343972908ef1b53a50`.
+
+With the controller stopped, a separate VM lease was reserved through the authenticated Central API with a 60-second deadline and no GitHub registration. Central's scheduled reaper advanced it from `vm_ready` to `deleted`, marked registration state `removed`, and left no guest namespace. No manual reconciliation call was used. The pool was then paused and the dedicated scale set removed; GitHub reported zero runners.
+
 ## Artifact provenance
 
 | Input | Revision or digest |
@@ -42,6 +52,6 @@ The recorded kernel was built with GCC 15.2.0 using explicit GNU11 mode. Binary 
 
 ## Limits
 
-VM creation, guest preparation, registration, and cleanup were coordinated by an operator. The listener's local journal is not a durable multi-worker controller. Unit tests cover explicit acquisition and failure boundaries; the live runs used direct assignment.
+The earlier experiments used operator orchestration and a local listener journal. The durable pilot now uses Central-backed leases and automatic lifecycle orchestration, with one live controller crash/restart trial. Unit tests cover explicit acquisition and failure boundaries; the live runs used direct assignment. This is not fleet-scale or exhaustive outage evidence.
 
 The experiment did not validate tenant egress isolation for untrusted jobs, fork PRs, production billing, fleet scaling, shared caches, customer onboarding, PR previews, or deploy-on-push. Runtime credentials, raw runner diagnostics, and machine-specific configuration are excluded from this repository.
