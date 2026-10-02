@@ -1,0 +1,36 @@
+# Manual runner smoke test; copy into a dedicated test repository.
+name: Runway runner smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: runway-dogfood
+    timeout-minutes: 5
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Verify guest tools and service container
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          id
+          docker version
+          python3 --version
+          git --version
+          python3 - <<'PY'
+          import socket
+          with socket.create_connection(("127.0.0.1", 6379), timeout=10) as conn:
+              conn.sendall(b"*1\r\n$4\r\nPING\r\n")
+              assert conn.recv(1024) == b"+PONG\r\n"
+          PY

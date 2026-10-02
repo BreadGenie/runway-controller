@@ -1,0 +1,194 @@
+diff --git a/atlas/atlas/core/dns_providers/route53.py b/atlas/atlas/core/dns_providers/route53.py
+index ab4e143..8a9f8e6 100644
+--- a/atlas/atlas/core/dns_providers/route53.py
++++ b/atlas/atlas/core/dns_providers/route53.py
+@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, override
+ from uuid import uuid4
+ 
+ import boto3
++from botocore.client import BaseClient
+ from botocore.exceptions import BotoCoreError, ClientError
+ 
+ from atlas.atlas.core.dns_providers import register
+@@ -27,11 +28,17 @@ class Route53Provider(DnsProvider):
+ 	def __init__(self, settings: "AtlasSettings | None" = None) -> None:
+ 		super().__init__(settings)
+ 		self.domain_name = self.settings.wildcard_domain.removeprefix("*.")
+-		self.client = boto3.client(
+-			"route53",
+-			aws_access_key_id=self.settings.route53_access_key_id,
+-			aws_secret_access_key=self.settings.get_password("route53_access_key_secret"),
+-		)
++		self.client: BaseClient | None = None
++
++	def _get_client(self) -> BaseClient:
++		"""Connect to Route53 only when a DNS operation needs credentials."""
++		if self.client is None:
++			self.client = boto3.client(
++				"route53",
++				aws_access_key_id=self.settings.route53_access_key_id,
++				aws_secret_access_key=self.settings.get_password("route53_access_key_secret"),
++			)
++		return self.client
+ 
+ 	@override
+ 	def validate_settings(self) -> None:
+@@ -56,7 +63,7 @@ class Route53Provider(DnsProvider):
+ 	def validate_credentials(self) -> bool:
+ 		"""Return true when the configured credentials can list zones."""
+ 		try:
+-			self.client.list_hosted_zones(MaxItems="1")
++			self._get_client().list_hosted_zones(MaxItems="1")
+ 		except (BotoCoreError, ClientError) as error:
+ 			raise Route53Error(f"Unable to validate Route53 credentials: {error}") from error
+ 		return True
+@@ -64,7 +71,7 @@ class Route53Provider(DnsProvider):
+ 	def get_zone_id(self, domain: str) -> str | None:
+ 		"""Return the ID of an existing zone for the domain, or None."""
+ 		try:
+-			result = self.client.list_hosted_zones_by_name(DNSName=domain, MaxItems="1")
++			result = self._get_client().list_hosted_zones_by_name(DNSName=domain, MaxItems="1")
+ 		except (BotoCoreError, ClientError) as error:
+ 			raise Route53Error(f"Failed to list zones for {domain}: {error}") from error
+ 
+@@ -77,7 +84,7 @@ class Route53Provider(DnsProvider):
+ 	def find_public_zone_id(self, domain: str) -> str | None:
+ 		"""Return the ID of an existing public zone for the exact domain."""
+ 		try:
+-			result = self.client.list_hosted_zones_by_name(DNSName=domain, MaxItems="100")
++			result = self._get_client().list_hosted_zones_by_name(DNSName=domain, MaxItems="100")
+ 		except (BotoCoreError, ClientError) as error:
+ 			raise Route53Error(f"Failed to list zones for {domain}: {error}") from error
+ 
+@@ -101,7 +108,7 @@ class Route53Provider(DnsProvider):
+ 			return existing_zone_id
+ 
+ 		try:
+-			result = self.client.create_hosted_zone(Name=domain, CallerReference=str(uuid4()))
++			result = self._get_client().create_hosted_zone(Name=domain, CallerReference=str(uuid4()))
+ 		except (BotoCoreError, ClientError) as error:
+ 			raise Route53Error(f"Failed to create zone for {domain}: {error}") from error
+ 		return self._zone_id(result["HostedZone"]["Id"])
+@@ -124,7 +131,7 @@ class Route53Provider(DnsProvider):
+ 	def create_https_health_check(self, ip_address: str, domain: str, path: str) -> str:
+ 		"""Create the HTTPS health check for one proxy."""
+ 		try:
+-			result = self.client.create_health_check(
++			result = self._get_client().create_health_check(
+ 				CallerReference=str(uuid4()),
+ 				HealthCheckConfig={
+ 					"IPAddress": ip_address,
+@@ -145,7 +152,7 @@ class Route53Provider(DnsProvider):
+ 	def remove_health_check(self, health_check_id: str) -> None:
+ 		"""Remove one proxy health check."""
+ 		try:
+-			self.client.delete_health_check(HealthCheckId=health_check_id)
++			self._get_client().delete_health_check(HealthCheckId=health_check_id)
+ 		except ClientError as error:
+ 			if error.response.get("Error", {}).get("Code") == "NoSuchHealthCheck":
+ 				return
+@@ -176,7 +183,7 @@ class Route53Provider(DnsProvider):
+ 		if record is None:
+ 			return
+ 		try:
+-			self.client.change_resource_record_sets(
++			self._get_client().change_resource_record_sets(
+ 				HostedZoneId=self.create_zone(self.domain_name),
+ 				ChangeBatch={"Changes": [{"Action": "DELETE", "ResourceRecordSet": record}]},
+ 			)
+@@ -186,7 +193,7 @@ class Route53Provider(DnsProvider):
+ 	def _change_record(self, action: str, record_type: str, name: str, values: list[str], ttl: int) -> None:
+ 		zone_id = self.create_zone(self.domain_name)
+ 		try:
+-			self.client.change_resource_record_sets(
++			self._get_client().change_resource_record_sets(
+ 				HostedZoneId=zone_id,
+ 				ChangeBatch={
+ 					"Changes": [
+@@ -225,7 +232,7 @@ class Route53Provider(DnsProvider):
+ 			"HealthCheckId": health_check_id,
+ 		}
+ 		try:
+-			self.client.change_resource_record_sets(
++			self._get_client().change_resource_record_sets(
+ 				HostedZoneId=zone_id,
+ 				ChangeBatch={"Changes": [{"Action": action, "ResourceRecordSet": record}]},
+ 			)
+@@ -235,7 +242,7 @@ class Route53Provider(DnsProvider):
+ 	def _get_record(self, record_type: str, name: str) -> dict | None:
+ 		zone_id = self.create_zone(self.domain_name)
+ 		try:
+-			result = self.client.list_resource_record_sets(
++			result = self._get_client().list_resource_record_sets(
+ 				HostedZoneId=zone_id,
+ 				StartRecordName=name,
+ 				StartRecordType=record_type,
+@@ -256,7 +263,7 @@ class Route53Provider(DnsProvider):
+ 	def _get_multivalue_a_record(self, name: str, identifier: str) -> dict | None:
+ 		zone_id = self.create_zone(self.domain_name)
+ 		try:
+-			result = self.client.list_resource_record_sets(
++			result = self._get_client().list_resource_record_sets(
+ 				HostedZoneId=zone_id,
+ 				StartRecordName=name,
+ 				StartRecordType="A",
+@@ -278,7 +285,7 @@ class Route53Provider(DnsProvider):
+ 
+ 	def _validate_zone(self, zone_id: str, domain: str) -> None:
+ 		try:
+-			zone = self.client.get_hosted_zone(Id=zone_id)["HostedZone"]
++			zone = self._get_client().get_hosted_zone(Id=zone_id)["HostedZone"]
+ 		except (BotoCoreError, ClientError) as error:
+ 			raise Route53Error(f"Failed to fetch zone {zone_id}: {error}") from error
+ 
+diff --git a/atlas/atlas/core/dns_providers/test_route53.py b/atlas/atlas/core/dns_providers/test_route53.py
+index b7cb5df..19e22dc 100644
+--- a/atlas/atlas/core/dns_providers/test_route53.py
++++ b/atlas/atlas/core/dns_providers/test_route53.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ 
+ from botocore.exceptions import ClientError
+ from frappe.tests import UnitTestCase
+@@ -25,6 +25,25 @@ def _build_provider() -> Route53Provider:
+ 
+ 
+ class TestRoute53Provider(UnitTestCase):
++	def test_validate_settings_does_not_require_dns_credentials(self) -> None:
++		settings = _FakeSettings()
++		settings.get_password = MagicMock(side_effect=AssertionError("No DNS credentials configured"))
++		with patch("atlas.atlas.core.dns_providers.route53.boto3.client") as client:
++			provider = Route53Provider(settings=settings)
++			provider.validate_settings()
++		client.assert_not_called()
++		settings.get_password.assert_not_called()
++
++	def test_dns_operation_connects_once_with_configured_credentials(self) -> None:
++		with patch("atlas.atlas.core.dns_providers.route53.boto3.client") as client:
++			provider = Route53Provider(settings=_FakeSettings())
++			provider.validate_credentials()
++			provider.validate_credentials()
++		client.assert_called_once_with(
++			"route53", aws_access_key_id="AKIA_TEST", aws_secret_access_key="test-secret"
++		)
++		self.assertEqual(client.return_value.list_hosted_zones.call_count, 2)
++
+ 	def test_find_public_zone_skips_a_private_zone(self) -> None:
+ 		provider = _build_provider()
+ 		provider.client.list_hosted_zones_by_name.return_value = {
+diff --git a/docs/region/configuration.md b/docs/region/configuration.md
+index d12818f..60640d1 100644
+--- a/docs/region/configuration.md
++++ b/docs/region/configuration.md
+@@ -17,6 +17,8 @@ Use **Atlas Settings** for regional configuration. Set the site value `atlas_bas
+ 
+ Save validates the provider and placement settings.
+ 
++Saving the settings checks the DNS domain without connecting to Route53. A DNS operation checks the configured credentials when it first connects. A Generic region can run VMs before DNS is configured.
++
+ | Change | Effect |
+ | --- | --- |
+ | Region ID | Refused while VMs or non-archived proxy records exist. |

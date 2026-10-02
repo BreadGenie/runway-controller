@@ -1,0 +1,35 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go checks
+        run: |
+          test -z "$(gofmt -l *.go)"
+          go test ./...
+          go vet ./...
+          go build ./...
+      - name: Python checks
+        run: |
+          python3 -m unittest discover -s guest -p '*_test.py'
+          python3 -m unittest discover -s examples -p '*_test.py'
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Shell checks
+        run: |
+          bash -n guest/guest-runner.sh
+          bash -n guest/install-guest-runner.sh
+          bash -n scripts/build-ci-kernel.sh
