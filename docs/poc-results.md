@@ -36,6 +36,19 @@ The image was built from a fresh, never-registered guest and separately verified
 
 With the controller stopped, a separate VM lease was reserved through the authenticated Central API with a 60-second deadline and no GitHub registration. Central's scheduled reaper advanced it from `vm_ready` to `deleted`, marked registration state `removed`, and left no guest namespace. No manual reconciliation call was used. The pool was then paused and the dedicated scale set removed; GitHub reported zero runners.
 
+## Frappe fork dogfood
+
+A real Frappe CI job was run through the controller for the first time. The repository was a BreadGenie Frappe fork on branch `runway-dogfood`, commit `bd2240f` based on `979b90732b3ee64dfb1586cb98db9a59e45e070a`, running the repository's own unchanged check `unittest frappe.tests.test_boilerplate.TestBoilerPlate.test_valid_ci_yaml` on Python 3.14 in a fresh Runway VM with two CPUs, 4 GiB RAM and a 4 GiB disk.
+
+| Run | Result | What it established |
+| --- | --- | --- |
+| Attempt 1 | Failed | The baked guest's `runner` account had Docker but no passwordless sudo |
+| [Attempt 2](https://github.com/BreadGenie/frappe/actions/runs/36986854455/job/110780787490) | Passed on 2026-10-02 | The same unchanged check ran in a fresh guest after that gap was closed |
+
+Attempt 2 took about 119 seconds end to end, including installation of the full Frappe dependency set; the test itself reported 0.006 seconds. The missing sudo attempt 1 exposed is now an explicit operator opt-in during guest preparation, not a change to the image recipe or the workflow. The successful VM was removed automatically and its GitHub runner deregistered.
+
+This is one focused unit check on one repository branch. It is not the full Frappe suite, which needs a database, and the recorded durations are not a performance benchmark.
+
 ## Artifact provenance
 
 | Input | Revision or digest |

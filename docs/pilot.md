@@ -89,6 +89,25 @@ Leave `owner_id` unset so each process gets a fresh identity. Only one process o
 
 After `controller_listening`, dispatch a trusted workflow using the dedicated `runs-on` label. Start with the [Docker smoke workflow](../examples/smoke-workflow.yml). Inspect Central's Runner Lease, the GitHub run, controller health output, and collected diagnostics. GitHub remains the authority for job success; a stopped guest service does not prove success.
 
+### Sudo compatibility for trusted workflows
+
+Some trusted GitHub Actions workflows expect a passwordless `sudo`. Preparation can grant it to the guest's `runner` account, but only when an operator asks for it. Append `--allow-guest-sudo` to `transport_command`:
+
+```json
+"transport_command": [
+  "python3", "/srv/runway/scripts/metal-guest-transport.py",
+  "--host", "root@metal.example.com",
+  "--key-file", "/var/lib/runway/guest-admin-key",
+  "--known-hosts", "/var/lib/runway/known-hosts",
+  "--diagnostics-dir", "/srv/runway/private/diagnostics",
+  "--allow-guest-sudo"
+]
+```
+
+The flag is off by default, and without it `prepare` performs its existing checks only and writes nothing. With it, `prepare` — and only `prepare`, and only while the guest still reports `installed`, an unregistered fresh clone — writes one static, root-owned `0440` drop-in at `/etc/sudoers.d/runway-runner` holding `runner ALL=(ALL) NOPASSWD: ALL`. Nothing is installed or downloaded: the baked image must already carry `sudo` and `visudo`. The file is created fresh, never written through an existing file or symlink, parsed with `visudo -c -f`, and then proved with `runuser -u runner -- sudo -n true`. A missing binary, a planted drop-in or any failed check fails preparation closed: no JIT configuration is requested and no bootstrap follows, so the controller surfaces the error until the lease deadline retires it. Status, collect, stop and bootstrap never touch the file, and a guest that already carries a registration is never configured.
+
+That root is optional and it is the disposable Firecracker guest's own root. It grants nothing on the Metal host, in the `metal-VM_ID` namespace, on Atlas or Central, and it reaches no GitHub App key, Central credential or host key. Keep the flag off while a pool could run untrusted code, including public fork pull requests.
+
 ## Recovery and shutdown
 
 The controller commits lease, acquisition and JIT intent before remote side effects. An uncertain Atlas create is discovered by durable tags, never blindly repeated. An uncertain JIT registration is retired by its stable runner name. An interrupted bootstrap is observed before deciding whether to retire it; credentials are not resent.
