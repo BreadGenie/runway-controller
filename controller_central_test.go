@@ -3,13 +3,144 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestOwnershipHeartbeatKeepsSanitizedCentralCauseAndStaysFailClosed(t *testing.T) {
+	// Central reports a blocked renewal as HTTP 508 (QueryDeadlockError).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusLoopDetected)
+		w.Write([]byte(`{"exception":"test-secret should never be logged"}`))
+	}))
+	defer server.Close()
+	client := &centralRPC{baseURL: server.URL, pool: "pool", owner: "owner", fence: 1, claimedPool: pilotPool{ID: "pool"}, http: server.Client()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	err := holdOwnership(ctx, func(ctx context.Context) error {
+		calls++
+		_, err := client.Renew(ctx, "")
+		return err
+	}, time.Millisecond)
+
+	if err == nil {
+		t.Fatal("a blocked renewal must stop ownership")
+	}
+	if !strings.Contains(err.Error(), "all side effects stopped") {
+		t.Fatalf("renewal failure must stay fail-closed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "508") {
+		t.Fatalf("renewal failure dropped the Central cause an operator needs: %v", err)
+	}
+	if strings.Contains(err.Error(), "test-secret") {
+		t.Fatalf("renewal failure leaked a secret: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("renewal failure must stop the heartbeat immediately, got %d renewals", calls)
+	}
+	// Fail-closed must not depend on ctx: the caller is the only thing that cancels.
+	if ctx.Err() != nil {
+		t.Fatal("renewal failure cancelled the caller context by itself")
+	}
+}
+
+func TestCentralRenewReportsPoolIdentityChangeCause(t *testing.T) {
+	// A genuine fencing loss must stay distinguishable from a blocked transaction.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	client := &centralRPC{baseURL: server.URL, pool: "pool", owner: "owner", fence: 1, claimedPool: pilotPool{ID: "pool"}, http: server.Client()}
+	err := holdOwnership(context.Background(), func(ctx context.Context) error {
+		_, err := client.Renew(ctx, "")
+		return err
+	}, time.Millisecond)
+	if err == nil {
+		t.Fatal("a rejected renewal must stop ownership")
+	}
+	if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "all side effects stopped") {
+		t.Fatalf("renewal cause must stay distinguishable from a blocked transaction: %v", err)
+	}
+}
+
+func TestOwnershipHeartbeatCancellationDuringRenewalIsAShutdown(t *testing.T) {
+	// Cancellation can land after the heartbeat starts a renewal. The in-flight
+	// failure is a shutdown, not a lost fence, so it must not fail closed. The
+	// callback blocks until the test confirms cancellation, so the outcome cannot
+	// depend on which goroutine happens to run first.
+	for attempt := range 200 {
+		ctx, cancel := context.WithCancel(context.Background())
+		started := make(chan struct{})
+		cancelled := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- holdOwnership(ctx, func(context.Context) error {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+				<-cancelled
+				return errors.New("Central renew_pool rejected (HTTP 508)")
+			}, time.Microsecond)
+		}()
+		<-started
+		cancel()
+		close(cancelled)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("attempt %d: cancellation during renewal must be a shutdown, got: %v", attempt, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("attempt %d: ownership did not stop after cancellation", attempt)
+		}
+	}
+}
+
+func TestOwnershipHeartbeatReturnsCleanlyWhenContextEnds(t *testing.T) {
+	// A renewal that fails while the controller is still alive is a real lost
+	// fence and must stay fail-closed. Cancellation only converts the outcome
+	// once it has happened, which the handshake test above pins down. Cancelling
+	// here without synchronising would race the callback and assert nothing.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := holdOwnership(ctx, func(context.Context) error {
+		return errors.New("Central renew_pool rejected (HTTP 508)")
+	}, time.Microsecond)
+	if err == nil {
+		t.Fatal("a live controller must fail closed on renewal failure")
+	}
+	if !strings.Contains(err.Error(), "all side effects stopped") {
+		t.Fatalf("fail-closed renewal must keep its notice: %v", err)
+	}
+}
+
+func TestOwnershipHeartbeatFailsClosedWhileContextIsAlive(t *testing.T) {
+	// The cancellation guard must not weaken fail-closed behaviour: a real Central
+	// failure on a live controller still stops ownership and keeps the cause.
+	for attempt := range 200 {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err := holdOwnership(ctx, func(context.Context) error {
+			return errors.New("Central renew_pool rejected (HTTP 508)")
+		}, time.Microsecond)
+		if err == nil {
+			t.Fatalf("attempt %d: a live controller must fail closed on renewal failure", attempt)
+		}
+		if !strings.Contains(err.Error(), "all side effects stopped") || !strings.Contains(err.Error(), "508") {
+			t.Fatalf("attempt %d: fail-closed renewal must keep its sanitized cause: %v", attempt, err)
+		}
+	}
+}
 
 func TestCentralRPCSendsFencingAndKeepsSecretsOutOfErrors(t *testing.T) {
 	requests := 0

@@ -38,6 +38,35 @@ func (s pilotScaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSet
 	}
 }
 
+// holdOwnership renews the fence on an interval until renewal fails or ctx ends.
+// A renewal failure is fail-closed, but it keeps the sanitized Central cause so
+// an operator can tell a fencing rejection from a blocked database transaction.
+func holdOwnership(ctx context.Context, renew func(context.Context) error, every time.Duration) error {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// A ready ticker and a cancelled context are both selectable, and the
+			// runtime picks between them at random. Renewing a cancelled context
+			// would report a shutdown as a lost fence, so check before renewing.
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err := renew(ctx); err != nil {
+				// Cancellation can still race the renewal itself. Only a failure
+				// while the controller is alive loses the fence.
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("Central ownership renewal failed; all side effects stopped: %w", err)
+			}
+		}
+	}
+}
+
 func runController(path string) error {
 	cfg, err := loadControllerConfig(path)
 	if err != nil {
@@ -75,23 +104,17 @@ func runController(path string) error {
 	var ownershipLost atomic.Bool
 	heartbeatErrors := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
+		renew := func(ctx context.Context) error {
+			_, err := central.Renew(ctx, lastError.Load().(string))
+			return err
+		}
+		if err := holdOwnership(ctx, renew, 15*time.Second); err != nil {
+			ownershipLost.Store(true)
 			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if _, err := central.Renew(ctx, lastError.Load().(string)); err != nil {
-					ownershipLost.Store(true)
-					select {
-					case heartbeatErrors <- errors.New("Central ownership renewal failed; all side effects stopped"):
-					default:
-					}
-					cancel()
-					return
-				}
+			case heartbeatErrors <- err:
+			default:
 			}
+			cancel()
 		}
 	}()
 	report := func(err error) {

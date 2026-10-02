@@ -962,10 +962,10 @@ index 0000000..5ba74dc
 +	return lease_snapshot(lease)
 diff --git a/central/integrations/runway.py b/central/integrations/runway.py
 new file mode 100644
-index 0000000..2174d8a
+index 0000000..b65506a
 --- /dev/null
 +++ b/central/integrations/runway.py
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,192 @@
 +import frappe
 +from frappe.utils import get_datetime, now_datetime
 +
@@ -1060,6 +1060,10 @@ index 0000000..2174d8a
 +
 +
 +def reconcile_lease(pool, name: str) -> None:
++	# Take the pool row lock before the lease row lock, matching fenced_lease.
++	# A reaper that locked the lease first would hold it across Atlas calls and
++	# deadlock every controller RPC that already owns the pool lock.
++	pool = frappe.get_doc("Runner Pool", pool.name, for_update=True)
 +	lease = frappe.get_doc("Runner Lease", name, for_update=True)
 +	if lease.phase == "deleted":
 +		frappe.db.commit()
@@ -1118,6 +1122,10 @@ index 0000000..2174d8a
 +	for row in frappe.get_all("Runner Pool", fields=["name", "team"]):
 +		pool = frappe.get_doc("Runner Pool", row.name)
 +		for lease in active_leases(pool=pool.name, team=pool.team):
++			# End the read view opened by the enumeration above. reconcile_lease
++			# locks the pool row, and a controller renewal that commits in between
++			# would fail this transaction with "record has changed since last read".
++			frappe.db.commit()
 +			try:
 +				reconcile_lease(pool, lease.name)
 +			except AtlasConnectionError:
@@ -1180,10 +1188,10 @@ index ae9cdee..0af37f5 100644
 +	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
 diff --git a/central/tests/test_runway.py b/central/tests/test_runway.py
 new file mode 100644
-index 0000000..0c56a68
+index 0000000..e1adf18
 --- /dev/null
 +++ b/central/tests/test_runway.py
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,399 @@
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
 +from types import SimpleNamespace
@@ -1471,6 +1479,88 @@ index 0000000..0c56a68
 +			error="Runner cleanup verification timed out",
 +		)
 +		self.assertEqual(replaced["last_error"], "Runner cleanup verification timed out")
++
++	def test_reaper_locks_pool_before_lease_like_the_rpc_path(self):
++		"""The scheduler reaper and the controller RPC must take row locks in one order.
++
++		The RPC path locks the pool, then the lease. If the reaper locks the lease
++		first it holds that lock across Atlas calls, and the two transactions
++		deadlock, which Frappe reports to the controller as HTTP 508.
++		"""
++		lease = self.reserve()
++		order = []
++
++		original_get_doc = frappe.get_doc
++
++		def tracked_get_doc(doctype, name=None, *args, **kwargs):
++			if doctype == "Runner Pool" and kwargs.get("for_update"):
++				order.append("pool")
++			elif doctype == "Runner Lease" and kwargs.get("for_update"):
++				order.append("lease")
++			return original_get_doc(doctype, name, *args, **kwargs)
++
++		with patch.object(regional.frappe, "get_doc", side_effect=tracked_get_doc):
++			client = Mock()
++			client.list_vms.return_value = []
++			with patch.object(regional, "client_for_pool", return_value=client):
++				regional.reconcile_lease(self.pool, lease["id"])
++
++		self.assertEqual(order[:2], ["pool", "lease"], f"reaper locked {order}, expected pool before lease")
++
++	def test_reaper_and_rpc_do_not_deadlock_under_concurrency(self):
++		"""A concurrent reaper sweep and controller RPC must both complete.
++
++		Inconsistent lock order between these two paths is the reported cause of
++		HTTP 508 renewals that stop the controller while the pool stays active.
++		The reaper runs the real sweep, including its pool and lease pre-reads,
++		because those reads open the transaction the locks are taken in.
++		"""
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], {"phase": "deleting", "vm_state": "running"})
++		site, sites_path = frappe.local.site, frappe.local.sites_path
++		pool, owner, fence = self.pool.name, self.owner, self.fence
++		barrier = Barrier(2)
++		failures = []
++		frappe.db.commit()
++
++		def reap():
++			frappe.init(site=site, sites_path=sites_path)
++			frappe.connect()
++			frappe.set_user("Administrator")
++			try:
++				barrier.wait(timeout=10)
++				client = Mock()
++				client.get_vm.return_value = {"current_state": "running"}
++				client.list_vms.return_value = []
++				with patch.object(regional, "client_for_pool", return_value=client):
++					# Run the real sweep, including its pool and lease pre-reads,
++					# because those reads open the transaction the locks are taken in.
++					# This test owns the only pool on the site, so sweep touches nothing else.
++					regional.sweep()
++			except Exception as error:  # noqa: BLE001 - the assertion reports the type
++				failures.append(f"reap: {type(error).__name__}: {error}")
++			finally:
++				frappe.db.rollback()
++				frappe.destroy()
++
++		def controller():
++			frappe.init(site=site, sites_path=sites_path)
++			frappe.connect()
++			frappe.set_user("Administrator")
++			try:
++				barrier.wait(timeout=10)
++				regional.request_delete(pool, owner, fence, lease["id"])
++			except Exception as error:  # noqa: BLE001 - the assertion reports the type
++				failures.append(f"rpc: {type(error).__name__}: {error}")
++			finally:
++				frappe.db.rollback()
++				frappe.destroy()
++
++		with ThreadPoolExecutor(max_workers=2) as executor:
++			for future in [executor.submit(reap), executor.submit(controller)]:
++				future.result()
++
++		self.assertEqual(failures, [], f"concurrent reaper and RPC failed with {failures}")
 +
 +	def test_unknown_create_cannot_be_declared_deleted(self):
 +		lease = self.reserve()
