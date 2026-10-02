@@ -31,7 +31,8 @@ func main() {
 }
 
 func run() error {
-	action := flag.String("action", "", "create, lookup, jit, listen, or delete (all except lookup modify GitHub)")
+	action := flag.String("action", "", "create, lookup, jit, listen, controller, or delete (all except lookup modify GitHub)")
+	config := flag.String("config", "", "private controller configuration JSON for --action controller")
 	url := flag.String("url", "", "https://github.com/OWNER/REPO; repository scope only")
 	name := flag.String("name", "", "runway-prefixed scale-set name for create/lookup; runner name for jit/listen")
 	id := flag.Int("id", 0, "existing scale-set ID for jit/listen/delete")
@@ -39,6 +40,12 @@ func run() error {
 	journal := flag.String("journal", "", "durable single-job journal for listen; parent directory must be private")
 	timeout := flag.Duration("timeout", 20*time.Minute, "maximum listener duration")
 	flag.Parse()
+	if *action == "controller" {
+		if *config == "" {
+			return errors.New("controller requires --config")
+		}
+		return runController(*config)
+	}
 	if !repositoryURL.MatchString(*url) {
 		return errors.New("--url must identify one github.com repository")
 	}
@@ -135,7 +142,7 @@ func writeSecret(file *os.File, secret string) error {
 	return file.Sync()
 }
 
-func authenticatedClient(ctx context.Context, url string) (*scaleset.Client, error) {
+func authenticatedClient(ctx context.Context, url string, options ...scaleset.HTTPOption) (*scaleset.Client, error) {
 	appID := os.Getenv("RUNWAY_GITHUB_APP_CLIENT_ID")
 	keyFile := os.Getenv("RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE")
 	installation := os.Getenv("RUNWAY_GITHUB_APP_INSTALLATION_ID")
@@ -151,7 +158,7 @@ func authenticatedClient(ctx context.Context, url string) (*scaleset.Client, err
 		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
 			GitHubConfigURL: url,
 			GitHubAppAuth:   scaleset.GitHubAppAuth{ClientID: appID, InstallationID: id, PrivateKey: string(key)},
-		})
+		}, options...)
 	}
 	// gh resolves its credential store; no token appears in argv or stdout.
 	token, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
@@ -160,5 +167,5 @@ func authenticatedClient(ctx context.Context, url string) (*scaleset.Client, err
 	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 		GitHubConfigURL: url, PersonalAccessToken: strings.TrimSpace(string(token)),
-	})
+	}, options...)
 }

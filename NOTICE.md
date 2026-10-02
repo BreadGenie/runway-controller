@@ -4,6 +4,8 @@ Runway is licensed under GNU AGPL version 3. See [LICENSE](LICENSE).
 
 The Atlas integration patch in `patches/atlas-lazy-route53-client.patch` includes context from [frappe/atlas](https://github.com/frappe/atlas) at commit `339735de16471e90232cf8b1ff840696ee830ad9`, licensed under GNU AGPL version 3. It changes Route53 client initialization and includes its focused tests and documentation. It is supplied for upstream review; it is not automatically applied.
 
+The Central integration patch in `integrations/central/central-runway-pilot.patch` includes context from [frappe/central](https://github.com/frappe/central) at commit `6676d3178943d332c288fc55c04e6f44a8d01732`, licensed under GNU AGPL version 3. It adds the internal runner pool/lease pilot and is supplied for review, not automatically applied.
+
 The Go controller uses [actions/scaleset](https://github.com/actions/scaleset) at commit `e6daac702355cdb5b880b4fbdcf6d85dcd9e48e5`, licensed under MIT. Dependencies are resolved through Go modules; upstream source is not vendored.
 
 The kernel build script downloads [Amazon Linux's Linux kernel source](https://github.com/amazonlinux/linux) at commit `8c3eeb0cc41e3fa4e5e27e29c557124ed1a1c451` and a [Firecracker guest configuration](https://github.com/firecracker-microvm/firecracker) at commit `791763f545dd73c1f5f22c67dd314009ad8047d9`. Linux is licensed under GPL version 2; Firecracker is licensed under Apache version 2. No kernel binary or downloaded source archive is included in this repository.

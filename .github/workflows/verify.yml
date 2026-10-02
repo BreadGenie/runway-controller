@@ -20,7 +20,7 @@ jobs:
       - name: Go checks
         run: |
           test -z "$(gofmt -l *.go)"
-          go test ./...
+          go test -race ./...
           go vet ./...
           go build ./...
       - name: Python checks
@@ -30,6 +30,6 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Shell checks
         run: |
-          bash -n guest/guest-runner.sh
-          bash -n guest/install-guest-runner.sh
-          bash -n scripts/build-ci-kernel.sh
+          for script in guest/*.sh scripts/*.sh; do
+            bash -n "$script"
+          done

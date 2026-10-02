@@ -13,9 +13,9 @@ go vet ./...
 python3 -m unittest discover -s guest -p '*_test.py'
 python3 -m unittest discover -s examples -p '*_test.py'
 python3 -m unittest discover -s scripts -p 'test_*.py'
-for script in guest/*.sh scripts/*.sh; do
-  bash -n "$script" || exit 1
-done
+bash -n guest/guest-runner.sh
+bash -n guest/install-guest-runner.sh
+bash -n scripts/build-ci-kernel.sh
 ./runway --help
 ```
 
@@ -47,6 +47,17 @@ bash scripts/build-ci-kernel.sh /path/to/private/kernel-build
 ```
 
 Publish the resulting kernel with a clean Ubuntu root filesystem through Atlas's image tooling. An image ID, artifact URL, or SSH key from another operator's environment is not portable. Keep image contents credential-free.
+
+Create the guest through the operator helper before installing runner tools (substitute actual environment values):
+
+```sh
+/path/to/bench/env/bin/python scripts/atlas-vm.py create \
+  --bench /path/to/bench --team TEAM --region REGION \
+  --image-id IMAGE --ssh-public-key /path/to/guest.pub \
+  --output /path/to/private/guest-create.jsonl
+/path/to/bench/env/bin/python scripts/atlas-vm.py get \
+  --bench /path/to/bench --team TEAM --region REGION --vm-id VM_ID
+```
 
 After creating a disposable guest, copy the scripts from `guest/` into it and execute the installer as root **inside that guest**:
 
@@ -81,7 +92,7 @@ The script consumes the transport file and supplies the JIT configuration throug
 
 ## Listen and run a workflow
 
-Install [the smoke workflow](../examples/smoke-workflow.yml) in the selected repository and confirm its `runs-on` label matches the dedicated scale set. Start the listener and manually dispatch that workflow:
+Install [the smoke workflow](../examples/smoke-workflow.yml) in the selected repository and confirm its `runs-on` label matches the dedicated scale set. Start the listener, wait for `listening with capacity one; journal:` in its output, and only then manually dispatch that workflow. A job that finishes before the listener starts can be missed:
 
 ```sh
 ./runway --action listen --url https://github.com/OWNER/REPO \
@@ -91,7 +102,6 @@ Install [the smoke workflow](../examples/smoke-workflow.yml) in the selected rep
 
 Use exactly one guest and one journal for this scale set. On interruption, resume with the same journal. The local lock does not coordinate multiple machines or different journal paths. Live GitHub events may represent direct assignment with a zero request ID; the listener binds the stable job UUID to the expected runner and records completion before acknowledgment.
 
-Wait for `listening with capacity one; journal:` before dispatching the workflow. That line confirms the GitHub message session is open. A job that finishes before the session opens may leave no completion event for this listener.
 
 Confirm success independently in GitHub. Preserve a sanitized receipt and diagnostics. Listener timeout or process termination does not cancel the workflow or destroy the guest.
 
@@ -101,28 +111,15 @@ Run `scripts/atlas-vm.py` with the Central bench's Python environment. Supply yo
 
 The helper creates through Central's Team-authorized Atlas client and reserves an exclusive creation journal before submitting one request. On an uncertain outcome, retain that journal and reconcile the attempt tag before trying another creation. The tool is an operator helper, not a lease controller or Central product flow.
 
-For example, before guest installation:
-
-```sh
-/path/to/bench/env/bin/python scripts/atlas-vm.py create \
-  --bench /path/to/bench --site central.localhost --team TEAM --region REGION \
-  --image-id IMAGE --ssh-public-key /path/to/guest-key.pub \
-  --output private/guest-create.journal.jsonl
-```
-
-Use the returned VM ID for inspection or cleanup:
-
-```sh
-/path/to/bench/env/bin/python scripts/atlas-vm.py get \
-  --bench /path/to/bench --team TEAM --region REGION --vm-id VM_ID
-/path/to/bench/env/bin/python scripts/atlas-vm.py terminate \
-  --bench /path/to/bench --team TEAM --region REGION --vm-id VM_ID
-```
-
 After completion or failure, remove the GitHub scale set and terminate the guest as separate operations. Confirm the GitHub runner is gone and the tenant-scoped Atlas GET returns `404`. An accepted delete alone is insufficient.
 
 ```sh
 ./runway --action delete --url https://github.com/OWNER/REPO --id SCALE_SET_ID
+```
+
+```sh
+/path/to/bench/env/bin/python scripts/atlas-vm.py terminate \
+  --bench /path/to/bench --team TEAM --region REGION --vm-id VM_ID
 ```
 
 Keep credentials, JIT files, private keys, site configurations, image files, journals, and raw runner logs out of commits. The proof-of-concept environment and its credentials are not included in this repository.

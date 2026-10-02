@@ -1,0 +1,1563 @@
+diff --git a/CAPABILITIES.md b/CAPABILITIES.md
+index ea1bd3c..3c324ec 100644
+--- a/CAPABILITIES.md
++++ b/CAPABILITIES.md
+@@ -110,3 +110,9 @@ Stored grants, fixtures, and the dashboard depend on the vocabulary. Adding, rem
+ 4. Update this document.
+ 
+ **Never rename a capability in place.** Stored grants and every consumer keep the old string, and the result authorizes the wrong thing without an error. Add the new capability, migrate grants to it, then retire the old one.
++
++## Internal Runway pilot
++
++Runner Pool and Runner Lease reads require team-wide `server:view`. Pool configuration is operator-only. The assigned `controller_user` must have team-wide `server:view`, `server:create`, and `server:terminate` to use the fenced controller RPCs. These existing capabilities are reused for the bounded internal pilot; no new capability strings or fixture grants are introduced. An API key does not bypass Team authorization. Direct customer writes to lifecycle records are denied.
++
++Each pool admits at most its configured concurrency, with an additional fixed pilot limit of four active or cleanup-pending leases per Team. A lease remains capacity-consuming until both the VM is absent and GitHub runner cleanup is reported. This is admission accounting, not billing enforcement.
+diff --git a/central/api/runway.py b/central/api/runway.py
+new file mode 100644
+index 0000000..28ccda5
+--- /dev/null
++++ b/central/api/runway.py
+@@ -0,0 +1,48 @@
++import frappe
++
++from central.infrastructure import runway
++from central.integrations import runway as regional
++
++
++@frappe.whitelist(methods=["POST"])
++def claim_pool(pool: str, owner_id: str) -> dict:
++	return runway.claim_pool(pool, owner_id)
++
++
++@frappe.whitelist(methods=["POST"])
++def renew_pool(pool: str, owner_id: str, fence: int, last_error: str = "") -> dict:
++	return runway.renew_pool(pool, owner_id, fence, last_error)
++
++
++@frappe.whitelist(methods=["POST"])
++def reserve_lease(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	return runway.reserve_lease(pool, owner_id, fence, lease_id)
++
++
++@frappe.whitelist(methods=["POST"])
++def update_lease(
++	pool: str,
++	owner_id: str,
++	fence: int,
++	lease_id: str,
++	event: str,
++	runner_id: int = 0,
++	job_id: str = "",
++	workflow_run_id: str = "",
++	result: str = "",
++	error: str = "",
++	request_id: int = 0,
++) -> dict:
++	return runway.update_lease(
++		pool, owner_id, fence, lease_id, event, runner_id, job_id, workflow_run_id, result, error, request_id
++	)
++
++
++@frappe.whitelist(methods=["POST"])
++def ensure_vm(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	return regional.ensure_vm(pool, owner_id, fence, lease_id)
++
++
++@frappe.whitelist(methods=["POST"])
++def request_delete(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	return regional.request_delete(pool, owner_id, fence, lease_id)
+diff --git a/central/hooks.py b/central/hooks.py
+index 3745dc5..c078b53 100644
+--- a/central/hooks.py
++++ b/central/hooks.py
+@@ -191,6 +191,7 @@ doc_events = {
+ scheduler_events = {
+ 	"all": ["central.integrations.resource_actions.recover_requests"],
+ 	"cron": {
++		"* * * * * */10": ["central.integrations.runway.sweep"],
+ 		"*/10 * * * *": [
+ 			# Repair observed state through scoped regional reads.
+ 			"central.integrations.servers.reconcile",
+@@ -355,6 +356,8 @@ override_doctype_dashboards = {
+ # Authentication and authorization
+ 
+ permission_query_conditions = {
++	"Runner Pool": "central.permissions.runner_pool_query_conditions",
++	"Runner Lease": "central.permissions.runner_lease_query_conditions",
+ 	"Team SSH Key": "central.permissions.team_ssh_key_query_conditions",
+ 	"Virtual Machine": "central.permissions.server_query_conditions",
+ 	"IAM Permission Probe": "central.permissions.iam_permission_probe_query_conditions",
+@@ -372,6 +375,8 @@ permission_query_conditions = {
+ }
+ 
+ has_permission = {
++	"Runner Pool": "central.permissions.runner_pool_has_permission",
++	"Runner Lease": "central.permissions.runner_lease_has_permission",
+ 	"Team SSH Key": "central.permissions.team_ssh_key_has_permission",
+ 	"Virtual Machine": "central.permissions.server_has_permission",
+ 	"IAM Permission Probe": "central.permissions.iam_permission_probe_has_permission",
+diff --git a/central/identity/doctype/team/team.json b/central/identity/doctype/team/team.json
+index 8bc99af..9674310 100644
+--- a/central/identity/doctype/team/team.json
++++ b/central/identity/doctype/team/team.json
+@@ -205,6 +205,14 @@
+    "group": "Infrastructure",
+    "link_doctype": "Site Domain",
+    "link_fieldname": "team"
++  },
++  {
++   "link_doctype": "Runner Pool",
++   "link_fieldname": "team"
++  },
++  {
++   "link_doctype": "Runner Lease",
++   "link_fieldname": "team"
+   }
+  ],
+  "modified": "2026-09-17 12:00:00.000000",
+diff --git a/central/infrastructure/doctype/runner_lease/__init__.py b/central/infrastructure/doctype/runner_lease/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/central/infrastructure/doctype/runner_lease/runner_lease.js b/central/infrastructure/doctype/runner_lease/runner_lease.js
+new file mode 100644
+index 0000000..f28ed7a
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_lease/runner_lease.js
+@@ -0,0 +1,13 @@
++frappe.ui.form.on("Runner Lease", {
++	refresh(frm) {
++		if (!frappe.user.has_role("System Manager") || frm.is_new()) return;
++		frm.add_custom_button(__("Reconcile"), () => frm.call("reconcile").then(() => frm.reload_doc()));
++		if (frm.doc.phase !== "deleted") {
++			frm.add_custom_button(__("Request Cleanup"), () => {
++				frappe.confirm(__("Terminate this runner VM? GitHub runner cleanup remains a controller task."), () => {
++					frm.call("reconcile", {cleanup: true}).then(() => frm.reload_doc());
++				});
++			});
++		}
++	},
++});
+diff --git a/central/infrastructure/doctype/runner_lease/runner_lease.json b/central/infrastructure/doctype/runner_lease/runner_lease.json
+new file mode 100644
+index 0000000..3146af3
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
+@@ -0,0 +1,220 @@
++{
++ "doctype": "DocType",
++ "name": "Runner Lease",
++ "module": "Infrastructure",
++ "autoname": "hash",
++ "engine": "InnoDB",
++ "field_order": [
++  "pool",
++  "team",
++  "phase",
++  "deadline",
++  "attempt_id",
++  "fence",
++  "runner_name",
++  "runner_id",
++  "jit_state",
++  "vm_section",
++  "vm_id",
++  "vm_state",
++  "mesh_address",
++  "create_dispatched_at",
++  "delete_requested_at",
++  "job_section",
++  "job_id",
++  "workflow_run_id",
++  "result",
++  "started_at",
++  "completed_at",
++  "deleted_at",
++  "last_error",
++  "request_id",
++  "acquire_state"
++ ],
++ "fields": [
++  {
++   "fieldname": "pool",
++   "label": "Pool",
++   "fieldtype": "Link",
++   "options": "Runner Pool",
++   "reqd": 1,
++   "in_list_view": 1,
++   "in_standard_filter": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "team",
++   "label": "Team",
++   "fieldtype": "Link",
++   "options": "Team",
++   "reqd": 1,
++   "set_only_once": 1,
++   "in_list_view": 1,
++   "in_standard_filter": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "phase",
++   "label": "Phase",
++   "fieldtype": "Select",
++   "options": "reserved\nprovisioning\nuncertain\nvm_ready\njit_pending\njit_ready\nrunning\ndeleting\ndeleted",
++   "read_only": 1,
++   "in_list_view": 1,
++   "in_standard_filter": 1
++  },
++  {
++   "fieldname": "deadline",
++   "label": "Deadline",
++   "fieldtype": "Datetime",
++   "read_only": 1,
++   "in_list_view": 1
++  },
++  {
++   "fieldname": "attempt_id",
++   "label": "Attempt Id",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "fence",
++   "label": "Fence",
++   "fieldtype": "Int",
++   "read_only": 1
++  },
++  {
++   "fieldname": "runner_name",
++   "label": "Runner Name",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "runner_id",
++   "label": "Runner Id",
++   "fieldtype": "Int",
++   "read_only": 1
++  },
++  {
++   "fieldname": "jit_state",
++   "label": "Jit State",
++   "fieldtype": "Select",
++   "options": "none\npending\nready\nremoved",
++   "read_only": 1
++  },
++  {
++   "fieldname": "vm_section",
++   "label": "Regional VM",
++   "fieldtype": "Section Break"
++  },
++  {
++   "fieldname": "vm_id",
++   "label": "Vm Id",
++   "fieldtype": "Data",
++   "read_only": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "vm_state",
++   "label": "Vm State",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "mesh_address",
++   "label": "Mesh Address",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "create_dispatched_at",
++   "label": "Create Dispatched At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "delete_requested_at",
++   "label": "Delete Requested At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "job_section",
++   "label": "Job result",
++   "fieldtype": "Section Break"
++  },
++  {
++   "fieldname": "job_id",
++   "label": "Job Id",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "workflow_run_id",
++   "label": "Workflow Run Id",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "result",
++   "label": "Result",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "started_at",
++   "label": "Started At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "completed_at",
++   "label": "Completed At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "deleted_at",
++   "label": "Deleted At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "last_error",
++   "label": "Last Error",
++   "fieldtype": "Small Text",
++   "read_only": 1
++  },
++  {
++   "fieldname": "request_id",
++   "fieldtype": "Data",
++   "label": "Request Id",
++   "read_only": 1
++  },
++  {
++   "fieldname": "acquire_state",
++   "fieldtype": "Select",
++   "label": "Acquire State",
++   "read_only": 1,
++   "options": "none\npending\nacquired"
++  }
++ ],
++ "permissions": [
++  {
++   "role": "System Manager",
++   "read": 1,
++   "write": 1,
++   "create": 1,
++   "delete": 1,
++   "report": 1
++  },
++  {
++   "role": "Central User",
++   "read": 1,
++   "report": 1
++  }
++ ],
++ "title_field": "runner_name",
++ "search_fields": "runner_name,vm_id,job_id",
++ "sort_field": "modified",
++ "sort_order": "DESC",
++ "links": []
++}
+diff --git a/central/infrastructure/doctype/runner_lease/runner_lease.py b/central/infrastructure/doctype/runner_lease/runner_lease.py
+new file mode 100644
+index 0000000..1777f64
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_lease/runner_lease.py
+@@ -0,0 +1,37 @@
++import frappe
++from frappe import _
++from frappe.model.document import Document
++
++
++class RunnerLease(Document):
++	def validate(self) -> None:
++		if frappe.db.get_value("Runner Pool", self.pool, "team") != self.team:
++			frappe.throw(_("Runner lease and pool must belong to the same Team."))
++		if not self.is_new() and any(
++			self.has_value_changed(field) for field in ("team", "pool", "attempt_id", "runner_name")
++		):
++			frappe.throw(_("Runner lease identity is immutable."))
++
++	@frappe.whitelist(methods=["POST"])
++	def reconcile(self, cleanup: bool = False) -> None:
++		from central.iam import user_has_operator_bypass
++		from central.integrations.runway import reconcile_lease
++
++		if not user_has_operator_bypass():
++			frappe.throw(_("Only an operator can reconcile a runner from Desk."), frappe.PermissionError)
++		self.reload()
++		if cleanup and self.phase != "deleted":
++			self.phase = "deleting"
++			self.save()
++		frappe.db.commit()
++		reconcile_lease(frappe.get_doc("Runner Pool", self.pool), self.name)
++
++	def on_trash(self) -> None:
++		frappe.throw(_("Runner leases are durable audit records and cannot be deleted."))
++
++
++def on_doctype_update() -> None:
++	frappe.db.add_index("Runner Lease", ["team", "phase"])
++	frappe.db.add_index("Runner Lease", ["pool", "phase"])
++	frappe.db.add_unique("Runner Lease", ["attempt_id"])
++	frappe.db.add_unique("Runner Lease", ["runner_name"])
+diff --git a/central/infrastructure/doctype/runner_lease/runner_lease_list.js b/central/infrastructure/doctype/runner_lease/runner_lease_list.js
+new file mode 100644
+index 0000000..9c06f9c
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_lease/runner_lease_list.js
+@@ -0,0 +1,6 @@
++frappe.listview_settings["Runner Lease"] = {
++	get_indicator(doc) {
++		const color = {running: "green", deleted: "gray", uncertain: "red", deleting: "orange"}[doc.phase] || "blue";
++		return [__(doc.phase), color, `phase,=,${doc.phase}`];
++	},
++};
+diff --git a/central/infrastructure/doctype/runner_pool/__init__.py b/central/infrastructure/doctype/runner_pool/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/central/infrastructure/doctype/runner_pool/runner_pool.json b/central/infrastructure/doctype/runner_pool/runner_pool.json
+new file mode 100644
+index 0000000..7e3e952
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_pool/runner_pool.json
+@@ -0,0 +1,191 @@
++{
++ "doctype": "DocType",
++ "name": "Runner Pool",
++ "module": "Infrastructure",
++ "autoname": "hash",
++ "engine": "InnoDB",
++ "field_order": [
++  "title",
++  "team",
++  "status",
++  "region",
++  "controller_user",
++  "repository_url",
++  "scale_set_id",
++  "image_id",
++  "capacity_section",
++  "max_concurrency",
++  "cpu_millicores",
++  "memory_mib",
++  "disk_mib",
++  "max_job_seconds",
++  "ssh_public_key",
++  "ownership_section",
++  "controller_owner",
++  "fence",
++  "owner_expires_at",
++  "last_error"
++ ],
++ "fields": [
++  {
++   "fieldname": "title",
++   "label": "Title",
++   "fieldtype": "Data",
++   "reqd": 1,
++   "in_list_view": 1
++  },
++  {
++   "fieldname": "team",
++   "label": "Team",
++   "fieldtype": "Link",
++   "options": "Team",
++   "reqd": 1,
++   "set_only_once": 1,
++   "in_list_view": 1,
++   "in_standard_filter": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "status",
++   "label": "Status",
++   "fieldtype": "Select",
++   "options": "Active\nPaused",
++   "default": "Paused",
++   "in_list_view": 1
++  },
++  {
++   "fieldname": "region",
++   "label": "Region",
++   "fieldtype": "Link",
++   "options": "Region",
++   "reqd": 1
++  },
++  {
++   "fieldname": "controller_user",
++   "label": "Controller User",
++   "fieldtype": "Link",
++   "options": "User",
++   "reqd": 1
++  },
++  {
++   "fieldname": "repository_url",
++   "label": "Repository Url",
++   "fieldtype": "Data",
++   "reqd": 1
++  },
++  {
++   "fieldname": "scale_set_id",
++   "label": "Scale Set Id",
++   "fieldtype": "Int",
++   "reqd": 1
++  },
++  {
++   "fieldname": "image_id",
++   "label": "Image Id",
++   "fieldtype": "Data",
++   "reqd": 1
++  },
++  {
++   "fieldname": "capacity_section",
++   "label": "Capacity and deadlines",
++   "fieldtype": "Section Break"
++  },
++  {
++   "fieldname": "max_concurrency",
++   "label": "Max Concurrency",
++   "fieldtype": "Int",
++   "default": "1",
++   "reqd": 1
++  },
++  {
++   "fieldname": "cpu_millicores",
++   "label": "Cpu Millicores",
++   "fieldtype": "Int",
++   "default": "1000",
++   "reqd": 1
++  },
++  {
++   "fieldname": "memory_mib",
++   "label": "Memory Mib",
++   "fieldtype": "Int",
++   "default": "2048",
++   "reqd": 1
++  },
++  {
++   "fieldname": "disk_mib",
++   "label": "Disk Mib",
++   "fieldtype": "Int",
++   "default": "4096",
++   "reqd": 1
++  },
++  {
++   "fieldname": "max_job_seconds",
++   "label": "Max Job Seconds",
++   "fieldtype": "Int",
++   "default": "1200",
++   "reqd": 1,
++   "description": "Total lease lifetime from reservation, including VM provisioning and guest bootstrap. Match the guest runtime limit."
++  },
++  {
++   "fieldname": "ssh_public_key",
++   "label": "Ssh Public Key",
++   "fieldtype": "Long Text",
++   "reqd": 1
++  },
++  {
++   "fieldname": "ownership_section",
++   "label": "Controller ownership",
++   "fieldtype": "Section Break",
++   "collapsible": 1
++  },
++  {
++   "fieldname": "controller_owner",
++   "label": "Controller Owner",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "fence",
++   "label": "Fence",
++   "fieldtype": "Int",
++   "read_only": 1
++  },
++  {
++   "fieldname": "owner_expires_at",
++   "label": "Owner Expires At",
++   "fieldtype": "Datetime",
++   "read_only": 1
++  },
++  {
++   "fieldname": "last_error",
++   "label": "Last Error",
++   "fieldtype": "Small Text",
++   "read_only": 1
++  }
++ ],
++ "permissions": [
++  {
++   "role": "System Manager",
++   "read": 1,
++   "write": 1,
++   "create": 1,
++   "delete": 1,
++   "report": 1
++  },
++  {
++   "role": "Central User",
++   "read": 1,
++   "report": 1
++  }
++ ],
++ "title_field": "title",
++ "search_fields": "title,repository_url",
++ "sort_field": "modified",
++ "sort_order": "DESC",
++ "links": [
++  {
++   "link_doctype": "Runner Lease",
++   "link_fieldname": "pool"
++  }
++ ]
++}
+diff --git a/central/infrastructure/doctype/runner_pool/runner_pool.py b/central/infrastructure/doctype/runner_pool/runner_pool.py
+new file mode 100644
+index 0000000..9db1ec6
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_pool/runner_pool.py
+@@ -0,0 +1,58 @@
++from urllib.parse import urlsplit
++
++import frappe
++from frappe import _
++from frappe.model.document import Document
++
++from central.infrastructure.doctype.team_ssh_key.team_ssh_key import fingerprint
++from central.infrastructure.runway import active_leases
++
++
++class RunnerPool(Document):
++	def validate(self) -> None:
++		url = urlsplit(self.repository_url or "")
++		if (
++			url.scheme != "https"
++			or url.netloc != "github.com"
++			or len(url.path.strip("/").split("/")) != 2
++			or url.query
++			or url.fragment
++		):
++			frappe.throw(_("Use one HTTPS github.com repository URL."))
++		for field, minimum, maximum in (
++			("max_concurrency", 1, 4),
++			("cpu_millicores", 1000, 4000),
++			("memory_mib", 512, 8192),
++			("disk_mib", 1024, 16384),
++			("max_job_seconds", 60, 3600),
++		):
++			if not minimum <= int(self.get(field) or 0) <= maximum:
++				frappe.throw(_("Runner pool capacity or deadline is outside pilot limits."))
++		if int(self.scale_set_id or 0) < 1:
++			frappe.throw(_("Set a positive GitHub scale set ID."))
++		fingerprint(self.ssh_public_key)
++		if not self.is_new():
++			immutable = (
++				"team",
++				"region",
++				"controller_user",
++				"repository_url",
++				"scale_set_id",
++				"image_id",
++				"ssh_public_key",
++				"cpu_millicores",
++				"memory_mib",
++				"disk_mib",
++			)
++			if any(self.has_value_changed(field) for field in immutable) and active_leases(
++				pool=self.name, team=self.team
++			):
++				frappe.throw(_("Drain every runner lease before changing pool identity or image."))
++
++	def on_trash(self) -> None:
++		if frappe.db.exists("Runner Lease", {"pool": self.name}):
++			frappe.throw(_("Retain a pool while its lease history exists."))
++
++
++def on_doctype_update() -> None:
++	frappe.db.add_index("Runner Pool", ["team", "status"])
+diff --git a/central/infrastructure/doctype/runner_pool/runner_pool_list.js b/central/infrastructure/doctype/runner_pool/runner_pool_list.js
+new file mode 100644
+index 0000000..1497f64
+--- /dev/null
++++ b/central/infrastructure/doctype/runner_pool/runner_pool_list.js
+@@ -0,0 +1,3 @@
++frappe.listview_settings["Runner Pool"] = {
++	get_indicator(doc) { return [__(doc.status), doc.status === "Active" ? "green" : "orange", `status,=,${doc.status}`]; },
++};
+diff --git a/central/infrastructure/runway.py b/central/infrastructure/runway.py
+new file mode 100644
+index 0000000..5ba74dc
+--- /dev/null
++++ b/central/infrastructure/runway.py
+@@ -0,0 +1,263 @@
++from datetime import UTC
++from uuid import UUID
++from zoneinfo import ZoneInfo
++
++import frappe
++from frappe import _
++from frappe.utils import add_to_date, get_datetime, get_system_timezone, now_datetime
++
++from central.iam import can, user_has_operator_bypass
++
++OWNER_TTL_SECONDS = 60
++TEAM_CONCURRENCY_LIMIT = 4
++
++
++def authorize(pool) -> None:
++	if user_has_operator_bypass():
++		return
++	if frappe.session.user != pool.controller_user or not all(
++		can(frappe.session.user, pool.team, capability)
++		for capability in ("server:view", "server:create", "server:terminate")
++	):
++		frappe.throw(_("This user cannot control the runner pool."), frappe.PermissionError)
++
++
++def locked_pool(name: str):
++	pool = frappe.get_doc("Runner Pool", name, for_update=True)
++	authorize(pool)
++	return pool
++
++
++def check_fence(pool, owner_id: str, fence: int) -> None:
++	if (
++		pool.controller_owner != owner_id
++		or int(pool.fence or 0) != int(fence)
++		or not pool.owner_expires_at
++		or get_datetime(pool.owner_expires_at) <= now_datetime()
++	):
++		frappe.throw(_("Runner controller ownership expired or changed."), frappe.PermissionError)
++
++
++def save_internal(document) -> None:
++	# Controller routes authorize the pool; service users cannot write lifecycle fields through Desk or REST.
++	document.save(ignore_permissions=True)
++
++
++def active_leases(pool: str | None = None, team: str | None = None, lock: bool = False) -> list:
++	lease = frappe.qb.DocType("Runner Lease")
++	query = (
++		frappe.qb.from_(lease)
++		.select(lease.name)
++		.where((lease.phase != "deleted") | (lease.jit_state != "removed"))
++		.orderby(lease.creation)
++	)
++	if pool:
++		query = query.where(lease.pool == pool)
++	if team:
++		query = query.where(lease.team == team)
++	if lock:
++		query = query.for_update()
++	return query.run(as_dict=True)
++
++
++def iso_utc(value) -> str | None:
++	if not value:
++		return None
++	return get_datetime(value).replace(tzinfo=ZoneInfo(get_system_timezone())).astimezone(UTC).isoformat()
++
++
++def lease_snapshot(lease) -> dict:
++	fields = (
++		"pool",
++		"team",
++		"phase",
++		"runner_name",
++		"runner_id",
++		"job_id",
++		"workflow_run_id",
++		"vm_id",
++		"vm_state",
++		"mesh_address",
++		"last_error",
++		"jit_state",
++		"attempt_id",
++		"acquire_state",
++	)
++	result = {field: lease.get(field) or (0 if field == "runner_id" else "") for field in fields}
++	return {
++		"id": lease.name,
++		**result,
++		"request_id": int(lease.request_id or 0),
++		"deadline": iso_utc(lease.deadline),
++	}
++
++
++def pool_snapshot(pool) -> dict:
++	fields = ("team", "region", "repository_url", "scale_set_id", "max_concurrency", "max_job_seconds")
++	return {
++		"fence": int(pool.fence),
++		"pool": {
++			"id": pool.name,
++			**{field: pool.get(field) for field in fields},
++			"enabled": pool.status == "Active",
++			"owner_expires_at": iso_utc(pool.owner_expires_at),
++		},
++		"leases": [
++			lease_snapshot(frappe.get_doc("Runner Lease", row.name))
++			for row in active_leases(pool=pool.name, team=pool.team)
++		],
++	}
++
++
++def claim_pool(pool: str, owner_id: str) -> dict:
++	if not owner_id or len(owner_id) > 128:
++		frappe.throw(_("Supply a controller instance identity."))
++	document = locked_pool(pool)
++	if (
++		document.controller_owner
++		and document.controller_owner != owner_id
++		and document.owner_expires_at
++		and get_datetime(document.owner_expires_at) > now_datetime()
++	):
++		frappe.throw(_("Another runner controller owns this pool."))
++	document.controller_owner = owner_id
++	document.fence = int(document.fence or 0) + 1
++	document.owner_expires_at = add_to_date(now_datetime(), seconds=OWNER_TTL_SECONDS)
++	save_internal(document)
++	return pool_snapshot(document)
++
++
++def renew_pool(pool: str, owner_id: str, fence: int, last_error: str = "") -> dict:
++	document = locked_pool(pool)
++	check_fence(document, owner_id, fence)
++	document.owner_expires_at = add_to_date(now_datetime(), seconds=OWNER_TTL_SECONDS)
++	document.last_error = str(last_error)[:1000]
++	save_internal(document)
++	return pool_snapshot(document)
++
++
++def reserve_lease(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	# Admission is database-only and keyed by the caller's UUID. Retrying a rolled-back
++	# snapshot conflict cannot repeat an Atlas or GitHub mutation.
++	for attempt in range(3):
++		try:
++			return _reserve_lease(pool, owner_id, fence, lease_id)
++		except frappe.QueryDeadlockError:
++			frappe.db.rollback()
++			if attempt == 2:
++				raise
++
++
++def _reserve_lease(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	try:
++		identity = str(UUID(lease_id))
++	except ValueError, TypeError, AttributeError:
++		frappe.throw(_("Runner lease identity must be a UUID."))
++	team = frappe.db.get_value("Runner Pool", pool, "team")
++	# Serialize aggregate team admission before pool admission, in one lock order.
++	frappe.get_doc("Team", team, for_update=True)
++	document = locked_pool(pool)
++	check_fence(document, owner_id, fence)
++	if frappe.db.exists("Runner Lease", identity):
++		lease = scoped_lease(document, identity)
++		return lease_snapshot(lease)
++	if document.status != "Active":
++		frappe.throw(_("The runner pool is paused."))
++	if (
++		len(active_leases(pool=pool, team=team, lock=True)) >= int(document.max_concurrency)
++		or len(active_leases(team=team, lock=True)) >= TEAM_CONCURRENCY_LIMIT
++	):
++		frappe.throw(_("Runner capacity is exhausted."))
++	lease = frappe.get_doc(
++		{
++			"doctype": "Runner Lease",
++			"name": identity,
++			"pool": pool,
++			"team": team,
++			"phase": "reserved",
++			"attempt_id": identity,
++			"fence": int(fence),
++			"runner_name": f"runway-{UUID(identity).hex}",
++			"jit_state": "none",
++			"acquire_state": "none",
++			"deadline": add_to_date(now_datetime(), seconds=int(document.max_job_seconds)),
++		}
++	)
++	# The authenticated pool controller owns the reserved identity and capacity.
++	lease.insert(ignore_permissions=True, set_name=identity)
++	return lease_snapshot(lease)
++
++
++def scoped_lease(pool, lease_id: str):
++	lease = frappe.get_doc("Runner Lease", lease_id, for_update=True)
++	if lease.pool != pool.name or lease.team != pool.team:
++		frappe.throw(_("Runner lease belongs to another pool."), frappe.PermissionError)
++	return lease
++
++
++def fenced_lease(pool: str, owner_id: str, fence: int, lease_id: str):
++	document = locked_pool(pool)
++	check_fence(document, owner_id, fence)
++	return document, scoped_lease(document, lease_id)
++
++
++def update_lease(
++	pool: str,
++	owner_id: str,
++	fence: int,
++	lease_id: str,
++	event: str,
++	runner_id: int = 0,
++	job_id: str = "",
++	workflow_run_id: str = "",
++	result: str = "",
++	error: str = "",
++	request_id: int = 0,
++) -> dict:
++	_, lease = fenced_lease(pool, owner_id, fence, lease_id)
++	if event == "acquire_requested":
++		if not 0 < int(request_id) < 2**63 or (lease.request_id and int(lease.request_id) != int(request_id)):
++			frappe.throw(_("Job acquisition identity must remain a positive request ID."))
++		if lease.phase in ("deleting", "deleted"):
++			frappe.throw(_("A retiring runner cannot acquire work."))
++		lease.request_id = str(request_id)
++		lease.acquire_state = "pending" if lease.acquire_state != "acquired" else "acquired"
++	elif event == "acquired":
++		if not lease.request_id or lease.acquire_state not in ("pending", "acquired"):
++			frappe.throw(_("Persist job acquisition intent first."))
++		lease.acquire_state = "acquired"
++	elif event == "runner_removed":
++		lease.jit_state = "removed"
++	elif event in ("completed", "failed"):
++		if lease.phase != "deleted":
++			lease.phase = "deleting"
++		lease.result = str(result)[:140]
++		lease.completed_at = now_datetime()
++	else:
++		transitions = {
++			"jit_requested": ("vm_ready", "jit_pending"),
++			"jit_ready": ("jit_pending", "jit_ready"),
++			"bootstrapped": ("jit_ready", "running"),
++			"started": ("running", "running"),
++		}
++		if event not in transitions:
++			frappe.throw(_("Unknown runner lease event."))
++		before, after = transitions[event]
++		if lease.phase not in (before, after):
++			frappe.throw(_("Runner lease event is invalid for its phase."))
++		lease.phase = after
++		if event in ("jit_requested", "jit_ready"):
++			lease.jit_state = "pending" if event == "jit_requested" else "ready"
++		if event in ("started", "bootstrapped"):
++			lease.started_at = lease.started_at or now_datetime()
++	for field, value in (("runner_id", runner_id), ("job_id", job_id), ("workflow_run_id", workflow_run_id)):
++		if value:
++			if lease.get(field) and str(lease.get(field)) != str(value):
++				frappe.throw(_("Runner job identity changed within a lease."))
++			lease.set(field, value)
++	# The lease is a durable audit record. An event that carries no new error must keep the
++	# recorded retirement reason or the failure to collect job diagnostics.
++	if error:
++		lease.last_error = str(error)[:1000]
++	save_internal(lease)
++	return lease_snapshot(lease)
+diff --git a/central/integrations/runway.py b/central/integrations/runway.py
+new file mode 100644
+index 0000000..2174d8a
+--- /dev/null
++++ b/central/integrations/runway.py
+@@ -0,0 +1,184 @@
++import frappe
++from frappe.utils import get_datetime, now_datetime
++
++from central.errors import AtlasConnectionError, AtlasRejected, AtlasRequestUncertain, AtlasResourceGone
++from central.infrastructure.runway import active_leases, fenced_lease, lease_snapshot, save_internal
++from central.integrations.atlas import AtlasClient
++
++
++def client_for_pool(pool) -> AtlasClient:
++	return AtlasClient.for_team(frappe.get_doc("Region", pool.region), pool.team, capability="server:create")
++
++
++def ensure_vm(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	document, lease = fenced_lease(pool, owner_id, fence, lease_id)
++	if (
++		lease.phase == "reserved"
++		and get_datetime(lease.deadline) > now_datetime()
++		and document.status == "Active"
++	):
++		lease.phase = "provisioning"
++		lease.create_dispatched_at = now_datetime()
++		save_internal(lease)
++		# Persist one dispatch intent before sending. An interrupted dispatch is never sent again.
++		frappe.db.commit()
++		create_vm(document, lease)
++	else:
++		frappe.db.commit()
++	reconcile_lease(document, lease.name)
++	return lease_snapshot(frappe.get_doc("Runner Lease", lease.name))
++
++
++def create_vm(pool, lease) -> None:
++	payload = {
++		"image_id": pool.image_id,
++		"cpu_millicores": pool.cpu_millicores,
++		"memory_mib": pool.memory_mib,
++		"disk_mib": pool.disk_mib,
++		"hostname": lease.runner_name,
++		"ssh_keys": [pool.ssh_public_key],
++		"sleep_after_idle_seconds": 0,
++		"tags": {"runway_pool": pool.name, "runway_lease": lease.name, "role": "ci", "team": pool.team},
++	}
++	try:
++		response = client_for_pool(pool).create_vm(payload)
++	except AtlasRejected:
++		lease.reload()
++		lease.phase = "deleting"
++		lease.create_dispatched_at = None
++		lease.last_error = "Atlas rejected VM creation."
++	except AtlasRequestUncertain, AtlasConnectionError:
++		lease.reload()
++		lease.phase = "uncertain" if lease.phase not in ("deleting", "deleted") else lease.phase
++		lease.last_error = "VM creation outcome is uncertain; reconciling tags without another create."
++	else:
++		lease.reload()
++		if not response.get("id"):
++			lease.phase = "uncertain" if lease.phase not in ("deleting", "deleted") else lease.phase
++			lease.last_error = "Atlas create response did not identify a VM."
++		else:
++			lease.vm_id = response["id"]
++	save_internal(lease)
++	frappe.db.commit()
++
++
++def pool_vms(pool) -> list[dict]:
++	client = client_for_pool(pool)
++	rows = []
++	offset = 0
++	while True:
++		page = client.list_vms(limit=100, offset=offset)
++		rows.extend(vm for vm in page if vm.get("tags", {}).get("runway_pool") == pool.name)
++		if len(page) < 100:
++			return rows
++		offset += 100
++
++
++def find_vm(pool, lease) -> str | None:
++	matches = [vm for vm in pool_vms(pool) if vm.get("tags", {}).get("runway_lease") == lease.name]
++	if len(matches) == 1:
++		return matches[0]["id"]
++	if len(matches) > 1:
++		lease.last_error = "Multiple VMs match the lease; operator review is required."
++	return None
++
++
++def mark_deleted(lease) -> None:
++	lease.phase = "deleted"
++	lease.deleted_at = now_datetime()
++	lease.vm_state = "absent"
++	if lease.jit_state == "none":
++		lease.jit_state = "removed"
++
++
++def reconcile_lease(pool, name: str) -> None:
++	lease = frappe.get_doc("Runner Lease", name, for_update=True)
++	if lease.phase == "deleted":
++		frappe.db.commit()
++		return
++	if get_datetime(lease.deadline) <= now_datetime():
++		lease.phase = "deleting"
++	if not lease.vm_id and lease.create_dispatched_at:
++		lease.vm_id = find_vm(pool, lease)
++	if not lease.vm_id:
++		if lease.phase == "deleting" and not lease.create_dispatched_at:
++			mark_deleted(lease)
++		save_internal(lease)
++		frappe.db.commit()
++		return
++	client = client_for_pool(pool)
++	try:
++		state = client.get_vm(lease.vm_id)
++	except AtlasResourceGone:
++		mark_deleted(lease)
++	else:
++		lease.vm_state = state.get("current_state") or "unknown"
++		lease.mesh_address = (state.get("network") or {}).get("mesh_ipv6") or ""
++		if lease.phase == "deleting":
++			lease.delete_requested_at = lease.delete_requested_at or now_datetime()
++			save_internal(lease)
++			frappe.db.commit()
++			try:
++				client.vm_action(lease.vm_id, "terminate")
++			except AtlasResourceGone:
++				# Confirm through GET on the next pass, rather than infer completion from DELETE.
++				pass
++			except AtlasRequestUncertain:
++				lease.reload()
++				lease.last_error = "VM deletion outcome is uncertain; waiting for scoped absence."
++				save_internal(lease)
++				frappe.db.commit()
++			return
++		elif lease.phase in ("provisioning", "uncertain") and lease.vm_state == "running":
++			lease.phase = "vm_ready"
++	save_internal(lease)
++	frappe.db.commit()
++
++
++def request_delete(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
++	document, lease = fenced_lease(pool, owner_id, fence, lease_id)
++	if lease.phase != "deleted":
++		lease.phase = "deleting"
++		save_internal(lease)
++	frappe.db.commit()
++	reconcile_lease(document, lease.name)
++	return lease_snapshot(frappe.get_doc("Runner Lease", lease.name))
++
++
++def sweep() -> None:
++	# A system task repairs only VMs bearing an existing pool and lease identity.
++	for row in frappe.get_all("Runner Pool", fields=["name", "team"]):
++		pool = frappe.get_doc("Runner Pool", row.name)
++		for lease in active_leases(pool=pool.name, team=pool.team):
++			try:
++				reconcile_lease(pool, lease.name)
++			except AtlasConnectionError:
++				frappe.db.rollback()
++				frappe.db.set_value(
++					"Runner Lease",
++					lease.name,
++					"last_error",
++					"Regional reconciliation failed; cleanup remains pending.",
++				)
++				frappe.db.commit()
++		try:
++			remove_orphans(pool)
++		except AtlasConnectionError:
++			frappe.db.rollback()
++			frappe.db.set_value("Runner Pool", pool.name, "last_error", "Regional orphan scan failed.")
++			frappe.db.commit()
++
++
++def remove_orphans(pool) -> None:
++	client = client_for_pool(pool)
++	for vm in pool_vms(pool):
++		tags = vm.get("tags") or {}
++		identity = tags.get("runway_lease")
++		if not identity or tags.get("team") != pool.team or tags.get("role") != "ci":
++			continue
++		if frappe.db.exists("Runner Lease", {"name": identity, "pool": pool.name, "team": pool.team}):
++			continue
++		try:
++			client.vm_action(vm["id"], "terminate")
++		except AtlasResourceGone, AtlasRequestUncertain:
++			pass
+diff --git a/central/permissions.py b/central/permissions.py
+index ae9cdee..0af37f5 100644
+--- a/central/permissions.py
++++ b/central/permissions.py
+@@ -342,3 +342,23 @@ def _server_scoped_has_permission(doc, server_field: str, user: str | None, ptyp
+ def _escape_values(values) -> str:
+ 	"""A comma-separated list of SQL-escaped values for an `in (...)` condition."""
+ 	return ", ".join(frappe.db.escape(value) for value in sorted(values))
++
++
++def runner_pool_query_conditions(user: str | None = None) -> str:
++	"""1. Operators see all pools. 2. Others require team-wide server:view."""
++	return _team_field_query_conditions("Runner Pool", "server:view", user)
++
++
++def runner_pool_has_permission(doc, user: str | None = None, ptype: str | None = None, **kwargs) -> bool:
++	"""1. Operators manage pools. 2. Others can only read their authorized Team."""
++	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
++
++
++def runner_lease_query_conditions(user: str | None = None) -> str:
++	"""1. Operators see all leases. 2. Others require team-wide server:view."""
++	return _team_field_query_conditions("Runner Lease", "server:view", user)
++
++
++def runner_lease_has_permission(doc, user: str | None = None, ptype: str | None = None, **kwargs) -> bool:
++	"""1. Operators inspect leases. 2. Others can only read their authorized Team."""
++	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
+diff --git a/central/tests/test_runway.py b/central/tests/test_runway.py
+new file mode 100644
+index 0000000..0c56a68
+--- /dev/null
++++ b/central/tests/test_runway.py
+@@ -0,0 +1,317 @@
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++from uuid import uuid4
++
++import frappe
++from frappe.tests import IntegrationTestCase
++from frappe.utils import add_to_date, now_datetime
++
++from central.errors import AtlasRequestUncertain, AtlasResourceGone
++from central.infrastructure import runway
++from central.integrations import runway as regional
++from central.permissions import runner_lease_has_permission, runner_lease_query_conditions
++
++
++class TestRunway(IntegrationTestCase):
++	def setUp(self):
++		super().setUp()
++		frappe.set_user("Administrator")
++		self.team = frappe.get_doc(
++			{"doctype": "Team", "team_name": f"Runway test {uuid4()}", "owner_user": "Administrator"}
++		).insert()
++		self.region = frappe.get_doc(
++			{
++				"doctype": "Region",
++				"region": f"test-{uuid4().hex[:12]}",
++				"atlas_region_id": str(int(uuid4().hex[:4], 16)),
++				"base_url": "https://atlas.example.test",
++				"status": "Active",
++			}
++		).insert()
++		from cryptography.hazmat.primitives import serialization
++		from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
++
++		key = (
++			Ed25519PrivateKey.generate()
++			.public_key()
++			.public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
++			.decode()
++		)
++		self.pool = frappe.get_doc(
++			{
++				"doctype": "Runner Pool",
++				"title": "Runway integration test",
++				"team": self.team.name,
++				"region": self.region.name,
++				"controller_user": "Administrator",
++				"repository_url": "https://github.com/example/ci",
++				"scale_set_id": 1,
++				"image_id": "test-image",
++				"status": "Active",
++				"max_concurrency": 1,
++				"cpu_millicores": 1000,
++				"memory_mib": 2048,
++				"disk_mib": 4096,
++				"max_job_seconds": 600,
++				"ssh_public_key": key,
++			}
++		).insert()
++		self.owner = str(uuid4())
++		self.fence = runway.claim_pool(self.pool.name, self.owner)["fence"]
++		frappe.db.commit()
++		self.addCleanup(self.cleanup_records)
++
++	def cleanup_records(self):
++		frappe.set_user("Administrator")
++		frappe.db.rollback()
++		# Tests own disposable fixtures, including immutable lease audit rows.
++		frappe.db.delete("Runner Lease", {"pool": self.pool.name})
++		frappe.db.delete("Runner Pool", {"name": self.pool.name})
++		frappe.db.delete("Region", {"name": self.region.name})
++		frappe.db.delete("Team Member", {"parent": self.team.name})
++		frappe.db.delete("Team", {"name": self.team.name})
++		frappe.db.commit()
++
++	def reserve(self):
++		return runway.reserve_lease(self.pool.name, self.owner, self.fence, str(uuid4()))
++
++	def test_duplicate_reservation_cannot_bypass_capacity(self):
++		lease = self.reserve()
++		self.assertEqual(
++			runway.reserve_lease(self.pool.name, self.owner, self.fence, lease["id"])["id"], lease["id"]
++		)
++		with self.assertRaises(frappe.ValidationError):
++			self.reserve()
++		self.assertEqual(len(runway.active_leases(pool=self.pool.name)), 1)
++
++	def test_concurrent_reservations_share_one_capacity_slot(self):
++		site, sites_path = frappe.local.site, frappe.local.sites_path
++		pool, owner, fence = self.pool.name, self.owner, self.fence
++		barrier = Barrier(2)
++		frappe.db.commit()
++
++		def reserve_concurrently():
++			frappe.init(site=site, sites_path=sites_path)
++			frappe.connect()
++			frappe.set_user("Administrator")
++			try:
++				barrier.wait(timeout=10)
++				runway.reserve_lease(pool, owner, fence, str(uuid4()))
++				frappe.db.commit()
++				return "reserved"
++			except frappe.ValidationError:
++				frappe.db.rollback()
++				return "full"
++			finally:
++				frappe.destroy()
++
++		with ThreadPoolExecutor(max_workers=2) as executor:
++			results = list(executor.map(lambda _: reserve_concurrently(), range(2)))
++		self.assertCountEqual(results, ["reserved", "full"])
++
++	def test_pool_identity_stays_frozen_until_github_cleanup(self):
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], {"phase": "deleted", "jit_state": "ready"})
++		self.pool.reload()
++		self.pool.repository_url = "https://github.com/other/repository"
++		with self.assertRaises(frappe.ValidationError):
++			self.pool.save()
++
++	def test_reclaim_fences_old_controller(self):
++		new = runway.claim_pool(self.pool.name, self.owner)
++		self.assertGreater(new["fence"], self.fence)
++		with self.assertRaises(frappe.PermissionError):
++			self.reserve()
++
++	def test_controller_requires_pool_assignment_and_capabilities(self):
++		with (
++			patch.object(runway, "user_has_operator_bypass", return_value=False),
++			patch.object(runway, "can", return_value=True),
++		):
++			pool = SimpleNamespace(controller_user="someone-else", team=self.team.name)
++			with self.assertRaises(frappe.PermissionError):
++				runway.authorize(pool)
++		with (
++			patch.object(runway, "user_has_operator_bypass", return_value=False),
++			patch.object(runway, "can", return_value=False),
++		):
++			with self.assertRaises(frappe.PermissionError):
++				runway.authorize(self.pool)
++
++	def test_lease_access_denies_cross_team_and_direct_writes(self):
++		with (
++			patch("central.permissions.user_has_operator_bypass", return_value=False),
++			patch(
++				"central.permissions.can", side_effect=lambda user, team, capability: team == self.team.name
++			),
++			patch("central.permissions.get_user_team_names_with_capability", return_value=[]),
++		):
++			self.assertTrue(
++				runner_lease_has_permission(SimpleNamespace(team=self.team.name), "reader", "read")
++			)
++			self.assertFalse(runner_lease_has_permission(SimpleNamespace(team="other"), "reader", "read"))
++			self.assertFalse(
++				runner_lease_has_permission(SimpleNamespace(team=self.team.name), "reader", "write")
++			)
++			self.assertEqual(runner_lease_query_conditions("outsider"), "1 = 0")
++		lease = self.reserve()
++		with self.assertRaises(frappe.PermissionError):
++			runway.scoped_lease(SimpleNamespace(name="other-pool", team=self.team.name), lease["id"])
++
++	def test_uncertain_create_is_not_repeated_and_can_be_discovered(self):
++		lease = self.reserve()
++		client = Mock()
++		client.create_vm.side_effect = AtlasRequestUncertain("lost reply")
++		client.list_vms.return_value = []
++		with patch.object(regional, "client_for_pool", return_value=client):
++			first = regional.ensure_vm(self.pool.name, self.owner, self.fence, lease["id"])
++			self.assertEqual(first["phase"], "uncertain")
++			regional.ensure_vm(self.pool.name, self.owner, self.fence, lease["id"])
++			client.create_vm.assert_called_once()
++			client.list_vms.return_value = [
++				{"id": "vm-42", "tags": {"runway_pool": self.pool.name, "runway_lease": lease["id"]}}
++			]
++			client.get_vm.return_value = {"current_state": "running", "network": {"mesh_ipv6": "fdaa::42"}}
++			found = regional.ensure_vm(self.pool.name, self.owner, self.fence, lease["id"])
++			self.assertEqual(found["vm_id"], "vm-42")
++			self.assertEqual(found["phase"], "vm_ready")
++			client.create_vm.assert_called_once()
++
++	def test_uncertain_create_preserves_concurrent_cleanup_intent(self):
++		lease = self.reserve()
++		client = Mock()
++
++		def concurrent_cleanup(_payload):
++			frappe.db.set_value("Runner Lease", lease["id"], "phase", "deleting")
++			frappe.db.commit()
++			return {}
++
++		client.create_vm.side_effect = concurrent_cleanup
++		client.list_vms.return_value = []
++		with patch.object(regional, "client_for_pool", return_value=client):
++			result = regional.ensure_vm(self.pool.name, self.owner, self.fence, lease["id"])
++		self.assertEqual(result["phase"], "deleting")
++
++	def test_expired_vm_requires_scoped_absence_and_github_cleanup(self):
++		lease = self.reserve()
++		frappe.db.set_value(
++			"Runner Lease",
++			lease["id"],
++			{
++				"vm_id": "vm-42",
++				"phase": "running",
++				"jit_state": "ready",
++				"deadline": add_to_date(now_datetime(), seconds=-1),
++			},
++		)
++		frappe.db.commit()
++		client = Mock()
++		client.get_vm.return_value = {"current_state": "running", "network": {}}
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.reconcile_lease(self.pool, lease["id"])
++			self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "phase"), "deleting")
++			client.vm_action.assert_called_once_with("vm-42", "terminate")
++			client.get_vm.side_effect = AtlasResourceGone("scoped 404")
++			regional.reconcile_lease(self.pool, lease["id"])
++			self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "phase"), "deleted")
++			self.assertEqual(len(runway.active_leases(pool=self.pool.name)), 1)
++			runway.update_lease(self.pool.name, self.owner, self.fence, lease["id"], "runner_removed")
++			self.assertEqual(runway.active_leases(pool=self.pool.name), [])
++
++	def test_delete_reply_does_not_overwrite_concurrent_runner_cleanup(self):
++		lease = self.reserve()
++		frappe.db.set_value(
++			"Runner Lease", lease["id"], {"phase": "deleting", "vm_id": "vm-42", "jit_state": "ready"}
++		)
++		client = Mock()
++		client.get_vm.return_value = {"current_state": "running", "network": {}}
++
++		def report_github_cleanup(*_):
++			frappe.db.set_value("Runner Lease", lease["id"], "jit_state", "removed")
++			frappe.db.commit()
++
++		client.vm_action.side_effect = report_github_cleanup
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.reconcile_lease(self.pool, lease["id"])
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "jit_state"), "removed")
++
++	def test_retirement_reason_survives_runner_removed_and_cleanup(self):
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], {"vm_id": "vm-42", "phase": "running"})
++		frappe.db.commit()
++		reason = "JIT registration outcome uncertain; registration requires cleanup"
++		retirement = runway.update_lease(
++			self.pool.name, self.owner, self.fence, lease["id"], "failed", error=reason
++		)
++		self.assertEqual(retirement["phase"], "deleting")
++		self.assertEqual(retirement["last_error"], reason)
++		client = Mock()
++		client.get_vm.return_value = {"current_state": "running", "network": {}}
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.reconcile_lease(self.pool, lease["id"])
++			client.get_vm.side_effect = AtlasResourceGone("scoped 404")
++			regional.reconcile_lease(self.pool, lease["id"])
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "phase"), "deleted")
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "last_error"), reason)
++		removed = runway.update_lease(self.pool.name, self.owner, self.fence, lease["id"], "runner_removed")
++		self.assertEqual(removed["jit_state"], "removed")
++		self.assertEqual(removed["last_error"], reason)
++
++	def test_completion_diagnostic_failure_survives_runner_removed(self):
++		lease = self.reserve()
++		reason = "Job log upload failed; diagnostics are incomplete"
++		completed = runway.update_lease(
++			self.pool.name,
++			self.owner,
++			self.fence,
++			lease["id"],
++			"completed",
++			result="success",
++			error=reason,
++		)
++		self.assertEqual(completed["last_error"], reason)
++		removed = runway.update_lease(self.pool.name, self.owner, self.fence, lease["id"], "runner_removed")
++		self.assertEqual(removed["jit_state"], "removed")
++		self.assertEqual(removed["last_error"], reason)
++		# A later error is new evidence, so it replaces the stored diagnostic failure.
++		replaced = runway.update_lease(
++			self.pool.name,
++			self.owner,
++			self.fence,
++			lease["id"],
++			"failed",
++			error="Runner cleanup verification timed out",
++		)
++		self.assertEqual(replaced["last_error"], "Runner cleanup verification timed out")
++
++	def test_unknown_create_cannot_be_declared_deleted(self):
++		lease = self.reserve()
++		frappe.db.set_value(
++			"Runner Lease", lease["id"], {"phase": "deleting", "create_dispatched_at": now_datetime()}
++		)
++		client = Mock()
++		client.list_vms.return_value = []
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.reconcile_lease(self.pool, lease["id"])
++		self.assertEqual(frappe.db.get_value("Runner Lease", lease["id"], "phase"), "deleting")
++		client.create_vm.assert_not_called()
++
++	def test_orphan_cleanup_requires_owned_tags(self):
++		client = Mock()
++		client.list_vms.return_value = [
++			{
++				"id": "orphan",
++				"tags": {
++					"runway_pool": self.pool.name,
++					"runway_lease": str(uuid4()),
++					"team": self.team.name,
++					"role": "ci",
++				},
++			},
++			{"id": "unrelated", "tags": {"runway_pool": self.pool.name}},
++		]
++		with patch.object(regional, "client_for_pool", return_value=client):
++			regional.remove_orphans(self.pool)
++		client.vm_action.assert_called_once_with("orphan", "terminate")
+diff --git a/spec/README.md b/spec/README.md
+index f47455c..287a37b 100644
+--- a/spec/README.md
++++ b/spec/README.md
+@@ -23,6 +23,8 @@ Each module specification below describes current behavior. Update it in the sam
+ - [Trial sites](../central/infrastructure/doctype/site/SPEC.md): the site a Pilot image carries, its predictable address, and the signup handoff.
+ - [VM snapshots](../central/infrastructure/doctype/vm_snapshot/SPEC.md): the free-snapshot pricing rule, daily snapshots, terminate with a snapshot, and restore.
+ 
++- [Runway internal runner pilot](RUNWAY.md): pool ownership, durable leases, admission, and cleanup.
++
+ ## Cross-cutting specifications
+ 
+ - [IAM](IAM.md): Central identity and permission model.
+diff --git a/spec/RUNWAY.md b/spec/RUNWAY.md
+new file mode 100644
+index 0000000..3d405ad
+--- /dev/null
++++ b/spec/RUNWAY.md
+@@ -0,0 +1,41 @@
++# Runway internal runner pilot
++
++## Purpose
++
++Central stores the bounded runner pool and lease lifecycle. The Runway process owns GitHub registration, event polling, and guest transport. Atlas calls remain inside `central/integrations/runway.py`, through the existing Team-authorized client. This pilot has no billing or customer dashboard.
++
++## Authorization and ownership
++
++Pool configuration is operator-only. A service user has `Central User`, a team-wide role granting `server:view`, `server:create`, and `server:terminate`, and must equal the pool's `controller_user`. `System Manager` remains the only operator bypass. Both DocType list and document permission hooks enforce team-wide read access. Direct customer lifecycle writes are denied.
++
++A controller claims a pool with a unique `owner_id`. Every successful claim increments the fence, including a same-owner reclaim. Another owner waits for expiry. Ownership lasts 60 seconds; the controller renews before expiry. Every lease RPC checks identity, fence, and expiry under the pool row lock.
++
++## Admission and lifecycle
++
++`Runner Pool` stores Team, region, repository, scale set, image, resources, SSH public key, concurrency, and deadline policy. Pool identity and image cannot change while any lease has unfinished VM or GitHub cleanup. `Runner Lease` is an immutable-identity audit record with its attempt UUID, runner identity, observed VM, job identity, deadlines, result, and error.
++
++Reservation locks the Team and pool before counting active leases. The pool limit applies alongside a fixed internal-pilot maximum of four leases per Team. A lease continues to consume capacity until phase is `deleted` and `jit_state` is `removed`. Snapshot conflicts retry only rolled-back database admission using the same lease UUID; this never retries a remote mutation.
++
++`max_job_seconds` currently means total lease lifetime from reservation, including provisioning and bootstrap. It is not execution-only billing time. Guest runtime limits must be compatible with this configured deadline.
++
++Phases are `reserved`, `provisioning`, `uncertain`, `vm_ready`, `jit_pending`, `jit_ready`, `running`, `deleting`, and `deleted`. JIT material is never stored here. The controller persists `jit_pending` before registration; an uncertain registration is retired rather than repeated. GitHub removal is separately recorded with `runner_removed`.
++
++## Regional reconciliation
++
++Creation intent is committed before one Atlas POST. A lost response retains the attempt and searches pool/lease tags; it never resends creation. If no matching VM can be found, the uncertain lease remains capacity-consuming, even after expiry. Operator investigation is required to establish an authoritative outcome. Tags do not provide atomic idempotency.
++
++The scheduler checks leases every ten seconds, expires them into cleanup, and confirms VM absence with a scoped GET. An accepted DELETE is not completion. GitHub runner cleanup remains the controller's responsibility, including after scheduler-driven VM deletion.
++
++An orphan scan selects only the current pool's tenant-scoped VMs with matching `runway_pool`, `runway_lease`, `team`, and CI role tags. It requests deletion only when no corresponding lease exists. Network failures leave visible pool or lease errors. Configure the bench scheduler tick to ten seconds and run its worker queues; merely installing DocTypes does not run reconciliation.
++
++## RPC contract
++
++Authenticated POST calls use `/api/method/central.api.runway.<method>` and Frappe's `message` envelope. Calls are `claim_pool`, `renew_pool`, `reserve_lease`, `update_lease`, `ensure_vm`, and `request_delete`. Except claim, each carries `pool`, `owner_id`, and `fence`; lease calls also carry `lease_id`.
++
++Claim and renew return the fence, pool configuration, and leases whose cleanup is incomplete. Times are ISO UTC. A reservation uses a caller-generated UUID and returns the same lease when repeated. VM provisioning and cleanup return the latest lease snapshot.
++
++Update events are `acquire_requested`, `acquired`, `jit_requested`, `jit_ready`, `bootstrapped`, `started`, `completed`, `failed`, and `runner_removed`. Acquisition identity is persisted before GitHub acquisition. Positive request IDs and job/runner identities cannot be replaced within a lease. A zero-request direct assignment uses the job UUID and expected runner in Runway.
++
++## Validation
++
++`central.tests.test_runway` exercises real concurrent reservations, duplicate capacity, fencing, authorization denial, cross-team reads, lifecycle write denial, uncertain creation and discovery, expired VM deletion, independent GitHub cleanup, owned orphan cleanup, and preservation of cleanup intent during uncertain responses. Run it only on a separate test site.
