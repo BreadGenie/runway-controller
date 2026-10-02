@@ -14,7 +14,7 @@ The tested builder uses one vCPU, 2 GiB RAM, and a 4 GiB disk. On a small Metal 
 
 Create a new VM through `scripts/atlas-vm.py`, using an explicit source image and a new creation journal. The builder must never receive JIT material or run a GitHub job. A used runner cannot become a shared image, even if its registration files are later removed.
 
-Copy the guest installer and sealing script into the builder. Run these commands as root **inside that guest**:
+Copy the guest installer, the sealing script, and any profile script into the builder. Run these commands as root **inside that guest**:
 
 ```sh
 bash install-guest-runner.sh --inside-disposable-guest
@@ -23,7 +23,37 @@ bash seal-runner-image.sh --inside-unregistered-image-builder
 
 The installer checks runner execution and Docker access. The sealing script refuses a registered runner, stops guest services, clears Docker state, SSH identities, cloud-init instance data, machine identity, logs, package caches, and user history. It leaves Docker enabled for a new clone's first boot.
 
+To ship an image that a Frappe workflow can use directly, add the dependency profile between the installer and the sealing script. See [Add the Frappe dependency profile](#add-the-frappe-dependency-profile).
+
 Stop the builder through Central's `AtlasClient.vm_action(vm_id, "stop")`. Poll until its observed state is stopped. Do not restart or register the sealed builder.
+
+## Add the Frappe dependency profile
+
+A Frappe job installs its own system dependencies on every run through `.github/actions/setup`, and on a fresh clone those installs dominate the run. [`guest/prepare-frappe-image.sh`](../guest/prepare-frappe-image.sh) bakes the same dependency set into a builder, so a job starts with them already present. It adds to the base image rather than replacing it: a Docker-only workload still boots an image that carries the profile.
+
+Run it as root inside the same builder, after the guest installer and before the sealing script:
+
+```sh
+bash prepare-frappe-image.sh --inside-unregistered-image-builder
+```
+
+The script refuses any guest whose runner is registered, whose runner directory holds registration state, or that carries a JIT bootstrap marker, and it refuses to run outside a root shell on Ubuntu 24.04 x86_64. It is safe to repeat on one builder, because every stage either skips what is present or replaces only the section it owns. A background `apt` or yarn install already running in that builder still holds the dpkg lock; let it finish before starting this.
+
+The package set mirrors the workflow's own list: build-essential, pkg-config, libmariadb-dev, libpq-dev, libcups2-dev, redis-server, mariadb-client, postgresql-client-18, curl, wget, gnupg, lsb-release, Ubuntu's nodejs and npm, and yarn 1.22.22. MariaDB's repository is set to 11.8.5 by the vendor's own setup script, invoked exactly as the workflow invokes it, and Ubuntu's MySQL metapackages and PostgreSQL 16 client are removed first so the image carries one client per database. PGDG's key is dearmored into a keyring that `signed-by` names, because `apt-key` is deprecated and absent from current apt and the workflow's `apt-key add` cannot be copied. The file `/etc/apt/apt.conf.d/99runway-ci` answers the workflow's own `sudo apt -qq install`, which carries neither `-y` nor `DEBIAN_FRONTEND` and would otherwise stop at its confirmation prompt, and it keeps existing conffiles.
+
+The workflow also resolves its toolchain through `RUNNER_TOOL_CACHE` before downloading anything, and with `check-latest` left at its default it takes the newest version already present. The script therefore installs Python 3.14.7 from the official `actions/python-versions` archive and Node 24.21.0 from nodejs.org under `/opt/hostedtoolcache`, each in the `x64` layout with its `x64.complete` marker, owned by the runner user so a setup action can still extend or replace an entry it manages. The archive's own installer deletes a version directory it finds, so the script never runs it against an entry it did not create: a complete entry is left alone and anything else stops the build. Both archives are checked against digests pinned in the script, and the Node digest is additionally cross-checked against the digest nodejs.org currently publishes, so a republished artifact stops the build instead of quietly changing what the image claims to ship. An operator who already staged and verified the Python archive in the guest may leave it in `/tmp/runway-frappe/`, and that copy is used and checksummed again. These are the public tool distributions a hosted image ships, not a job's dependency cache: nothing in them was produced by another job, and sealing leaves `/opt` alone, so both entries reach every clone. The distribution nodejs stays the default Node outside a job, the setup action puts the tool cache copy ahead of it on PATH for the steps that pin a version, and the single yarn installed from npm serves both because its launcher resolves `node` from PATH when it runs.
+
+Only the runner archive and those three tool archives are pinned. The MariaDB setup script, the PGDG key, and every apt package are fetched live at build time, are not checksum-verified by this recipe, and depend on the repositories as they are that day. Rebuilding is how an image picks up repository changes, so read `/etc/runway-runner-image.txt` from the published image to learn what a given build shipped. The `wkhtmltox` package is the third pinned archive: the script downloads it from the same official release, checks it against its digest, installs it, and deletes the download, because the workflow fetches its own copy at `/tmp/wkhtmltox.deb` and no job reads an archive from inside the image. Sealing empties `/tmp`, so a clone's first job takes the cache-miss branch and downloads it again; the installed package is what makes that reinstall a no-op.
+
+The builder needs room for the finished image plus this recipe's scratch, because the tool archives are downloaded and extracted before anything is measured: the build that produced the published profile image used a 10 GiB guest. The 4 GiB builder described above is enough for the runner-only image and not for this profile, because the tool cache is written and expanded inside the guest before the finalizer truncates anything. The script measures the root filesystem after cleaning the apt cache and after deleting its own private staging tree, so the measurement is the image's own content rather than this recipe's scratch, and it fails when that exceeds 3.5 GiB. That gate is only about what the finalizer can truncate; it is not a claim about the space a job needs, and it does not tell you how large the builder disk must be.
+
+Size the pool separately from the artifact. The 4 GiB is a truncation target, not a capacity plan: a substantial Frappe workflow still installs its own bench environment, node modules, assets, and checkout on every run, so a pool serving it needs roughly 10 GiB per guest, and the guest transport grows the sealed filesystem onto that larger disk at boot. The manifest records the published filesystem size, the budget, the bytes this build used, and the free space that leaves, so the capacity of a given image is a recorded measurement rather than a promise, and an ENOSPC in a job is a capacity result rather than a benchmark fluke.
+
+An image published before this recipe stopped retaining the `wkhtmltox` archive still carries that 17 MB package under `/opt/runway`. Its raw filesystem SHA-256 is what identifies it, because the digest this recipe records was not in its manifest; the package inside it was confirmed separately, by extracting it from the published filesystem and matching the official release download. Build-specific measurements and runtime evidence belong with the pilot's recorded results, not in this recipe.
+
+This recipe installs dependencies only. It does not install Frappe, bench, Python packages, node modules, or any GitHub credential, and it neither checks out the repository nor runs a job. The workflow still performs setup, `bench init`, and its own dependency installs on every run, and it still requests Python `3.14` and Node `24`; pinning it to the exact `3.14.7` this image carries is a separate change.
+
+After sealing and publishing, verify a fresh clone by reading the manifest, running the tool cache `python3.14` and `node` by path, `yarn --version`, `psql --version`, `mariadb --version`, and `wkhtmltopdf --version`, confirming both tool cache entries belong to the runner user, and confirming `.runner` and `.credentials` are still absent.
 
 ## Capture and export
 
@@ -48,7 +78,11 @@ zstd --decompress /private/runner.ext4.zst --output /private/runner.ext4
 bash scripts/finalize-runner-image.sh /private/runner.ext4
 ```
 
-The finalizer checks sealing preconditions, repairs the filesystem, resizes it to 4 GiB before truncation, replaces the ext4 journal, and zeroes unused blocks. The last two steps remove residual deleted identity material from free blocks and the old journal. It then writes a fresh compressed artifact and prints both hashes. Never run it against a mounted filesystem or a live VM disk.
+The finalizer repairs the filesystem before it inspects it. A stopped VM's export carries a dirty ext4 journal, and `debugfs` reads a filesystem without replaying one, so a file that is present can be reported as missing and an inode bitmap can fail its checksum for reasons that no credential problem explains. The finalizer therefore runs `e2fsck -f -p` first, accepts the statuses that mean repaired, and only then checks the sealing marker and the absent registration files.
+
+`e2fsck -p` never answers yes on the operator's behalf and never makes a change it is unsure about. When it cannot finish, the finalizer stops and says so instead of inspecting an unrepaired export, because those file checks are the only credential guard a published image gets. Review the unmounted export yourself, repeat the finalizer on a clean result, and verify a fresh VM afterwards. An export that needed unreviewed repair is not evidence for anything.
+
+The finalizer then resizes the filesystem to 4 GiB before truncation, replaces the ext4 journal, and zeroes unused blocks. The last two steps remove residual deleted identity material from free blocks and the old journal. It then writes a fresh compressed artifact and prints both hashes. Never run it against a mounted filesystem or a live VM disk. The Frappe profile image exposed this ordering: `e2fsck -f -p` exited 4 on the export, a manual `-f -y` pass repaired an orphaned inode, and the finalizer then completed and published. Treat that as the reason the repair comes first, not as a routine step.
 
 After a successful export, delete staging through `client.delete_snapshot(snapshot_id)`. Terminate the builder through the Central helper and wait for tenant-scoped `404`.
 

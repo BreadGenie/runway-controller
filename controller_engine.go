@@ -11,6 +11,20 @@ import (
 	"github.com/google/uuid"
 )
 
+// guestWorkFolder is the absolute work folder requested for self-hosted scale
+// set runners. actions/setup-node stores a yarn cache as paths relative to the
+// checkout workspace, and the relative prefix is baked into the archive. The
+// relative "_work" default resolves under the runner install root, putting the
+// checkout one level deeper than GitHub-hosted
+// ($HOME/actions-runner/_work/<repo>/<repo> vs $HOME/work/<repo>/<repo>), so a
+// cache entry written by one layout fails to extract under the other with
+// "Cannot mkdir" on every member. Requesting the absolute GitHub-hosted layout
+// makes both sides emit the same relative prefix and share cache entries.
+// The runner accepts an absolute value: RunnerSettings.WorkFolder is an
+// unvalidated string and HostContext resolves it with Path.Combine, which
+// returns a rooted second operand verbatim.
+const guestWorkFolder = "/home/runner/work"
+
 type pilotGitHub interface {
 	GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 	GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error)
@@ -296,7 +310,7 @@ func (e *pilotEngine) startFreshRunner(ctx context.Context, lease pilotLease) er
 	if err != nil {
 		return err
 	}
-	jit, err := e.github.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: lease.RunnerName, WorkFolder: "_work"}, e.snapshot.Pool.ScaleSetID)
+	jit, err := e.github.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: lease.RunnerName, WorkFolder: guestWorkFolder}, e.snapshot.Pool.ScaleSetID)
 	if err != nil {
 		_, recordErr := e.update(ctx, lease, "failed", leaseEvent{Error: "JIT request outcome uncertain; registration requires cleanup"})
 		if recordErr != nil {
