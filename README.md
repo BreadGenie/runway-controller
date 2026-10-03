@@ -35,6 +35,7 @@ See [development](docs/development.md) for the separate infrastructure and GitHu
 | [Image building](docs/image-building.md) | Bake and verify a clean runner image |
 | [Architecture](docs/architecture.md) | Ownership and proposed integration boundaries |
 | [Proof of concept results](docs/poc-results.md) | Live evidence, fixes, and limits |
+| [Frappe performance](docs/frappe-performance.md) | Runner timing against GitHub-hosted, and what limits the test phase |
 | [Development](docs/development.md) | Prerequisites and operator workflow |
 | [Roadmap](docs/roadmap.md) | Milestones and decisions for the Frappe team |
 
