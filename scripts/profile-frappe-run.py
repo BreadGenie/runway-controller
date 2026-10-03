@@ -12,14 +12,22 @@ fsync-probe
           Single-file fsync/commit microbenchmark used to prove or disprove
           "storage sync latency" as the cause of the test-phase gap. Runs
           entirely inside a scratch directory; touches no service config.
+tree-read  Cold-versus-warm read cost across a whole directory tree, which is
+          what a single-file fsync probe cannot see: the test phase reads very
+          many small files and only the first pass is slow. Creates, deletes
+          and mounts nothing, but evicts the page cache of the kernel it runs
+          on, which is why it wants root.
 
 Nothing here mutates host, guest, VM or FC service state.  Every command is a
-pure reader except `sampler`/`fsync-probe`, which only write into a directory
-you name with --out.  That directory must be private to the invoking user: it
-is created 0700 when missing and refused when it is shared or a symlink.  Output
-files are always *new*: created O_CREAT|O_EXCL|O_NOFOLLOW at 0600, so anything
-already at that path is left untouched and the run is refused.  Point --out at a
-path that is not taken.
+pure reader except `sampler` and `fsync-probe`, which only write into a
+directory you name with --out, and `tree-read`, which evicts this kernel's page
+cache and nothing else.  That last one is not harmless on a shared machine: it
+affects every process, not just this one.  The other two write paths require
+that directory to be private to the invoking user: it is created 0700 when
+missing and refused when it is shared or a symlink.  Output files are always
+*new*: created O_CREAT|O_EXCL|O_NOFOLLOW at 0600, so anything already at that
+path is left untouched and the run is refused.  Point --out at a path that is
+not taken.
 
 Stdlib only.
 """
@@ -32,10 +40,12 @@ import json
 import os
 import re
 import stat
+import socket
 import statistics
 import sys
 import time
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, Sequence
@@ -1042,6 +1052,158 @@ def _jit_config() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _drop_page_cache() -> bool:
+    """Try to evict this kernel's page cache.  Report whether it happened.
+
+    Returns False rather than raising when the write is not permitted, because
+    the caller still wants the pass -- it just has to know the numbers are warm
+    and must not be reported as cold.
+    """
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as fh:
+            fh.write("3")
+    except OSError:
+        return False
+    return True
+
+
+def _tree_files(root: str, suffixes: Sequence[str]) -> list[str]:
+    """Every file under `root` whose name ends with one of `suffixes`.
+
+    Sorted so two runs of the same tree read the same files in the same order.
+    """
+    found = []
+    for directory, _dirs, names in os.walk(root):
+        for name in names:
+            if name.endswith(tuple(suffixes)):
+                found.append(os.path.join(directory, name))
+    found.sort()
+    return found
+
+
+def _read_files(paths: Sequence[str]) -> tuple[float, int]:
+    """Sequentially open and read every file in `paths`.
+
+    Returns (wall seconds, bytes read).  Unreadable files are counted as read
+    nothing rather than aborting the pass: a permission-denied entry should not
+    turn a whole measurement into an error, but it does mean the byte total is
+    a floor, not an exact figure.
+    """
+    start = time.monotonic()
+    total = 0
+    for path in paths:
+        try:
+            with open(path, "rb", buffering=0) as fh:
+                while True:
+                    chunk = fh.read(1 << 18)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+        except OSError:
+            continue
+    return time.monotonic() - start, total
+
+
+def tree_read_probe(args: argparse.Namespace) -> int:
+    """Measure cold-versus-warm read cost across a whole directory tree.
+
+    A single-file fsync microbenchmark cannot see what the Frappe test phase
+    actually does: it reads very many small files, spread across a large tree,
+    and only the first pass is slow.  This walks a tree (by default the baked
+    `actions/setup-python` tool cache, the same read-mostly content class as a
+    job's `site-packages`) once with the page cache dropped and once without,
+    and reports how much of the cold pass was I/O wait.
+
+    Creates, deletes and mounts nothing.  It does evict the page cache of the
+    kernel it runs on, which affects every process on that machine and is why
+    this wants root and should not be run casually on a shared host; to compare
+    the same tree against a RAM-backed path, point `--tree` at an existing
+    tmpfs mount the operator has already set up.
+
+    Cache dropping is best-effort and is reported honestly: each pass carries
+    `page_cache_dropped`, and the cold-versus-warm split is emitted only when
+    the cold pass really was cold.  A run without permission to drop the cache
+    reports two indistinguishable `false` values rather than inventing an I/O
+    share out of noise.
+
+    `hostname` is recorded because the same tree can exist on the host and in
+    the guest, and a number without knowing which kernel produced it is not
+    worth much.  Dropping the *other* kernel's cache is an out-of-band operator
+    step this cannot perform or observe; pass `--host-cache-dropped` to record
+    that it was done.
+    """
+    root = os.path.abspath(args.tree)
+    if not os.path.isdir(root):
+        raise SystemExit(f"--tree is not a directory: {root}")
+    try:
+        os.listdir(root)
+    except OSError as exc:
+        raise SystemExit(f"--tree is not readable: {root} ({type(exc).__name__})")
+    if args.threads < 1:
+        raise SystemExit("--threads must be at least 1")
+
+    paths = _tree_files(root, args.suffix)
+    if not paths:
+        raise SystemExit(f"--tree contains no matching files: {root}")
+    size = 0
+    for path in paths:
+        try:
+            size += os.path.getsize(path)
+        except OSError:
+            continue
+
+    passes: list[dict[str, object]] = []
+    chunks = [paths[i::args.threads] for i in range(args.threads)]
+    for label in ("cold", "warm"):
+        dropped = _drop_page_cache() if label == "cold" else False
+        if args.threads == 1:
+            wall, nbytes = _read_files(paths)
+        else:
+            start = time.monotonic()
+            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                nbytes = sum(pool.map(lambda c: _read_files(c)[1], chunks))
+            wall = time.monotonic() - start
+        passes.append({
+            "label": label,
+            "page_cache_dropped": dropped,
+            "wall_s": round(wall, 3),
+            "wall_exact": wall,
+            "bytes_read": nbytes,
+            "files_per_s": round(len(paths) / wall, 1) if wall else None,
+            "mib_per_s": round(nbytes / wall / 2**20, 1) if wall else None,
+            "us_per_file": round(wall / len(paths) * 1e6, 1),
+        })
+
+    report: dict[str, object] = {
+        "hostname": socket.gethostname(),
+        "tree": root,
+        "suffixes": list(args.suffix),
+        "files": len(paths),
+        "bytes": size,
+        "threads": args.threads,
+        "host_cache_dropped": args.host_cache_dropped,
+        "passes": passes,
+    }
+
+    cold, warm = passes
+    # Derived from the unrounded walls, not the rounded ones already in the
+    # report: a sub-millisecond pass prints "wall_s": 0.0 next to a
+    # files_per_s computed from the real value, and mixing the two produces
+    # ratios that disagree with the numbers printed beside them.
+    if cold["page_cache_dropped"]:
+        report["io_seconds"] = round(cold["wall_exact"] - warm["wall_exact"], 3)
+        if cold["wall_exact"] and warm["wall_exact"]:
+            report["io_share_of_cold_pass"] = round(
+                (cold["wall_exact"] - warm["wall_exact"]) / cold["wall_exact"], 3)
+            report["warm_speedup"] = round(
+                cold["wall_exact"] / warm["wall_exact"], 1)
+    for entry in passes:
+        del entry["wall_exact"]
+
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def fsync_probe(args: argparse.Namespace) -> int:
     """Measure durable-commit latency for a scratch directory.
 
@@ -1148,12 +1310,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="path to a 0600 client option file, if socket auth "
                         "is not enough; the path is safe in argv, its "
                         "contents are never exposed")
-
     f = sub.add_parser("fsync-probe", help="single-file fsync/commit microbenchmark")
     f.add_argument("--iters", type=int, default=200)
     f.add_argument("--bytes", type=int, default=4096)
     f.add_argument("--dir", help="scratch dir (default: fresh mkdtemp)")
     f.add_argument("--keep", action="store_true")
+
+    r = sub.add_parser(
+        "tree-read",
+        help="cold vs warm read cost across a whole directory tree")
+    r.add_argument("--tree", default="/opt/hostedtoolcache/Python",
+                   help="directory to walk (default: the baked setup-python "
+                        "tool cache, the same content class as site-packages)")
+    r.add_argument("--suffix", action="append", dest="suffix",
+                   default=(".py", ".pyc", ".so"),
+                   help="filename suffix to include; repeatable, and "
+                        "repeating it replaces the default set outright")
+    r.add_argument("--threads", type=int, default=1,
+                   help="concurrent readers; >1 tests whether the block path "
+                        "is latency- or throughput-bound")
+    r.add_argument("--host-cache-dropped", action="store_true",
+                   help="record that the *other* kernel's page cache was "
+                        "dropped between passes by hand; this tool cannot do it")
 
     k = sub.add_parser("cpu-probe",
                        help="single-core CPU speed + JIT availability probe")
@@ -1177,6 +1355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return sampler(args)
     elif args.cmd == "fsync-probe":
         return fsync_probe(args)
+    elif args.cmd == "tree-read":
+        return tree_read_probe(args)
     elif args.cmd == "cpu-probe":
         return cpu_probe(args)
     else:  # pragma: no cover
