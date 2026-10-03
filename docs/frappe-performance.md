@@ -136,3 +136,13 @@ execution and repeat preparation. It was deleted before starting the full trial.
 The preceding baked-image job used about 1.27 GB of package cache, including
 804 MB of Yarn files and 469 MB of uv files, which fits the proposed cap. This is
 an experimental profile, not an admission guarantee for arbitrary workflows.
+
+
+The [RAM package cache trial](https://github.com/BreadGenie/frappe/actions/runs/37112715046)
+passed all 708 tests with coverage in 699 seconds: containers 17 seconds, setup 166
+seconds, tests 489 seconds and dispatch 53 seconds. Its
+[paired GitHub run](https://github.com/BreadGenie/frappe/actions/runs/37112717413)
+took 340 seconds (containers 20, setup 79, tests 234). Compared with the preceding
+700-second baked-image run, this is effectively unchanged. The package RAM cache
+is therefore left off in the dogfood profile; this trial does not establish a
+useful performance improvement.
