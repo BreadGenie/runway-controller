@@ -208,7 +208,7 @@ def report_network():
     subprocess.run([client, "rm", "-f", name],
                    capture_output=True, check=False)
     run = subprocess.run(
-        [client, "run", "-d", "--rm", "-p", "127.0.0.1::80",
+        [client, "run", "-d", "--rm", "-p", "80",
          "python:3.12-slim", "python", "-c",
          "import socket;s=socket.socket();s.setsockopt("
          "socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('0.0.0.0',80));"
@@ -224,12 +224,17 @@ def report_network():
              stderr=run.stderr.strip()[:200])
         return
     try:
-        mapped = subprocess.run(
-            [client, "port", name, "80/tcp"],
-            capture_output=True, text=True).stdout.strip().rsplit(":", 1)[-1]
         deadline = time.monotonic() + 30
         samples = None
         while time.monotonic() < deadline:
+            # The published port is only assigned once the container is up, so
+            # this is polled rather than read once.
+            out = subprocess.run([client, "port", name, "80/tcp"],
+                                 capture_output=True, text=True).stdout.strip()
+            mapped = out.rsplit(":", 1)[-1].strip()
+            if not mapped.isdigit():
+                time.sleep(0.5)
+                continue
             try:
                 samples = _rtt("127.0.0.1", int(mapped))
                 break
@@ -248,11 +253,22 @@ def report_network():
 
 
 def main():
-    report_identity()
-    report_clocksource()
-    report_clock_cost()
-    report_interpreter()
-    report_network()
+    # Each section is independent and optional. A probe that cannot take one
+    # measurement has to say so and keep going: a diagnostic whose failure mode
+    # is to abort loses every later measurement, and the caller cannot tell an
+    # absent number from a crashed run.
+    for name, section in (
+        ("identity", report_identity),
+        ("clocksource", report_clocksource),
+        ("clock_cost", report_clock_cost),
+        ("interpreter", report_interpreter),
+        ("network", report_network),
+    ):
+        try:
+            section()
+        except Exception as exc:
+            emit("section_failed", section=name,
+                 error=type(exc).__name__, detail=str(exc)[:200])
     print("DONE", flush=True)
     return 0
 
