@@ -81,10 +81,23 @@ The [paired GitHub run](https://github.com/BreadGenie/frappe/actions/runs/371076
 took 345 seconds, including 24 seconds for containers, 77 seconds for setup and
 236 seconds for tests. This reinforces the need to report multiple samples.
 
-The next controlled experiment bakes the three pinned public service images into
-a larger, never-registered guest image. The workflow still pulls its declared tags,
-which preserves updates if a tag changes. The test is whether a fresh clone can
-reuse the existing unpacked layers without job-time transfer or extraction.
+The baked-image [trial](https://github.com/BreadGenie/frappe/actions/runs/37111170787)
+passed all 708 tests with coverage. It used Atlas image `cffdaa3f24a245ca`, a 7 GiB
+artifact (raw SHA256 `ce4ffa2e7f8ce2b50e13ffd9bae5222c90dfb0e7758477e885bf044951979c45`).
+Container startup took 16 seconds, setup 171 seconds, tests 484 seconds and the job
+700 seconds (dispatch: 44 seconds). This is 49 seconds faster than the baseline,
+about 6.5%; the test phase itself remained almost unchanged.
+The [paired GitHub run](https://github.com/BreadGenie/frappe/actions/runs/37111172701)
+took 440 seconds: containers 32 seconds, setup 91 seconds and tests 308 seconds.
+Runway has not reached overall timing parity.
+
+The artifact came from never-registered builder VM21. Its offline export required
+reviewed repair of an invalid systemd socket entry and allocation counters before
+passing the finalizer; the original compressed export was retained. A separate
+fresh VM verified tool versions, fresh identity, all three digests, cached pulls
+and Redis PONG through a published Docker port. Both VMs and staging were deleted.
+The workflow still pulls its declared tags, so a changed tag can fetch updated
+content instead of silently using an old image.
 
 ## Reproducing the analysis
 

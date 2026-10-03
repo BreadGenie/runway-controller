@@ -325,7 +325,7 @@ def compare(baseline: RunProfile, candidate: RunProfile, top: int) -> str:
         ("results parsed", baseline.results_seen, candidate.results_seen),
         ("classes", len(baseline.classes), len(candidate.classes)),
         ("test wall (s)", baseline.test_wall, candidate.test_wall),
-        ("job wall (s)", baseline.wall, candidate.wall),
+        ("selected log span (s)", baseline.wall, candidate.wall),
     ]
     for label, a, b in rows:
         if a is None or b is None:
