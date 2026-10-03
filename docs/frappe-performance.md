@@ -146,3 +146,43 @@ took 340 seconds (containers 20, setup 79, tests 234). Compared with the precedi
 700-second baked-image run, this is effectively unchanged. The package RAM cache
 is therefore left off in the dogfood profile; this trial does not establish a
 useful performance improvement.
+
+
+## Same-interpreter native and nested CPU probe
+
+An unregistered one-vCPU guest and the Metal host ran the same Python 3.14.7
+binary and standard library copied from the published image. Each probe used
+three repetitions at scale 0.25, then the host/guest order was reversed. No CI
+job was running. The temporary host interpreter copy was removed afterward.
+
+| Probe | Native host, operations/s | Guest, operations/s |
+| --- | ---: | ---: |
+| Integer loop, first pass | 6,186,223 | 5,744,671 |
+| Integer loop, reverse pass | 6,082,444 | 5,919,360 |
+| Float loop, first pass | 15,508,970 | 14,856,433 |
+| Float loop, reverse pass | 15,573,870 | 14,834,121 |
+| getpid loop, first pass | 4,098,100 | 5,125,125 |
+| getpid loop, reverse pass | 3,960,304 | 5,179,274 |
+
+The guest was about 3–7% slower on the integer loop and 4–5% slower on the float
+loop; its getpid loop was faster. These small synthetic probes do not reproduce
+the full Frappe workload, and compare native versus nested execution on this
+host, not this host versus GitHub's hardware. They do not establish a uniform
+virtualization penalty large enough to explain the full test-phase gap.
+
+
+## Bounded workspace in RAM
+
+The separate `--workspace-tmpfs-mib 2048` profile mounts `/home/runner/work` as
+`runway-workspace` before registration. Package caches remain on disk. It uses
+the same ownership, executable mount options, requested-capacity-plus-2-GiB
+memory admission and fresh-directory checks as the package cache profile.
+Both profiles remain off by default, and enabling them together is rejected
+before SSH and inside the guest. This keeps the experiment to one variable and
+avoids reserving both mounts against the same 6 GiB guest.
+
+A never-registered verification VM proved the 2 GiB mount, native execution,
+runner ownership and repeat preparation; the package cache was not mounted.
+That VM was deleted before the full workflow trial. The workspace cap includes
+checkout, virtualenvs, node modules, runner temporary files and job artifacts.
+Workflows requiring more space should retain the disk-backed default.

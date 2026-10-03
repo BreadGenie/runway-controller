@@ -42,8 +42,8 @@ class TransportTests(unittest.TestCase):
         (root / 'actions-runner/bin/Runner.Listener').write_text('')
         (root / 'sudoers').mkdir(parents=True, exist_ok=True)
         (root / 'docker').mkdir(parents=True, exist_ok=True)
-        # The cache directory is deliberately left out: sealing empties the caches, so a
-        # fresh guest arrives without one and preparation has to create it.
+        # The cache and workspace directories are deliberately left out: sealing empties
+        # them, so a fresh guest arrives without either and preparation has to create one.
         program = transport.GUEST_PROGRAM
         for guest_path, private_path in (('/var/lib/runway/bootstrap.json', root / 'bootstrap.json'),
                                          ('/home/runner/actions-runner', root / 'actions-runner'),
@@ -52,6 +52,9 @@ class TransportTests(unittest.TestCase):
                                          ('/etc/sudoers.d', root / 'sudoers'),
                                          ('/etc/docker/daemon.json', root / 'docker/daemon.json')):
             program = program.replace(guest_path, str(private_path))
+        # The workspace is redirected here too, so no test can reach a real guest's
+        # directory even when it never enables that opt-in.
+        program = program.replace('/home/runner/work', str(root / 'work'))
         # Every file this code may create is root-owned in the guest. The test user
         # cannot own them, so the recorded ownership stands in for that.
         return program, root / 'sudoers/runway-runner', [root / 'sudoers/runway-runner',
@@ -801,24 +804,26 @@ class TransportTests(unittest.TestCase):
             self.assertEqual([argv for argv in recorded if any('sudo' in part for part in argv)], [])
 
     # The opt-in RAM package cache: one named tmpfs over the guest's own cache directory.
+    # The workspace opt-in below mounts the same way, so these helpers are stated in terms
+    # of a path and a source name rather than of the cache alone.
 
     MOUNT_TOOLS = ('mount', 'findmnt', 'umount')
     # What the kernel reports back for the mount this program asks for: the type, the
     # source name, the granted size and the options, exactly as findmnt prints them.
-    CACHE_OPTIONS = ('rw,nosuid,nodev,relatime,size=2048m,mode=755,uid=1001,gid=1001,inode64')
+    TMPFS_OPTIONS = ('rw,nosuid,nodev,relatime,size=2048m,mode=755,uid=1001,gid=1001,inode64')
 
     @staticmethod
     def cache_path(directory):
         return Path(directory) / 'cache'
 
     @staticmethod
-    def probe(cache):
+    def probe(path):
         """The exact probe this program issues for one path's mount table."""
         return ('/usr/bin/findmnt', '--bytes', '--noheadings', '--output',
-                'SOURCE,FSTYPE,TARGET,SIZE,OPTIONS', '--target', str(cache))
+                'SOURCE,FSTYPE,TARGET,SIZE,OPTIONS', '--target', str(path))
 
-    def findmnt(self, directory, cache=None):
-        return self.probe(self.cache_path(directory) if cache is None else cache)
+    def findmnt(self, directory, path=None):
+        return self.probe(self.cache_path(directory) if path is None else path)
 
     @staticmethod
     def enclosing():
@@ -826,10 +831,10 @@ class TransportTests(unittest.TestCase):
         return (0, '/dev/vda1 ext4 / 207929917440 rw,relatime\n')
 
     def mounted(self, directory, source='runway-cache', fstype='tmpfs', size_mib=2048,
-                options=CACHE_OPTIONS, cache=None):
+                options=TMPFS_OPTIONS, path=None):
         """One probe answer: this source and type, at this size and these options."""
         return (0, '%s %s %s %d %s\n' % (source, fstype,
-                                         cache or self.cache_path(directory),
+                                         path or self.cache_path(directory),
                                          size_mib * 1048576, options))
 
     def cache_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
@@ -989,7 +994,7 @@ class TransportTests(unittest.TestCase):
                     cache = home / '.cache'
                     code, output, recorded, _, _, _, _ = self.cache_guest(
                         directory, cache=cache,
-                        results={self.findmnt(directory, cache): [self.enclosing()]})
+                        results={self.findmnt(directory, path=cache): [self.enclosing()]})
                     self.assertEqual(code, 1)
                     self.assertEqual(json.loads(output), {'state': 'unknown'})
                     self.assertEqual(self.mount_calls(recorded), [])
@@ -1103,7 +1108,7 @@ class TransportTests(unittest.TestCase):
         for name, arguments, options in cases:
             with self.subTest(case=name):
                 with tempfile.TemporaryDirectory() as directory:
-                    reported = self.mounted(directory, options=options or self.CACHE_OPTIONS,
+                    reported = self.mounted(directory, options=options or self.TMPFS_OPTIONS,
                                             **arguments)
                     code, output, recorded, _, _, _, _ = self.cache_guest(
                         directory, results={self.findmnt(directory): [reported]})
@@ -1178,6 +1183,346 @@ class TransportTests(unittest.TestCase):
             self.assertNotIn('-R', argv)
             self.assertNotIn('ProxyCommand', ' '.join(argv))
             self.assertNotIn('runway-forward', ' '.join(argv))
+
+    # The opt-in RAM workspace: the same named, bounded, verified tmpfs over the directory
+    # the guest runner checks every job out into, never requested together with the cache.
+
+    WORKSPACE_SOURCE = 'runway-workspace'
+
+    @staticmethod
+    def workspace_path(directory):
+        return Path(directory) / 'work'
+
+    def workspace_findmnt(self, directory):
+        return self.findmnt(directory, path=self.workspace_path(directory))
+
+    def workspace_mounted(self, directory, **changes):
+        """One probe answer: the mount this program asks for over the workspace.
+
+        A caller may override any part of it to model a filesystem this code did not make.
+        """
+        return self.mounted(directory, path=self.workspace_path(directory),
+                            **{'source': self.WORKSPACE_SOURCE, **changes})
+
+    def workspace_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
+                        payload=None):
+        """Prepare a fresh guest with the RAM workspace opt-in and the guest's answers."""
+        program, sudoers, owned = self.guest_paths(directory)
+        request = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                   'workspace_tmpfs_mib': mib} if payload is None else payload
+        return (self.execute_guest(program, sudoers, request, root_owned=owned,
+                                   present=self.MOUNT_TOOLS if present is None else present,
+                                   results=results, meminfo=meminfo)
+                + (program, sudoers, owned))
+
+    def test_workspace_opt_in_is_explicit_and_carried_in_the_payload(self):
+        for flag, expected in (([], None), (['--workspace-tmpfs-mib', '2048'], 2048)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv', self.arguments('prepare') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                payload = json.loads(run.call_args.kwargs['input'])
+                # Absent by default: an unflagged preparation carries no size at all, so no
+                # guest can be given a RAM-backed workspace an operator never asked for.
+                self.assertEqual(payload.get('workspace_tmpfs_mib'), expected)
+                # Asking for the workspace leaves the cache opt-in exactly as it was, so
+                # one flag moves one directory and never both.
+                self.assertNotIn('cache_tmpfs_mib', payload)
+
+    def test_workspace_size_outside_the_supported_range_is_rejected_before_ssh(self):
+        for size in ('0', '127', '16385', '-2048'):
+            with self.subTest(size=size):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('prepare') + ['--workspace-tmpfs-mib', size]),
+                      patch.object(transport.sys, 'stderr', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run,
+                      self.assertRaises(SystemExit)):
+                    transport.main()
+                run.assert_not_called()
+        for size in ('128', '2048', '16384'):
+            with self.subTest(size=size):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('prepare') + ['--workspace-tmpfs-mib', size]),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                payload = json.loads(run.call_args.kwargs['input'])
+                self.assertEqual(payload['workspace_tmpfs_mib'], int(size))
+
+    def test_the_cache_and_the_workspace_are_exclusive_on_the_command_line_and_in_the_guest(self):
+        args = self.arguments('prepare') + ['--cache-tmpfs-mib', '2048',
+                                            '--workspace-tmpfs-mib', '2048']
+        with (patch.object(transport.sys, 'argv', args),
+              patch.object(transport.sys, 'stderr', io.StringIO()),
+              patch.object(transport.subprocess, 'run') as run,
+              self.assertRaises(SystemExit)):
+            transport.main()
+        # Refused before a key or a channel is used: two reservations against one 6 GiB
+        # guest would be an aggregate, so the trial could never attribute a result.
+        run.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, recorded, _, _, _, _ = self.workspace_guest(
+                directory, payload={'action': 'prepare', 'runner_name': 'runway-lease-123',
+                                    'cache_tmpfs_mib': 2048, 'workspace_tmpfs_mib': 2048})
+            # A payload written any other way is refused by the guest itself, before it has
+            # read the guest's state, created a directory or mounted anything at all.
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(recorded, [])
+            self.assertFalse(self.cache_path(directory).exists())
+            self.assertFalse(self.workspace_path(directory).exists())
+
+    def test_the_workspace_is_neither_probed_nor_mounted_without_the_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            code, output, recorded, ownership = self.execute_guest(
+                program, sudoers,
+                {'action': 'prepare', 'runner_name': 'runway-lease-123', 'cache_tmpfs_mib': 2048},
+                present=self.MOUNT_TOOLS, root_owned=owned,
+                results={self.findmnt(directory): [self.enclosing(), self.mounted(directory)]})
+            # The cache opt-in on its own still works, and the workspace is never read: a
+            # preparation that asked for one directory must not reserve a second one.
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(ownership, [(1001, 1001)])
+            self.assertEqual([argv for argv in recorded
+                              if argv[-1] == str(self.workspace_path(directory))], [])
+            self.assertFalse(self.workspace_path(directory).exists())
+
+    def test_opt_in_mounts_a_named_bounded_tmpfs_over_the_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = self.workspace_path(directory)
+            answers = {self.workspace_findmnt(directory): [self.enclosing(),
+                                                          self.workspace_mounted(directory)]}
+            code, output, recorded, ownership, _, _, _ = self.workspace_guest(
+                directory, results=answers)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            # The sealed image arrives without this directory, so preparation makes one for
+            # the account the job runs as: open() applied a umask, so both are set exactly.
+            self.assertTrue(workspace.is_dir())
+            self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o755)
+            self.assertEqual(ownership, [(1001, 1001)])
+            mount, = self.mount_calls(recorded)
+            self.assertEqual(mount[:4], ['/usr/bin/mount', '-n', '-t', 'tmpfs'])
+            # Identical to the cache mount in every respect the job can observe: bounded,
+            # owned by the account it runs as, and executable, because native modules are
+            # built and run out of this very directory.
+            self.assertEqual(mount[mount.index('-o') + 1],
+                             'rw,nosuid,nodev,size=2048m,uid=1001,gid=1001,mode=0755')
+            self.assertNotIn('noexec', ' '.join(mount))
+            # The one variable under test: this directory, not the cache, under a source
+            # name of its own so the two filesystems can never be mistaken for each other.
+            self.assertEqual(mount[-2:], [self.WORKSPACE_SOURCE, str(workspace)])
+            self.assertNotIn(str(self.cache_path(directory)), ' '.join(mount))
+            # The path is read before the mount and confirmed after it, never assumed.
+            probes = [index for index, argv in enumerate(recorded)
+                      if argv[0] == '/usr/bin/findmnt']
+            self.assertEqual(len(probes), 2)
+            self.assertLess(probes[0], recorded.index(mount))
+            self.assertLess(recorded.index(mount), probes[1])
+            self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+            # Nothing is installed or downloaded into it: the mount only decides where the
+            # guest's own checkout and build land.
+            self.assertEqual(list(workspace.iterdir()), [])
+
+    def test_opt_in_mounts_over_an_empty_workspace_the_image_already_shipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.workspace_path(directory).mkdir()
+            answers = {self.workspace_findmnt(directory): [self.enclosing(),
+                                                          self.workspace_mounted(directory)]}
+            code, _, recorded, ownership, _, _, _ = self.workspace_guest(
+                directory, results=answers)
+            self.assertEqual(code, 0)
+            # An empty directory the image already carries is mounted as it stands: no
+            # second one is created and nothing is chowned behind an operator's back.
+            self.assertEqual(ownership, [])
+            self.assertEqual(len(self.mount_calls(recorded)), 1)
+
+    def test_workspace_refuses_a_directory_it_does_not_own_the_shape_of(self):
+        for kind in ('symlink', 'nonempty', 'file'):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    workspace, planted = self.workspace_path(directory), Path(directory) / 'planted'
+                    if kind == 'symlink':
+                        planted.mkdir()
+                        workspace.symlink_to(planted)
+                    elif kind == 'nonempty':
+                        workspace.mkdir()
+                        (workspace / 'repo').mkdir()
+                    else:
+                        workspace.write_text('')
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, results={self.workspace_findmnt(directory): [self.enclosing()]})
+                    # A workspace this code does not own the shape of is refused outright,
+                    # so no bootstrap follows this preparation on the guest.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+                    if kind == 'symlink':
+                        # lstat never followed it, so the planted directory is left alone.
+                        self.assertTrue(workspace.is_symlink())
+                        self.assertEqual(list(planted.iterdir()), [])
+
+    def test_workspace_is_refused_unless_the_memory_reserve_is_spare(self):
+        # 2048 MiB of workspace plus the 2048 MiB this guest keeps in reserve, which is the
+        # margin the running database and the job itself are entitled to.
+        cases = [('no-estimate', 'MemTotal:       6168576 kB\n', 1, 0),
+                 ('unparsable', 'MemAvailable:   many kB\n', 1, 0),
+                 ('short-by-one', 'MemAvailable:   %d kB\n' % (4095 * 1024), 1, 0),
+                 ('exactly-the-reserve', 'MemAvailable:   %d kB\n' % (4096 * 1024), 0, 1)]
+        for name, report, expected, mounts in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    answers = {self.workspace_findmnt(
+                        directory): [self.enclosing(), self.workspace_mounted(directory)]}
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, results=answers, meminfo=report)
+                    self.assertEqual(code, expected)
+                    self.assertEqual(json.loads(output)['state'],
+                                     'installed' if expected == 0 else 'unknown')
+                    # A workspace that cannot fit under the reserve would be an out-of-memory
+                    # kill mid-job, so it is refused while it is still only a request.
+                    self.assertEqual(len(self.mount_calls(recorded)), mounts)
+                    if mounts == 0:
+                        self.assertFalse(self.workspace_path(directory).exists())
+
+    def test_a_workspace_mount_that_does_not_come_up_is_never_reported_as_one(self):
+        for kind in ('mount-refused', 'absent-after', 'no-util-linux'):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    results, present = {}, self.MOUNT_TOOLS
+                    if kind == 'mount-refused':
+                        results[('/usr/bin/mount', '-n', '-t', 'tmpfs', '-o',
+                                 'rw,nosuid,nodev,size=2048m,uid=1001,gid=1001,mode=0755',
+                                 self.WORKSPACE_SOURCE, str(self.workspace_path(directory)))] = (1, '')
+                        results[self.workspace_findmnt(directory)] = [self.enclosing()]
+                    elif kind == 'absent-after':
+                        results[self.workspace_findmnt(directory)] = [self.enclosing(),
+                                                                      self.enclosing()]
+                    else:
+                        present = ()
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, results=results, present=present)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    if kind == 'no-util-linux':
+                        # An image without the mount table's own binaries fails closed
+                        # instead of preparing a guest whose workspace was never mounted.
+                        self.assertEqual(self.mount_calls(recorded, 'findmnt'), [])
+                    elif kind == 'mount-refused':
+                        # Nothing was mounted, so nothing is taken back off.
+                        self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+                    else:
+                        # A filesystem this code could not verify is one the job would still
+                        # use, so it comes back off instead of behind a reported success.
+                        self.assertEqual(len(self.mount_calls(recorded, 'umount')), 1)
+                        self.assertEqual(self.mount_calls(recorded, 'umount')[0][-1],
+                                         str(self.workspace_path(directory)))
+
+    def test_repeated_prepare_verifies_its_own_workspace_mount_without_stacking_another(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, _, first_calls, _, _, _, _ = self.workspace_guest(
+                directory, results={self.workspace_findmnt(
+                    directory): [self.enclosing(), self.workspace_mounted(directory)]})
+            self.assertEqual(first, 0)
+            self.assertEqual(len(self.mount_calls(first_calls)), 1)
+            # A controller can die before it records the phase, so the same guest is
+            # prepared again: the type, size and options the kernel actually gave this
+            # mount are re-read, and nothing is mounted over the first one.
+            second, output, second_calls, _, _, _, _ = self.workspace_guest(
+                directory, results={self.workspace_findmnt(directory):
+                                    [self.workspace_mounted(directory)]})
+            self.assertEqual(second, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(self.mount_calls(second_calls), [])
+            self.assertEqual(self.mount_calls(second_calls, 'umount'), [])
+            self.assertEqual(len(self.mount_calls(second_calls, 'findmnt')), 1)
+
+    def test_a_workspace_mount_that_is_not_the_one_asked_for_is_neither_remounted_nor_removed(self):
+        # Source, type and size identify this code's own mount; the options identify the
+        # filesystem the job would actually get, ownership included. Anything else here is
+        # somebody else's, and a wrong owner would fail later as uid 1001, mid-job.
+        cases = [('guest-root', {'source': '/dev/vda1'}, None),
+                 ('bind-of-home', {'source': '/dev/vda1[/home/runner]'}, None),
+                 ('the-cache-instead', {'source': 'runway-cache'}, None),
+                 ('same-name-other-type', {'fstype': 'ext4'}, None),
+                 ('half-asked-for', {'size_mib': 1024}, None),
+                 ('noexec', {}, 'rw,nosuid,nodev,noexec,relatime,size=2048m,'
+                                'mode=755,uid=1001,gid=1001,inode64'),
+                 ('root-owned', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                    'mode=755,uid=0,gid=1001,inode64'),
+                 ('group-writable', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                         'mode=775,uid=1001,gid=1001,inode64')]
+        for name, arguments, options in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    reported = self.workspace_mounted(directory, options=options or self.TMPFS_OPTIONS,
+                                                       **arguments)
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, results={self.workspace_findmnt(directory): [reported]})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    # A filesystem this code did not create is never mounted over and never
+                    # taken away, whatever it is mounted from, sized at or restricted to.
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+
+    def test_the_guest_refuses_a_workspace_size_the_command_line_would_never_send(self):
+        # Zero and an absent key both mean "not requested", so neither is a size here.
+        for mib in (127, 16385, 1 << 20):
+            with self.subTest(mib=mib):
+                with tempfile.TemporaryDirectory() as directory:
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, mib=mib,
+                        results={self.workspace_findmnt(directory): [self.enclosing()]})
+                    # The command line bounds this already, but the guest is the code that
+                    # sizes a tmpfs, so it refuses a size outside the same range itself.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertFalse(self.workspace_path(directory).exists())
+
+    def test_workspace_never_reaches_a_registered_or_non_prepare_action(self):
+        for action, expected in (('status', 0), ('collect', 0), ('stop', 0), ('bootstrap', 1)):
+            with self.subTest(action=action):
+                with tempfile.TemporaryDirectory() as directory:
+                    program, sudoers, owned = self.guest_paths(directory)
+                    code, _, recorded, _ = self.execute_guest(
+                        program, sudoers,
+                        {'action': action, 'runner_name': 'runway-lease-123',
+                         'workspace_tmpfs_mib': 2048},
+                        present=self.MOUNT_TOOLS, root_owned=owned)
+                    self.assertEqual(code, expected)
+                    for binary in self.MOUNT_TOOLS:
+                        self.assertEqual(self.mount_calls(recorded, binary), [])
+        for report, registered, expected in [(RUNNING_REPORT, 'marker', 'running'),
+                                             (COMPLETED_REPORT, 'marker', 'completed'),
+                                             (None, 'dot-runner', 'unknown')]:
+            with self.subTest(registered=registered, expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    program, sudoers, owned = self.guest_paths(directory)
+                    results = {SERVICE_REPORT: (0, report)} if report else {}
+                    if registered == 'marker':
+                        (Path(directory) / 'bootstrap.json').write_text(
+                            json.dumps({'runner_name': 'runway-lease-123'}))
+                    else:
+                        (Path(directory) / 'actions-runner/.runner').write_text('{}')
+                    code, output, recorded, _ = self.execute_guest(
+                        program, sudoers,
+                        {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                         'workspace_tmpfs_mib': 2048},
+                        present=self.MOUNT_TOOLS, results=results, root_owned=owned)
+                    # The freshness guard runs first: a lease that already started, or a
+                    # clone another lease ran, is only read and never touched.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': expected})
+                    for binary in self.MOUNT_TOOLS:
+                        self.assertEqual(self.mount_calls(recorded, binary), [])
 
 
 if __name__ == '__main__':
