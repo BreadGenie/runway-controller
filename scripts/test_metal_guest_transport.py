@@ -1,5 +1,6 @@
 """Verify that the administrative transport keeps JIT material out of argv."""
 
+import builtins
 import importlib.util
 import io
 import json
@@ -24,6 +25,8 @@ COMPLETED_REPORT = 'LoadState=loaded\nActiveState=inactive\nExecMainStartTimesta
 SERVICE_REPORT = ('systemctl', 'show', 'runway-runner.service', '--property=LoadState',
                   '--property=ActiveState', '--property=ExecMainStartTimestampMonotonic')
 SUDOERS_RULE = 'runner ALL=(ALL) NOPASSWD: ALL\n'
+# A healthy 6 vCPU guest of the shape the trial measured: 6 GiB total, 5.1 GB available.
+MEMINFO = 'MemTotal:       6168576 kB\nMemFree:        4103352 kB\nMemAvailable:   5222412 kB\n'
 
 
 class TransportTests(unittest.TestCase):
@@ -39,9 +42,12 @@ class TransportTests(unittest.TestCase):
         (root / 'actions-runner/bin/Runner.Listener').write_text('')
         (root / 'sudoers').mkdir(parents=True, exist_ok=True)
         (root / 'docker').mkdir(parents=True, exist_ok=True)
+        # The cache directory is deliberately left out: sealing empties the caches, so a
+        # fresh guest arrives without one and preparation has to create it.
         program = transport.GUEST_PROGRAM
         for guest_path, private_path in (('/var/lib/runway/bootstrap.json', root / 'bootstrap.json'),
                                          ('/home/runner/actions-runner', root / 'actions-runner'),
+                                         ('/home/runner/.cache', root / 'cache'),
                                          ('/etc/sudoers.d/runway-runner', root / 'sudoers/runway-runner'),
                                          ('/etc/sudoers.d', root / 'sudoers'),
                                          ('/etc/docker/daemon.json', root / 'docker/daemon.json')):
@@ -52,16 +58,23 @@ class TransportTests(unittest.TestCase):
                                                         root / 'docker/daemon.json']
 
     def execute_guest(self, program, sudoers, payload, *, present=('sudo', 'visudo'),
-                      results=None, plant=None, root_owned=()):
+                      results=None, plant=None, root_owned=(), meminfo=None):
         """Run the embedded guest program locally: no SSH and no real guest binary."""
         real_lstat = os.lstat
+        real_open = builtins.open
         recorded, ownership = [], []
-        results = results or {}
+        # A probe this program issues more than once in a single run is answered in
+        # order, so the mount table read before a mount can differ from the one after.
+        results = {key: list(value) if isinstance(value, list) else value
+                   for key, value in (results or {}).items()}
         owned = {os.fspath(path) for path in (list(root_owned) + [sudoers])}
 
         def fake_run(argv, **kwargs):
             recorded.append(list(argv))
-            return subprocess.CompletedProcess(list(argv), *results.get(tuple(argv), (0, '')))
+            answers = results.get(tuple(argv), (0, ''))
+            if isinstance(answers, list):
+                answers = answers.pop(0) if answers else (1, '')
+            return subprocess.CompletedProcess(list(argv), *answers)
 
         def fake_which(name, path=None, **kwargs):
             return '/usr/bin/' + name if name in present else None
@@ -70,6 +83,13 @@ class TransportTests(unittest.TestCase):
             # An unprivileged test user cannot hand a temporary file to root: record
             # the ownership the guest program demands instead of granting it.
             ownership.append((uid, gid))
+
+        def fake_open(path, *rest, **options):
+            # The memory reserve is read from procfs, which this unprivileged test
+            # cannot dictate. Only that one file is answered here.
+            if path == '/proc/meminfo':
+                return io.StringIO(MEMINFO if meminfo is None else meminfo)
+            return real_open(path, *rest, **options)
 
         def fake_lstat(path):
             if os.fspath(path) not in owned:
@@ -86,6 +106,7 @@ class TransportTests(unittest.TestCase):
         with (patch.object(transport.sys, 'stdin', io.StringIO(json.dumps(payload))),
               patch.object(transport.sys, 'stdout', io.StringIO()) as output,
               patch('shutil.which', side_effect=fake_which),
+              patch('builtins.open', side_effect=fake_open),
               patch.object(transport.os, 'fchown', side_effect=fake_fchown),
               patch.object(transport.os, 'lstat', side_effect=fake_lstat),
               patch.object(transport.subprocess, 'run', side_effect=fake_run)):
@@ -778,6 +799,385 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(json.loads(output), {'state': 'unknown'})
             self.assertEqual(target.read_text(), 'root ALL=(ALL) NOPASSWD: ALL\n')
             self.assertEqual([argv for argv in recorded if any('sudo' in part for part in argv)], [])
+
+    # The opt-in RAM package cache: one named tmpfs over the guest's own cache directory.
+
+    MOUNT_TOOLS = ('mount', 'findmnt', 'umount')
+    # What the kernel reports back for the mount this program asks for: the type, the
+    # source name, the granted size and the options, exactly as findmnt prints them.
+    CACHE_OPTIONS = ('rw,nosuid,nodev,relatime,size=2048m,mode=755,uid=1001,gid=1001,inode64')
+
+    @staticmethod
+    def cache_path(directory):
+        return Path(directory) / 'cache'
+
+    @staticmethod
+    def probe(cache):
+        """The exact probe this program issues for one path's mount table."""
+        return ('/usr/bin/findmnt', '--bytes', '--noheadings', '--output',
+                'SOURCE,FSTYPE,TARGET,SIZE,OPTIONS', '--target', str(cache))
+
+    def findmnt(self, directory, cache=None):
+        return self.probe(self.cache_path(directory) if cache is None else cache)
+
+    @staticmethod
+    def enclosing():
+        """One probe answer: the path is not a mountpoint, so this is its filesystem."""
+        return (0, '/dev/vda1 ext4 / 207929917440 rw,relatime\n')
+
+    def mounted(self, directory, source='runway-cache', fstype='tmpfs', size_mib=2048,
+                options=CACHE_OPTIONS, cache=None):
+        """One probe answer: this source and type, at this size and these options."""
+        return (0, '%s %s %s %d %s\n' % (source, fstype,
+                                         cache or self.cache_path(directory),
+                                         size_mib * 1048576, options))
+
+    def cache_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
+                    cache=None):
+        """Prepare a fresh guest with the RAM cache opt-in and the guest's own answers."""
+        program, sudoers, owned = self.guest_paths(directory)
+        if cache is not None:
+            # Re-point this program at a differently shaped cache path, e.g. one whose
+            # parent is not the real home directory.
+            program = program.replace(str(self.cache_path(directory)), str(cache))
+        payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                   'cache_tmpfs_mib': mib}
+        return (self.execute_guest(program, sudoers, payload, root_owned=owned,
+                                   present=self.MOUNT_TOOLS if present is None else present,
+                                   results=results, meminfo=meminfo)
+                + (program, sudoers, owned))
+
+    @staticmethod
+    def mount_calls(recorded, binary='mount'):
+        """The calls this program made to one binary of the mount table's own toolkit."""
+        return [argv for argv in recorded if argv[0] == '/usr/bin/' + binary]
+
+    def test_cache_opt_in_is_explicit_and_carried_in_the_payload(self):
+        for flag, expected in (([], None), (['--cache-tmpfs-mib', '2048'], 2048)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv', self.arguments('prepare') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                # Absent by default: an unflagged preparation carries no size at all, so no
+                # guest can be given a RAM-backed cache an operator never asked for.
+                payload = json.loads(run.call_args.kwargs['input'])
+                self.assertEqual(payload.get('cache_tmpfs_mib'), expected)
+
+    def test_cache_size_outside_the_supported_range_is_rejected_before_ssh(self):
+        for size in ('0', '127', '16385', '-2048'):
+            with self.subTest(size=size):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('prepare') + ['--cache-tmpfs-mib', size]),
+                      patch.object(transport.sys, 'stderr', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run,
+                      self.assertRaises(SystemExit)):
+                    transport.main()
+                run.assert_not_called()
+        for size in ('128', '2048', '16384'):
+            with self.subTest(size=size):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('prepare') + ['--cache-tmpfs-mib', size]),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                payload = json.loads(run.call_args.kwargs['input'])
+                self.assertEqual(payload['cache_tmpfs_mib'], int(size))
+
+    def test_prepare_without_the_cache_opt_in_touches_no_mount_at_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            code, output, recorded, ownership = self.execute_guest(
+                program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'},
+                root_owned=owned)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            for binary in self.MOUNT_TOOLS:
+                self.assertEqual(self.mount_calls(recorded, binary), [])
+            # Not even the directory: the default guest is left exactly as it was sealed.
+            self.assertFalse(self.cache_path(directory).exists())
+            self.assertEqual(ownership, [])
+
+    def test_opt_in_mounts_a_named_bounded_tmpfs_over_the_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            answers = {self.findmnt(directory): [self.enclosing(), self.mounted(directory)]}
+            code, output, recorded, ownership, _, _, _ = self.cache_guest(
+                directory, results=answers)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            # The sealed image arrives without this directory, so preparation makes one for
+            # the account the job runs as: open() applied a umask, so both are set exactly.
+            cache = self.cache_path(directory)
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o755)
+            self.assertEqual(ownership, [(1001, 1001)])
+            mount, = self.mount_calls(recorded)
+            self.assertEqual(mount[:4], ['/usr/bin/mount', '-n', '-t', 'tmpfs'])
+            # Bounded, owned by the job's account, and executable: noexec would break the
+            # native modules that are built and run out of this very directory.
+            self.assertEqual(mount[mount.index('-o') + 1],
+                             'rw,nosuid,nodev,size=2048m,uid=1001,gid=1001,mode=0755')
+            self.assertNotIn('noexec', ' '.join(mount))
+            # The mount carries a source name, so the next preparation can tell its own
+            # filesystem from a foreign one instead of stacking a second mount over it.
+            self.assertEqual(mount[-2:], ['runway-cache', str(cache)])
+            # The path is read before the mount and confirmed after it, never assumed.
+            probes = [index for index, argv in enumerate(recorded)
+                      if argv[0] == '/usr/bin/findmnt']
+            self.assertEqual(len(probes), 2)
+            self.assertLess(probes[0], recorded.index(mount))
+            self.assertLess(recorded.index(mount), probes[1])
+            self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+            # Nothing is installed or downloaded into it: the mount only decides where the
+            # guest's own downloads will land.
+            self.assertEqual(list(cache.iterdir()), [])
+
+    def test_opt_in_mounts_over_an_empty_cache_the_image_already_shipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.cache_path(directory)
+            cache.mkdir()
+            answers = {self.findmnt(directory): [self.enclosing(), self.mounted(directory)]}
+            code, _, recorded, ownership, _, _, _ = self.cache_guest(
+                directory, results=answers)
+            self.assertEqual(code, 0)
+            # An empty directory the image already carries is mounted as it stands: no
+            # second one is created and nothing is chowned behind an operator's back.
+            self.assertEqual(ownership, [])
+            self.assertEqual(len(self.mount_calls(recorded)), 1)
+
+    def test_cache_refuses_a_directory_it_does_not_own_the_shape_of(self):
+        for kind in ('symlink', 'nonempty', 'file'):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    cache, planted = self.cache_path(directory), Path(directory) / 'planted'
+                    if kind == 'symlink':
+                        planted.mkdir()
+                        cache.symlink_to(planted)
+                    elif kind == 'nonempty':
+                        cache.mkdir()
+                        (cache / 'yarn').mkdir()
+                    else:
+                        cache.write_text('')
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, results={self.findmnt(directory): [self.enclosing()]})
+                    # A cache this code does not own the shape of is refused outright, so no
+                    # bootstrap follows this preparation on the guest.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+                    if kind == 'symlink':
+                        # lstat never followed it, so the planted directory is left alone.
+                        self.assertTrue(cache.is_symlink())
+                        self.assertEqual(list(planted.iterdir()), [])
+
+    def test_cache_is_refused_when_the_home_directory_is_not_a_real_one(self):
+        for kind in ('symlinked', 'file', 'missing'):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    home, planted = Path(directory) / 'home', Path(directory) / 'planted'
+                    planted.mkdir()
+                    if kind == 'symlinked':
+                        home.symlink_to(planted)
+                    elif kind == 'file':
+                        home.write_text('')
+                    else:
+                        home.mkdir()
+                        home.rmdir()
+                    cache = home / '.cache'
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, cache=cache,
+                        results={self.findmnt(directory, cache): [self.enclosing()]})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    # The parent is read with lstat, so nothing is created through it.
+                    self.assertFalse((planted / '.cache').exists())
+
+    def test_cache_is_refused_unless_the_memory_reserve_is_spare(self):
+        # 2048 MiB of cache plus the 2048 MiB this guest keeps in reserve, which is the
+        # margin the running database and the job itself are entitled to.
+        cases = [('no-estimate', 'MemTotal:       6168576 kB\n', 1, 0),
+                 ('unparsable', 'MemAvailable:   many kB\n', 1, 0),
+                 ('short-by-one', 'MemAvailable:   %d kB\n' % (4095 * 1024), 1, 0),
+                 ('exactly-the-reserve', 'MemAvailable:   %d kB\n' % (4096 * 1024), 0, 1)]
+        for name, report, expected, mounts in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    answers = {self.findmnt(directory): [self.enclosing(), self.mounted(directory)]}
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, results=answers, meminfo=report)
+                    self.assertEqual(code, expected)
+                    self.assertEqual(json.loads(output)['state'],
+                                     'installed' if expected == 0 else 'unknown')
+                    # A cache that cannot fit under the reserve would be an out-of-memory
+                    # kill mid-job, so it is refused while it is still only a request.
+                    self.assertEqual(len(self.mount_calls(recorded)), mounts)
+                    if mounts == 0:
+                        self.assertFalse(self.cache_path(directory).exists())
+
+    def test_a_cache_that_does_not_come_up_is_never_reported_as_one(self):
+        for kind in ('mount-refused', 'absent-after', 'wrong-size-after', 'noexec-after',
+                     'no-util-linux'):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    results, present = {}, self.MOUNT_TOOLS
+                    if kind == 'mount-refused':
+                        results[('/usr/bin/mount', '-n', '-t', 'tmpfs', '-o',
+                                 'rw,nosuid,nodev,size=2048m,uid=1001,gid=1001,mode=0755',
+                                 'runway-cache', str(self.cache_path(directory)))] = (1, '')
+                        results[self.findmnt(directory)] = [self.enclosing()]
+                    elif kind == 'absent-after':
+                        results[self.findmnt(directory)] = [self.enclosing(), self.enclosing()]
+                    elif kind == 'wrong-size-after':
+                        results[self.findmnt(directory)] = [self.enclosing(),
+                                                            self.mounted(directory, size_mib=1024)]
+                    elif kind == 'noexec-after':
+                        results[self.findmnt(directory)] = [self.enclosing(), self.mounted(
+                            directory, options='rw,nosuid,nodev,noexec,relatime,size=2048m')]
+                    else:
+                        present = ()
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, results=results, present=present)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    if kind == 'no-util-linux':
+                        # An image without the mount table's own binaries fails closed
+                        # instead of preparing a guest whose cache was never mounted.
+                        self.assertEqual(self.mount_calls(recorded, 'findmnt'), [])
+                    elif kind == 'mount-refused':
+                        # Nothing was mounted, so nothing is taken back off.
+                        self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+                    else:
+                        # A filesystem this code could not verify is one the job would still
+                        # use, so it comes back off instead of behind a reported success.
+                        self.assertEqual(len(self.mount_calls(recorded, 'umount')), 1)
+                        self.assertEqual(self.mount_calls(recorded, 'umount')[0][-1],
+                                         str(self.cache_path(directory)))
+
+    def test_repeated_prepare_verifies_its_own_mount_without_stacking_another(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, _, first_calls, _, _, _, _ = self.cache_guest(
+                directory, results={self.findmnt(directory):
+                                    [self.enclosing(), self.mounted(directory)]})
+            self.assertEqual(first, 0)
+            self.assertEqual(len(self.mount_calls(first_calls)), 1)
+            # A controller can die before it records the phase, so the same guest is
+            # prepared again: the type, size and options the kernel actually gave this
+            # mount are re-read, and nothing is mounted over the first one.
+            second, output, second_calls, _, _, _, _ = self.cache_guest(
+                directory, results={self.findmnt(directory): [self.mounted(directory)]})
+            self.assertEqual(second, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(self.mount_calls(second_calls), [])
+            self.assertEqual(self.mount_calls(second_calls, 'umount'), [])
+            self.assertEqual(len(self.mount_calls(second_calls, 'findmnt')), 1)
+
+    def test_a_mount_that_is_not_the_one_asked_for_is_neither_remounted_nor_removed(self):
+        # Source, type and size identify this code's own mount; the options identify the
+        # filesystem the job would actually get, ownership included. Anything else here is
+        # somebody else's, and a wrong owner would fail later as uid 1001, mid-job.
+        cases = [('guest-root', {'source': '/dev/vda1'}, None),
+                 ('bind-of-home', {'source': '/dev/vda1[/home/runner]'}, None),
+                 ('same-name-other-type', {'fstype': 'ext4'}, None),
+                 ('half-asked-for', {'size_mib': 1024}, None),
+                 ('twice-asked-for', {'size_mib': 4096}, None),
+                 ('noexec', {}, 'rw,nosuid,nodev,noexec,relatime,size=2048m,'
+                                 'mode=755,uid=1001,gid=1001,inode64'),
+                 ('read-only', {}, 'ro,nosuid,nodev,relatime,size=2048m,'
+                                   'mode=755,uid=1001,gid=1001,inode64'),
+                 ('without-nosuid', {}, 'rw,nodev,relatime,size=2048m,'
+                                        'mode=755,uid=1001,gid=1001,inode64'),
+                 ('without-nodev', {}, 'rw,nosuid,relatime,size=2048m,'
+                                       'mode=755,uid=1001,gid=1001,inode64'),
+                 ('root-owned', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                    'mode=755,uid=0,gid=1001,inode64'),
+                 ('wrong-group', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                     'mode=755,uid=1001,gid=0,inode64'),
+                 ('without-uid', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                     'mode=755,gid=1001,inode64'),
+                 ('group-writable', {}, 'rw,nosuid,nodev,relatime,size=2048m,'
+                                        'mode=775,uid=1001,gid=1001,inode64')]
+        for name, arguments, options in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    reported = self.mounted(directory, options=options or self.CACHE_OPTIONS,
+                                            **arguments)
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, results={self.findmnt(directory): [reported]})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    # A filesystem this code did not create is never mounted over and never
+                    # taken away, whatever it is mounted from, sized at or restricted to.
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertEqual(self.mount_calls(recorded, 'umount'), [])
+
+    def test_the_guest_refuses_a_size_the_command_line_would_never_send(self):
+        # Zero and an absent key both mean "not requested", so neither is a size here.
+        for mib in (127, 16385, 1 << 20):
+            with self.subTest(mib=mib):
+                with tempfile.TemporaryDirectory() as directory:
+                    code, output, recorded, _, _, _, _ = self.cache_guest(
+                        directory, mib=mib,
+                        results={self.findmnt(directory): [self.enclosing()]})
+                    # The command line bounds this already, but the guest is the code that
+                    # sizes a tmpfs, so it refuses a size outside the same range itself.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(self.mount_calls(recorded), [])
+                    self.assertFalse(self.cache_path(directory).exists())
+
+    def test_cache_never_reaches_a_registered_guest(self):
+        for report, registered, expected in [(RUNNING_REPORT, 'marker', 'running'),
+                                             (COMPLETED_REPORT, 'marker', 'completed'),
+                                             (None, 'dot-runner', 'unknown')]:
+            with self.subTest(registered=registered, expected=expected):
+                with tempfile.TemporaryDirectory() as directory:
+                    program, sudoers, owned = self.guest_paths(directory)
+                    results = {SERVICE_REPORT: (0, report)} if report else {}
+                    if registered == 'marker':
+                        (Path(directory) / 'bootstrap.json').write_text(
+                            json.dumps({'runner_name': 'runway-lease-123'}))
+                    else:
+                        (Path(directory) / 'actions-runner/.runner').write_text('{}')
+                    code, output, recorded, _ = self.execute_guest(
+                        program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                                           'cache_tmpfs_mib': 2048},
+                        present=self.MOUNT_TOOLS, results=results, root_owned=owned)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': expected})
+                    # The freshness guard runs first: a lease that already started, or a
+                    # clone another lease ran, is only read and never touched.
+                    for binary in self.MOUNT_TOOLS:
+                        self.assertEqual(self.mount_calls(recorded, binary), [])
+
+    def test_cache_never_configures_a_non_prepare_action(self):
+        for action, expected in (('status', 0), ('collect', 0), ('stop', 0), ('bootstrap', 1)):
+            with self.subTest(action=action):
+                with tempfile.TemporaryDirectory() as directory:
+                    program, sudoers, owned = self.guest_paths(directory)
+                    code, _, recorded, _ = self.execute_guest(
+                        program, sudoers, {'action': action, 'runner_name': 'runway-lease-123',
+                                           'cache_tmpfs_mib': 2048},
+                        present=self.MOUNT_TOOLS, root_owned=owned)
+                    self.assertEqual(code, expected)
+                    for binary in self.MOUNT_TOOLS:
+                        self.assertEqual(self.mount_calls(recorded, binary), [])
+
+    def test_the_cache_opt_in_leaves_the_namespace_transport_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = self.host_request(directory, port=None)
+            request['cache_tmpfs_mib'] = 2048
+            code, _, recorded = self.execute_host(request)
+            argv, = self.guests(recorded)
+            # No mirror, so no reverse forward: the client stays in the Metal root
+            # namespace and enters the guest's namespace to make the connection.
+            self.assertEqual(argv[:5], ['ip', 'netns', 'exec', 'metal-vm-123', 'ssh'])
+            self.assertNotIn('-R', argv)
+            self.assertNotIn('ProxyCommand', ' '.join(argv))
+            self.assertNotIn('runway-forward', ' '.join(argv))
 
 
 if __name__ == '__main__':

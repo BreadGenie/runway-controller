@@ -20,9 +20,20 @@ action = payload['action']
 name = payload['runner_name']
 marker = Path('/var/lib/runway/bootstrap.json')
 runner = Path('/home/runner/actions-runner')
+cache = Path('/home/runner/.cache')
 sudoers = Path('/etc/sudoers.d/runway-runner')
 sudoers_rule = 'runner ALL=(ALL) NOPASSWD: ALL\n'
 daemon_config = Path('/etc/docker/daemon.json')
+# Yarn and uv fill this one directory with about 1.3 GiB of packages during a job and
+# read it back on every restore, so it is mounted under a name a repeated preparation
+# can recognise as its own instead of stacking a second mount over the first.
+cache_source = 'runway-cache'
+# The guest already keeps a running database on its own tmpfs, so a cache sized against
+# all the memory a job can see would buy disk latency with an out-of-memory kill.
+cache_reserve_mib = 2048
+# The same bounds the command line enforces, so the guest refuses a size it was never
+# asked to support even if a future caller sends one.
+cache_min_mib, cache_max_mib = 128, 16384
 # The exact text preparation replaced, so a refused mirror leaves Docker as it was.
 previous = None
 # Absolute lookup: a non-interactive ssh command inherits no operator PATH, and
@@ -226,6 +237,111 @@ def enable_mirror(port):
         undo_daemon(status)
         return False
     return True
+def available_mib():
+    """Report MemAvailable in MiB: the kernel's own estimate of what a job may claim."""
+    try:
+        with open('/proc/meminfo') as report:
+            for line in report:
+                field, _, rest = line.partition(':')
+                if field == 'MemAvailable':
+                    return int(rest.split()[0]) // 1024
+    except (OSError, ValueError, IndexError):
+        return -1
+    return -1
+def cache_state(findmnt, mib):
+    """Report 'ours', 'foreign' or 'unmounted' for the cache path.
+
+    Source, type, the size the kernel granted and the options all have to match what
+    preparation asked for: a filesystem of another type under this name is not one this
+    code mounted. The ownership and mode are options too, and the job writes here as
+    uid 1001, so a mount that dropped them is refused here rather than failing mid-job. A
+    noexec is refused as well, because native modules are built and run out of this
+    directory. A path that is not a mountpoint answers with the filesystem containing it,
+    whose target is an ancestor, so only a line naming this path counts at all.
+    """
+    report = call([findmnt, '--bytes', '--noheadings', '--output',
+                   'SOURCE,FSTYPE,TARGET,SIZE,OPTIONS', '--target', str(cache)])
+    if report.returncode != 0:
+        return 'unmounted'
+    for line in report.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 5 or fields[2] != str(cache) or not fields[3].isdigit():
+            continue
+        options = set(fields[4].split(','))
+        if (fields[0], fields[1], int(fields[3])) != (cache_source, 'tmpfs', mib * 1048576):
+            return 'foreign'
+        # The kernel records what it granted normalised, so the mode reads 755 and not
+        # 0755, and it adds relatime and inode64 of its own: ask for a subset, not a set.
+        wanted = {'rw', 'nosuid', 'nodev', 'uid=1001', 'gid=1001', 'mode=755'}
+        return 'ours' if wanted <= options and 'noexec' not in options else 'foreign'
+    return 'unmounted'
+def create_cache():
+    """Create the cache directory the sealed image leaves out, for the job's account."""
+    try:
+        # The parent is read with lstat, so a symlinked or non-directory home is refused
+        # here. Nothing untrusted has run on this guest yet, and nothing does until the job
+        # starts, so this check and the mkdir need no lock between them.
+        if not stat.S_ISDIR(os.lstat(cache.parent).st_mode):
+            return False
+        os.mkdir(cache, 0o755)
+        handle = os.open(str(cache), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # open() applied a umask: the account the job runs as must own this outright.
+            os.fchown(handle, 1001, 1001)
+            os.fchmod(handle, 0o755)
+        finally:
+            os.close(handle)
+        return True
+    except OSError:
+        return False
+def cache_filesystem(mib):
+    """Back a fresh guest's package cache with bounded RAM, on the first preparation.
+
+    The mount is named, so a repeated preparation recognises its own filesystem and
+    re-reads the type, size and options the kernel gave it instead of mounting over it
+    again. Nothing is installed or downloaded: only where the guest's own downloads land.
+    """
+    mount = shutil.which('mount', path=root_path)
+    findmnt = shutil.which('findmnt', path=root_path)
+    umount = shutil.which('umount', path=root_path)
+    if mount is None or findmnt is None or umount is None:
+        return False
+    # The command line already bounds this, but the guest is the code that sizes a tmpfs,
+    # so the same range holds here rather than depending on there being one caller.
+    if not cache_min_mib <= mib <= cache_max_mib:
+        return False
+    state = cache_state(findmnt, mib)
+    if state != 'unmounted':
+        # Its own filesystem, or a foreign one: both are verified where they are, because
+        # a second mount over either would only hide the first.
+        return state == 'ours'
+    absent = False
+    try:
+        # lstat never followed a symlink, so one planted here is refused rather than
+        # mounted through, and only an empty directory counts as unused.
+        if not stat.S_ISDIR(os.lstat(cache).st_mode) or os.listdir(cache):
+            return False
+    except FileNotFoundError:
+        # Sealing empties the caches, so absence is the ordinary state of a fresh guest.
+        absent = True
+    except OSError:
+        return False
+    available = available_mib()
+    if available < mib + cache_reserve_mib:
+        # Refused while it is still only a request: nothing created, nothing mounted.
+        return False
+    if absent and not create_cache():
+        return False
+    options = 'rw,nosuid,nodev,size=%dm,uid=1001,gid=1001,mode=0755' % mib
+    if call([mount, '-n', '-t', 'tmpfs', '-o', options, cache_source,
+             str(cache)]).returncode != 0:
+        return False
+    if cache_state(findmnt, mib) == 'ours':
+        return True
+    # A filesystem this code did not verify is one the job would still use, so it comes
+    # back off here instead of being left behind a reported success.
+    call([umount, str(cache)])
+    return False
 if action in ('status', 'prepare'):
     current = state()
     if action == 'prepare' and current == 'installed':
@@ -235,6 +351,11 @@ if action in ('status', 'prepare'):
             print(json.dumps({'state': 'unknown'}))
             sys.exit(1)
         if payload.get('mirror_port') and not enable_mirror(int(payload['mirror_port'])):
+            print(json.dumps({'state': 'unknown'}))
+            sys.exit(1)
+        # A refusal here leaves the two opt-ins above applied. That is deliberate: this is
+        # a disposable guest, and preparation is idempotent, so the retry re-verifies them.
+        if payload.get('cache_tmpfs_mib') and not cache_filesystem(int(payload['cache_tmpfs_mib'])):
             print(json.dumps({'state': 'unknown'}))
             sys.exit(1)
     print(json.dumps({'state': current}))
@@ -456,6 +577,13 @@ def main() -> int:
     # no credential is written anywhere, and nothing is pulled into the image.
     parser.add_argument('--registry-mirror-port', type=int,
                         help='Serve an anonymous registry mirror to fresh guests on this loopback port')
+    # Explicit operator opt-in for a RAM-backed package cache. The filesystem lives
+    # inside the disposable guest and dies with the lease: it holds only the yarn and
+    # uv downloads one job makes, so it moves those writes out of the guest's disk
+    # without touching the Metal host, the guest workspace or any file that outlives
+    # the run. A preparation that cannot prove the memory reserve fails instead.
+    parser.add_argument('--cache-tmpfs-mib', type=int,
+                        help='Back a fresh guest package cache with this many MiB of RAM')
     parser.add_argument('--vm-id', required=True)
     parser.add_argument('--runner-name', required=True)
     parser.add_argument('--deadline', help='Absolute RFC3339 deadline for bootstrap')
@@ -473,6 +601,8 @@ def main() -> int:
         parser.error('collect requires --diagnostics-dir')
     if args.registry_mirror_port is not None and not 1024 <= args.registry_mirror_port <= 65535:
         parser.error('Registry mirror port must be between 1024 and 65535')
+    if args.cache_tmpfs_mib is not None and not 128 <= args.cache_tmpfs_mib <= 16384:
+        parser.error('Cache tmpfs must be between 128 and 16384 MiB')
     if args.deadline:
         try:
             deadline = datetime.fromisoformat(args.deadline)
@@ -493,6 +623,8 @@ def main() -> int:
         # control socket, which is bound to loopback and carries no key material.
         payload['forward_dir'] = str(Path(args.known_hosts).parent
                                      / ('runway-forward-' + args.vm_id))
+    if args.cache_tmpfs_mib:
+        payload['cache_tmpfs_mib'] = args.cache_tmpfs_mib
     if args.deadline:
         payload['deadline'] = args.deadline
     if args.action == 'bootstrap':

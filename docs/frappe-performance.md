@@ -110,3 +110,29 @@ python3 scripts/profile-frappe-run.py steps runway.log
 
 Logs and sampler captures may contain private workflow information. Keep raw
 captures outside the repository; publish only the relevant aggregate measurements.
+
+## Bounded package cache in RAM
+
+The transport accepts `--cache-tmpfs-mib 2048` as an explicit opt-in. During
+preparation of an unregistered guest, it mounts `/home/runner/.cache` on a named
+2 GiB tmpfs. The default remains a disk-backed cache. The guest must report at
+least the requested capacity plus 2 GiB through `MemAvailable`; otherwise
+preparation fails. The CLI range of 128–16384 MiB is not the admission ceiling:
+for example, a guest reporting 5100 MiB available can admit at most 3052 MiB.
+A refusal currently reports the transport’s generic `unknown` state; inspect
+`/proc/meminfo` and `findmnt` when diagnosing a failed preparation.
+The cap limits filesystem growth, but memory is consumed as
+files are written and competes with the database and test processes.
+
+The mount stays executable for native package binaries and uses `nosuid,nodev`.
+It belongs to runner UID/GID 1001. An absent cache directory is created; existing
+symlinks, nonempty unmounted caches and foreign mounts are refused. Repeated
+preparation checks the source, filesystem type, size and options without mounting
+a second filesystem. It does not change the workspace, service configuration,
+workflow, test selection or coverage.
+
+A fresh 3 vCPU / 6 GiB verification VM proved the 2 GiB mount, ownership, native
+execution and repeat preparation. It was deleted before starting the full trial.
+The preceding baked-image job used about 1.27 GB of package cache, including
+804 MB of Yarn files and 469 MB of uv files, which fits the proposed cap. This is
+an experimental profile, not an admission guarantee for arbitrary workflows.

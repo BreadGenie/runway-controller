@@ -72,14 +72,15 @@ ssh -o ProxyCommand='ip netns exec metal-vm-123 socat - TCP:172.16.0.2:22' ...
 ```
 
 `ProxyCommand` runs on the client, in the root namespace; only the `socat` inside it
-sees the namespace. This changes every guest command, not just the forward, so `socat`
-becomes a prerequisite on the Metal host.
+sees the namespace. With `--registry-mirror-port` enabled, every guest command uses
+this connection path, so the Metal host needs `socat`. Without that flag, the
+transport retains its original namespace SSH path and does not require `socat`.
 
 ## Operating it
 
 ### Prerequisites
 
-`socat` on the Metal host, for every guest command:
+`socat` on the Metal host when the mirror flag is enabled:
 
 ```sh
 command -v socat || apt-get install -y --no-install-recommends socat
