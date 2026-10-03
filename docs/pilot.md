@@ -141,3 +141,26 @@ This is trusted internal compute. Firecracker separation and guest-local Docker 
 Cache entries still live in GitHub's own Actions cache service. Aligning the workspace layout fixed the yarn cache, which one runner type had been writing and the other unable to restore, and Runway operates no regional cache tier and no proxy or mirror in front of that service.
 
 Next, extend the verified restart and independent deadline checks with bootstrap response loss, ownership takeover, and GitHub outage cleanup. Performance has been measured on a real Frappe integration job; the next step is a benchmark with hardware matched to GitHub-hosted, then trials of a regional dependency cache and an OCI image cache. Keep cache trust and tenant boundaries explicit; reusable images must remain credential-free.
+
+### Clock reads and the guest clocksource
+
+Firecracker passes the guest no pvclock page, so the guest kernel's `kvm-clock` is MSR-backed and the vDSO has nothing to read in userspace. Every `clock_gettime` in every process on the guest therefore becomes a full syscall. Measured on this pilot's guest, `time.monotonic()` cost 205 ns per call against 49 ns on a GitHub-hosted runner, and `strace` counted 470 `clock_gettime` syscalls for 20 calls. Selecting `tsc`, which the same kernel already lists in `available_clocksource`, dropped that to 57 ns and to zero syscalls.
+
+Preparation can select it, opt-in, and only while the guest still reports `installed` on an unregistered fresh clone. Append `--prefer-guest-tsc` to `transport_command`:
+
+```json
+"transport_command": [
+  "python3", "/srv/runway/scripts/metal-guest-transport.py",
+  "--host", "root@metal.example.com",
+  "--key-file", "/var/lib/runway/guest-admin-key",
+  "--known-hosts", "/var/lib/runway/known-hosts",
+  "--diagnostics-dir", "/srv/runway/private/diagnostics",
+  "--prefer-guest-tsc"
+]
+```
+
+The flag is off by default, and without it `prepare` performs its existing checks only and writes nothing. With it, `prepare`, and only `prepare`, and only while the guest still reports `installed`, selects `tsc` and reads the attribute back to confirm it took. A guest already on `tsc` is confirmed and left alone, so a repeated preparation does not write again. A kernel that does not list `tsc` in `available_clocksource`, a kernel that has marked its TSC unstable, a missing attribute, and an attribute that is not a root-owned regular file are each refused, and preparation fails closed with the transport's generic `unknown` state, so no JIT configuration is requested and no bootstrap follows. Inspect `/sys/devices/system/clocksource/clocksource0/` when diagnosing a refusal.
+
+Nothing is installed or downloaded, and two preconditions make selecting a clocksource as root responsible rather than merely fast. The kernel must advertise `tsc` in `available_clocksource`, and it must not have marked its own TSC unstable by creating an `unstable` attribute in the same directory. Preparation refuses a guest that fails either, and this guest's kernel passes both. That is the whole of the risk: a root-selected `tsc` on a kernel that has declared its TSC unstable trades clock accuracy for latency, which is the opposite of what this opt-in is for, so it is a refusal rather than a judgement call. A weaker position than the sudo opt-in above, which grants privilege: selecting a clocksource grants none. The attributes are root-owned and not group- or world-writable, which is what the kernel exposes and what preparation verifies rather than assumes; anything else, including a symlink, is refused. The write therefore needs root, which is why this lives in `prepare` and not in the job. The setting is the disposable guest's own kernel state. It reaches no Metal host value, no network namespace, no control-plane or GitHub credential, and it is applied before registration so no job observes a partial change. `bootstrap`, `status`, `collect` and `stop` never touch it, and a guest that already carries a registration is never reconfigured. A refusal from the opt-ins after this one leaves it applied, which this code cannot undo; preparation is idempotent, so the retry re-verifies rather than rolls back.
+
+This is a microbenchmark result on an unloaded guest, with no job and no controller running. It closed about 95% of the guest's excess over a GitHub-hosted runner on clock reads, from 205 ns against 49 ns to 57 ns, and moved nothing else measurably in the same session. It has not been measured end to end on a job, so it is not a prediction about the 708-test phase. See [Frappe performance](frappe-performance.md) for the full per-operation comparison, for what this does not fix, and for the larger per-operation cost that no Runway-side change reaches.

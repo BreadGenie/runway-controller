@@ -434,9 +434,10 @@ same userspace Firecracker process as the block device, with the same absent
 vhost configuration, so it is exposed to the same class of overhead, but that is
 an inference, and the round-trip cost has not been measured on either platform.
 
-The measurement to take is therefore a MariaDB round-trip latency distribution,
-guest against host and Runway against a GitHub-hosted runner, taken during a job.
-That needs a live trial.
+The measurement to take is therefore how many round trips the 708 tests make,
+which would put a per-operation cost onto a per-test basis. The next section
+measures the per-operation costs; counting the operations still needs a live
+trial to close.
 
 Two per-class results from the paired-run analysis are outliers rather than
 platform properties and should not be carried into any comparison. `TestSMTP`,
@@ -447,3 +448,260 @@ the workflow starts. Its per-connect cost was 0.060–0.304 s on GitHub and
 1.056–1.295 s on Runway. Separately, the workspace trial's coverage-upload step
 took 35 s, of which about 28 s was a stall on a 172,005-byte artifact against
 1.8 s for 172,030 bytes in another run.
+
+## Per-operation costs and the clocksource
+
+The per-operation costs left unattributed above are now measured, and they are
+two things rather than one. A clock read costs about 4x what it costs on a
+GitHub-hosted runner, and a loopback round trip costs about 3x, dominated by
+waking a vCPU that has gone idle. The second is a property of the virtualization
+boundary and Runway does not control it. The first is a clocksource choice in
+the guest, and it is the only clean lever here: switching it takes clock reads
+from 4.16x to 1.14x of a GitHub-hosted runner and moves nothing else measurably.
+
+What this does not close is the attribution to the test phase. The costs are
+measured; how many of each operation 708 tests perform is not, so the share of
+the 92 s the gap is made of that these two account for is still an estimate. Both
+statements above are microbenchmarks on an unloaded guest, and no end-to-end job
+has been run with the clocksource change, so neither is a prediction about the
+phase.
+
+### What the per-operation costs actually are
+
+`scripts/platform-probe.py` is the canonical tool for this. It is standard
+library only, strictly a reader that opens one loopback listener on an ephemeral
+port, and prints one JSON object per measurement. Each row below names the
+statistic it reports, because they are not all the same and a reader should not
+have to guess which:
+
+```sh
+python3 scripts/platform-probe.py                     # every section
+python3 scripts/platform-probe.py --list-sections
+python3 scripts/platform-probe.py --section clock --section network
+```
+
+The GitHub-hosted column came from the same file inlined into a dispatched
+workflow on the `runway-dogfood` branch of `BreadGenie/frappe`. That workflow is
+not on `main` here, so reproducing the GitHub-hosted column needs a dispatched
+run in that repository.
+
+Both sides ran the same interpreter, `/usr/bin/python3` 3.12.3, which the
+probe's own identity line confirms on the guest. The guest was a
+never-registered VM from image `cffdaa3f24a245ca` at the pool's own
+3 vCPU / 6144 MiB / 10240 MiB shape on the Metal host, with no job and no
+controller running; the GitHub-hosted runner reported 4 vCPU and 16 GiB. Guest
+figures are the median of three whole runs, with the range over those three runs
+in the cell. The clock rows report the fastest of three repetitions, the
+interpreter rows the median of three, the sleep row the median of 40 samples,
+and the round trip the median and p95 of 2,000 rounds.
+
+| Measurement | GitHub-hosted | Runway guest | Ratio |
+| --- | ---: | ---: | ---: |
+| `time.monotonic()` | 49.4 ns/call | 200.5 ns/call (198.8–200.8) | 4.06x |
+| `time.perf_counter()` | 49.0 ns/call | 199.7 ns/call (199.3–206.1) | 4.08x |
+| `time.time()` | 48.4 ns/call | 205.0 ns/call (200.5–205.9) | 4.24x |
+| `sleep(1 ms)` overshoot, median | 59.3 µs | 116.9 µs (104.1–117.1) | 1.97x |
+| `interpreter_dispatch` | 51.38 ns/iter | 58.22 ns/iter (57.46–58.77) | 1.13x |
+| `interpreter_allocate` | 258.79 ns/iter | 394.84 ns/iter (391.09–409.37) | 1.53x |
+| `rtt_loopback`, median | 27.36 µs | 81.08 µs (80.65–90.16) | 2.96x |
+| `rtt_loopback`, p95 | 33.02 µs | 109.23 µs (104.11–129.35) | 3.31x |
+
+The interpreter rows say what the earlier probes in this document already said.
+Against a GitHub-hosted runner, bytecode dispatch is 1.13x and an
+allocation-heavy loop is 1.53x. Against the Metal host rather than against
+GitHub's hardware, the same-interpreter comparison is 1.017x and the tight C loops
+are 1.02–1.07x, which is the basis of
+[the CPU probe section](#same-interpreter-native-and-nested-cpu-probe) and a
+different question from the GitHub-hosted column here. Neither set is large
+enough to be the phase.
+
+One hypothesis is rejected outright. The image pins the official
+`actions/python-versions` 3.14.7 tarball by SHA256
+(`guest/prepare-frappe-image.sh`), and GitHub ships that same build, so the
+interpreter build is not a platform difference here. An out-of-tree comparison
+of the two builds found the pinned 3.14.7 has `USE_COMPUTED_GOTOS = 0` where a
+stock 3.14.4 has it set, worth about 1.7x on bytecode dispatch. That is worth
+knowing about the image, and it cancels out of a comparison where both platforms
+run the same binary.
+
+The clock rows are the outlier at 4.06x to 4.24x, and the `strace` count
+explains why: in the guest, 470 `clock_gettime` syscalls for 20
+`time.monotonic()` calls. The guest kernel logs `kvm-clock: Using msrs
+4b564d01 and 4b564d00`, so its kvm-clock is MSR-backed with no pvclock page, the
+guest vDSO has nothing to read in userspace, and every clock read in every
+process is a full syscall. GitHub-hosted reports `tsc`; the guest reports
+`kvm-clock`, with `tsc` in `available_clocksource`. The same count was not taken
+on the GitHub-hosted side, so the two mechanisms are inferred from the guest's
+syscall count and the two platforms' reported clocksource rather than measured
+on both.
+
+### Why the guest's clock reads cost four times as much
+
+Switching the guest to `tsc` and rerunning the same probe, three whole runs
+before and three after, in one session with no job present:
+
+| Measurement | Guest, `kvm-clock` | Guest, `tsc` | GitHub-hosted | Before | After |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `clock_cost_monotonic` | 205.5 ns (200.7–206.4) | 56.5 ns (56.2–62.0) | 49.4 ns | 4.16x | 1.14x |
+| `clock_cost_perf_counter` | 202.0 ns (200.8–206.6) | 56.1 ns (55.7–63.0) | 49.0 ns | 4.12x | 1.14x |
+| `clock_cost_time` | 208.9 ns (201.2–209.2) | 57.9 ns (57.5–63.1) | 48.4 ns | 4.32x | 1.20x |
+| `interpreter_dispatch` | 61.48 ns (57.67–61.70) | 59.09 ns (58.24–59.66) | 51.38 ns | 1.20x | 1.15x |
+| `interpreter_allocate` | 407.12 ns (401.3–468.2) | 399.93 ns (398.8–417.1) | 258.79 ns | 1.57x | 1.55x |
+| `rtt_loopback`, median | 82.18 µs (81.97–100.56) | 89.51 µs (69.68–91.96) | 27.36 µs | 3.00x | 3.27x |
+| `sleep_overshoot_1ms` | 107.5 µs (96.5–117.5) | 107.1 µs (97.0–108.4) | 59.3 µs | 1.81x | 1.81x |
+
+After the switch the `strace` count for the same 20 calls is zero, and all three
+`after` captures report `current: tsc`.
+
+Nothing else moved beyond its own noise. The rep-to-rep spread on allocation,
+loopback round trip and sleep overshoot is 4.6–25% of the median within a single
+configuration, taking the range over the median of three repetitions, and the
+before-to-after movement on those three rows is 1.8%, 8.9% and 0.4%; bytecode
+dispatch moved 3.9% against a 6.6% spread. This is a clocksource result, not a
+broad speedup, and it should be quoted as one.
+
+The residual 1.14x is not the vDSO either: with zero syscalls the reads are
+already userspace `rdtsc`. What it is, is not established. The obvious candidate
+does not survive the out-of-tree measurement, which put this guest's TSC-backed
+read at 54.07 ns against the Metal host's pvclock-backed 58.60 ns, and 20.14 ns
+against 26.68 ns in C. With a working TSC the guest's clock read is faster than a
+host's, so the cost of the read itself is not available as an explanation for a
+deficit against a GitHub-hosted runner, and the remainder is carried forward
+unaccounted.
+
+The write is root only. `current_clocksource` is mode `0644 root:root` and the
+runner's uid 1001 gets `EACCES`, so the switch has to run as root or be set when
+the image is built. It is not a knob a job can reach.
+
+### The round trip is vCPU placement, not networking
+
+The probe's own round trip runs its client and echo server as two threads in one
+process, so it cannot show placement. It was replaced, out of tree, by a C client
+and server in separate processes, one byte-identical static binary on both
+machines (each harness statically linked and re-verified by md5 after transfer),
+8-byte payload, 20,000 timed iterations per run after 2,000 warmup, six runs
+each. Raw captures are kept outside the repository and the aggregates are
+published here.
+
+| Bare loopback TCP, 8 B, six runs | Metal host | Runway guest |
+| --- | ---: | ---: |
+| median of six run medians | 20.57 µs (17.44–23.26, 29.1%) | 77.10 µs (73.50–77.67, 5.4%) |
+| p95 of six run p95s | 24.34 µs (18.14–24.80, 28.4%) | 103.21 µs (96.04–108.98, 12.6%) |
+
+That is 3.75x on the median and 4.24x on p95, and it agrees with the 81.08 µs
+the in-process probe measured in its own session.
+
+That 3.75x is not a constant, because both machines are bimodal at the level of
+whole runs. A second independent six-run set, recorded as run medians only
+rather than as retained samples, gave host values of either 17.5 or 24.0 µs and
+guest values of either 9.5 or 75.1 µs. Compared mode
+to mode, the guest's slow mode is 3.13x the host's and its fast mode is 1.84x
+faster than the host's, so a three-repetition median on this measurement lands
+in one mode or the other depending on the run. It should be read as "the
+guest's slow mode is about 3x the host's", not as a multiplier.
+
+Pinning the two ends decides which mode a run lands in:
+
+| Placement, 8 B, three runs each | Metal host | Runway guest |
+| --- | ---: | ---: |
+| Both ends on vCPU 0 | 10.12 µs | 9.40 µs |
+| Client on vCPU 1 | 17.42 µs | 84.59 µs |
+| Premium for using a second vCPU | +7.31 µs | +75.19 µs |
+| Busy-poll at both ends, 8 B | 7.66 µs | 6.35 µs |
+| Busy-poll at both ends, 64 KiB | 30.94 µs | 25.12 µs |
+
+Confined to one vCPU the guest is faster than the host, and under busy-polling
+it is faster still at both payload sizes. All of the penalty is the wake.
+
+It is not the network stack either. Repeating the pinned measurement with no
+networking at all, an `AF_UNIX` socketpair and a pipe between two processes:
+
+| Transport, three runs each | Host, one vCPU | Host, two vCPUs | Guest, one vCPU | Guest, two vCPUs |
+| --- | ---: | ---: | ---: | ---: |
+| `SOCK_SEQPACKET` | 4.52 µs | 18.84 µs | 4.32 µs | 57.08 µs |
+| `SOCK_DGRAM` | 4.75 µs | 12.25 µs | 4.33 µs | 57.14 µs |
+| Pipe | 6.73 µs | 9.87 µs | 4.90 µs | 51.95 µs |
+
+The guest's cross-vCPU premium is 52.8 µs on both socket types and 47.1 µs on
+the pipe, with 0.4–0.7% spread over three runs on the socket transports, against
+3–14 µs on the host. TCP, netfilter, offloads, MTU and qdisc are all out of the
+picture by then and the gap is still there.
+
+Ruled out by measurement: GRO and GSO offload (`ethtool -k lo` is identical on
+both, MTU already 65536, `lo` is `noqueue`); payload size, flat from 1 B to
+8 KiB; netfilter, where the host carries 52 `iptables-save` lines against the
+guest's 34 and so does more work per packet; RPS, `busy_poll` and CPU isolation,
+identical on both; idle-CPU burn, measured at 0.04 cores for an idle guest;
+qdisc and congestion control. The missing pvclock page is not implicated either:
+it is worth about 254 ns of extra clock read per round-trip sample, 0.33% of the
+slow mode, and the same harness put the guest's clock read at 159 ns against the
+host's 32 ns, so the guest carries a 5x worse clock and a faster loopback. That
+ruling rests on the measurement and on the mechanism rather than on a direct A/B,
+because the guest kernel was never rebuilt with a pvclock-capable configuration
+to confirm it.
+
+Not settled: how the roughly 53 µs splits between guest IPI resume, KVM exit and
+re-entry, and host scheduling of the target vCPU thread. KVM exit counts were
+not instrumented, so the split is unknown. What is established is that the cost
+lives at the virtualization boundary, because it survives with networking
+removed and disappears when both ends share one vCPU.
+
+The shape that matters for this workload is the published port, because the
+workflow publishes MariaDB's port. The probe's own container case returned
+`never accepted a connection` in all three guest runs and produced no number, so
+the published-port path was measured with the C harness against a `mariadb:11.8`
+container instead: 113.99, 191.61 and 136.79 µs median over three runs, against
+76.26, 76.67 and 76.64 µs for the container's own bridge IP. The bridge is free,
+at the bare-loopback slow mode, and `docker-proxy` adds a second userspace hop
+worth +40 to +115 µs on top, which is two more sleep/wake transitions. That hop
+was measured in the guest only, so it is not established how much of it is the
+guest and how much is `docker-proxy` anywhere. A per-query cost in a Runway guest
+should therefore be expected at 115–190 µs median, though that is a container
+round trip through a published port and not a measured MariaDB query, and
+neither this group nor the spinner rows below has a retained capture.
+
+### What Runway can change, and what it cannot
+
+| Lever | Measured | Cost |
+| --- | --- | --- |
+| Guest clocksource, as root or at image build | 4.16x to 1.14x on clock reads | Nothing else moved; no job measured |
+| Pin both ends of a loopback exchange to one vCPU | 84.59 to 9.40 µs, 9.0x | Serialises the peers; a workload decision, not a guest default |
+| `busy_poll` plus `SO_BUSY_POLL` | 76.6 to 6.35 µs, 12x | Needs a client-side change; burns a whole vCPU |
+| A vCPU keeper spinner | 57.5 to 40.8 µs, -29%, no retained capture | p99.9 stalls of 9.4–9.6 ms |
+| Fewer vCPUs per guest | 9.40 µs at one vCPU | Only pays at one vCPU, and gives up the parallelism the pool is sized for |
+
+Rebuilding the guest kernel is not on that list and should not be attempted.
+`HZ=250` against the host's 1000 and `PREEMPT_NONE` cannot produce this: the
+same binary on the same vCPU is faster in the guest, and there is no 4 ms
+quantization anywhere in the distribution (minimum 26.7 µs, p95 74–79 µs). The
+guest is in fact better on `NO_HZ_IDLE`.
+
+The round-trip cost is not reachable from this repository. Runway picks pool
+size and guest preparation and never configures the hypervisor, the same
+position
+[the block path section](#the-guests-block-path-is-genuinely-poor-and-still-is-not-the-limit)
+records for Firecracker's `Sync` io engine and the absent vhost configuration.
+What would help is a request to Atlas and Metal rather than a Runway change:
+either a vCPU wake path that does not require the host to reschedule a vCPU
+thread for every idle-to-runnable transition, or a documented host CPU pinning
+for a guest's vCPUs, so that the placement which costs 75 µs is a known quantity
+rather than whatever the scheduler chose.
+
+### What is still not established
+
+- The probe's own loopback measurement puts the client and the echo server in
+  one process, so both platforms share a GIL. The two-process C measurement is
+  the one to rely on.
+- That C measurement has no GitHub-hosted counterpart. Getting one needs a
+  dispatched workflow, so the only comparison available is the guest against the
+  Metal host.
+- The probe ran `/usr/bin/python3` 3.12.3, which is not the 3.14.7 toolcache
+  interpreter the job uses, so the two interpreter rows describe the platform's
+  Python rather than the workload's own.
+- No end-to-end job has been run with `clocksource=tsc`. The effect on the
+  708-test phase is unmeasured, and the aggregate effect of the clock and the
+  round trip on job time remains an estimate rather than a trial.
+- The cost per round trip is now measured; the number of round trips the 708
+  tests actually make is not. `scripts/profile-frappe-run.py sampler` would
+  count them, and it is still blocked as described in
+  [open blocker on the paired live trial](#open-blocker-on-the-paired-live-trial).

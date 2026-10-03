@@ -33,6 +33,16 @@ cache = Path('/home/runner/.cache')
 workspace = Path('/home/runner/work')
 sudoers = Path('/etc/sudoers.d/runway-runner')
 sudoers_rule = 'runner ALL=(ALL) NOPASSWD: ALL\n'
+# Firecracker exposes no pvclock page to the guest, so the kernel's kvm-clock is
+# MSR-backed and the vDSO has nothing to read in userspace: every clock_gettime in
+# every process becomes a full syscall. Measured on this host's guest, that costs
+# about 205 ns per read against 57 ns with tsc selected and 49 ns on a GitHub-hosted
+# runner. tsc is offered alongside kvm-clock and reading it is one instruction.
+clocksource = Path('/sys/devices/system/clocksource/clocksource0')
+clocksource_current = clocksource / 'current_clocksource'
+clocksource_available = clocksource / 'available_clocksource'
+clocksource_unstable = clocksource / 'unstable'
+preferred_clocksource = 'tsc'
 daemon_config = Path('/etc/docker/daemon.json')
 # Yarn and uv fill this one directory with about 1.3 GiB of packages during a job and
 # read it back on every restore, so it is mounted under a name a repeated preparation
@@ -130,6 +140,77 @@ def grant_runner_sudo():
         return False
     # Prove the effective rule, not just the file: sudo must succeed with no password.
     return call(['runuser', '-u', 'runner', '--', sudo, '-n', 'true']).returncode == 0
+def root_owned_sysfs(path):
+    """True when `path` is a root-owned sysfs attribute only root could have changed.
+
+    lstat, never stat: a symlink here would redirect the write below, so it is
+    refused rather than followed. The condition mirrors read_daemon rather than
+    grant_runner_sudo. sudo(8) skips a drop-in that group or world can write, so
+    that check is an exact mode; here the requirement is only that nobody but
+    root could have selected a clocksource already, and the kernel exposes these
+    as root-owned 0644. Demanding that exact mode would refuse a 0444 or 0640
+    attribute that is equally safe.
+    """
+    try:
+        recorded = os.lstat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(recorded.st_mode) and recorded.st_uid == 0
+            and not recorded.st_mode & 0o022)
+
+
+def prefer_tsc_clocksource():
+    """Select the guest's tsc clocksource, opt-in only.
+
+    Nothing is installed or downloaded: tsc is a clocksource the guest kernel
+    already offers in `available_clocksource`, so an image whose kernel does not
+    offer it fails preparation instead of being mutated. A kernel that offers it
+    but cannot select it also fails, rather than leaving a guest reporting a
+    clocksource the job will not get.
+
+    `unstable` is refused when the kernel exposes it. A root-selected tsc on a
+    kernel that has marked its own TSC unstable trades clock accuracy for speed,
+    which is the opposite of what this opt-in is for, so it is a refusal rather
+    than a judgement call.
+
+    Idempotent, and re-verified on a repeated preparation: a guest already on tsc
+    is confirmed and left alone rather than written again.
+    """
+    if not root_owned_sysfs(clocksource_available) or not root_owned_sysfs(clocksource_current):
+        return False
+    # Presence only. The kernel creates this attribute to say the TSC is not to be
+    # trusted; there is nothing in it to read.
+    if clocksource_unstable.exists():
+        return False
+    try:
+        offered = clocksource_available.read_text().split()
+        current = clocksource_current.read_text().strip()
+    except OSError:
+        return False
+    if preferred_clocksource not in offered:
+        return False
+    if current == preferred_clocksource:
+        return True
+    try:
+        # O_NOFOLLOW binds the write to this exact inode, which the lstat above only
+        # checked separately. Nothing in the test suite can exercise that difference,
+        # because it cannot widen the window between the two calls; it is there so
+        # that a symlink cannot be substituted in a guest this code did not build.
+        # Neither O_CREAT nor O_TRUNC: the attribute provably exists, and neither
+        # means anything for an attribute that takes a whole value on write.
+        descriptor = os.open(clocksource_current, os.O_WRONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        os.write(descriptor, preferred_clocksource.encode())
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    try:
+        return clocksource_current.read_text().strip() == preferred_clocksource
+    except OSError:
+        return False
 def read_daemon():
     """Read the guest Docker configuration. Returns (status, document).
 
@@ -365,11 +446,20 @@ if action in ('status', 'prepare'):
         if payload.get('allow_guest_sudo') and not grant_runner_sudo():
             print(json.dumps({'state': 'unknown'}))
             sys.exit(1)
+        # Before the mirror and the two mounts, so that this setting, which is the
+        # only one preparation cannot put back, is the one most likely to be left
+        # applied: a later refusal cannot undo it. It goes first so that the refusals
+        # which can be retried cleanly come after it and report first.
+        if payload.get('prefer_tsc_clocksource') and not prefer_tsc_clocksource():
+            print(json.dumps({'state': 'unknown'}))
+            sys.exit(1)
         if payload.get('mirror_port') and not enable_mirror(int(payload['mirror_port'])):
             print(json.dumps({'state': 'unknown'}))
             sys.exit(1)
-        # A refusal here leaves the two opt-ins above applied. That is deliberate: this is
-        # a disposable guest, and preparation is idempotent, so the retry re-verifies them.
+        # A refusal from here on leaves the three opt-ins above applied, including the
+        # clocksource, which this code cannot put back. That is deliberate: this is a
+        # disposable guest and preparation is idempotent, so the retry re-verifies them
+        # rather than rolling them back.
         if payload.get('cache_tmpfs_mib') and not tmpfs_filesystem(
                 cache, cache_source, int(payload['cache_tmpfs_mib'])):
             print(json.dumps({'state': 'unknown'}))
@@ -591,6 +681,15 @@ def main() -> int:
     # network namespace and no control-plane or GitHub credential.
     parser.add_argument('--allow-guest-sudo', action='store_true',
                         help='Give a fresh guest runner account passwordless sudo inside that guest')
+    # Explicit operator opt-in to select the guest kernel's tsc clocksource during
+    # prepare. Firecracker passes no pvclock page, so the guest's kvm-clock is
+    # MSR-backed, the vDSO cannot serve clock_gettime, and every clock read in
+    # every process becomes a syscall; selecting tsc that the kernel already
+    # offers avoids it. This is the disposable guest's own kernel setting: it
+    # changes no Metal host value, no network namespace, and no credential, and it
+    # is applied before registration so no job observes a partial change.
+    parser.add_argument('--prefer-guest-tsc', action='store_true',
+                        help='Select the tsc clocksource in a fresh guest to keep clock reads out of the kernel')
     # Explicit operator opt-in for an anonymous, read-only container image mirror. It
     # opens one reverse SSH forward from the guest's loopback to this Metal host's
     # loopback and points the guest's Docker daemon at it. No host port is published,
@@ -647,7 +746,9 @@ def main() -> int:
         parser.error('Expected one JIT configuration on stdin')
     payload = dict(action=args.action, runner_name=args.runner_name, vm_id=args.vm_id,
                    key_file=args.key_file, known_hosts=args.known_hosts + '-' + args.vm_id,
-                   allow_guest_sudo=args.allow_guest_sudo, guest_program=GUEST_PROGRAM)
+                   allow_guest_sudo=args.allow_guest_sudo,
+                   prefer_tsc_clocksource=args.prefer_guest_tsc,
+                   guest_program=GUEST_PROGRAM)
     if args.registry_mirror_port:
         payload['mirror_port'] = args.registry_mirror_port
         # One private control directory per VM, beside the known-hosts prefix the

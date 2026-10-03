@@ -3,27 +3,54 @@
 
 Answers the questions that decide whether a self-hosted runner's test phase is
 slower because of the machine or because of the interpreter build: interpreter
-build flags, clock/timer cost, bytecode dispatch, allocation, and per-request
-network latency for both loopback and a published container port.
+build flags, clock/timer cost, bytecode dispatch, allocation, and loopback
+round-trip latency.
 
-Standard library only. Read-only apart from a scratch socket port. Prints one
-JSON object per measurement, three repetitions each, reporting the median.
+Strictly a reader. It opens one loopback listener on an ephemeral port, reads one
+attribute under `/sys`, starts no container, pulls no image, and writes nothing.
+
+What each field actually reports, because they are not all the same statistic:
+
+- `clock_cost_*` is the *fastest* of three repetitions of `calls` reads.
+- `sleep_overshoot_*` is the median and p95 of 40 sleeps in one pass.
+- `interpreter_*` is the median of three repetitions.
+- `rtt_loopback` is one pass of `rounds` round trips, so its median and p95 come
+  from a single run and are bimodal on some hosts. Compare medians across whole
+  runs, not within one.
+
+The published-container-port path, which is the shape of a database reached
+through a port Docker publishes, is deliberately not measured here: doing it
+properly pulls an image into the very image store being measured, and a
+throwaway echo container never accepted a connection on this guest, so the
+figure was taken with a separate C harness instead. See the performance report.
+
+Standard library only. Prints one JSON object per measurement.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import platform
 import socket
 import statistics
-import subprocess
 import sys
 import sysconfig
 import threading
 import time
 
 REPS = 3
+# Ordered so the cheapest and most identifying runs first: a truncated capture is
+# still worth something if it got this far.
+SECTIONS = {
+    "identity": "interpreter build, JIT state, platform and CPU count",
+    "clocksource": "the kernel clocksource currently selected and available",
+    "clock": "per-call cost of clock reads and the accuracy of sleeps",
+    "interpreter": "bytecode dispatch and allocation throughput",
+    "network": "loopback TCP round-trip latency",
+}
+ORDER = list(SECTIONS)
 
 
 def emit(name, **kw):
@@ -51,10 +78,9 @@ def report_identity():
     config = {k: sysconfig.get_config_var(k) for k in keys}
     jit = None
     try:
-        import sys as _s
-        if hasattr(_s, "_jit"):
-            jit = dict(available=_s._jit.is_available(),
-                       enabled=_s._jit.is_enabled())
+        if hasattr(sys, "_jit"):
+            jit = dict(available=sys._jit.is_available(),
+                       enabled=sys._jit.is_enabled())
     except Exception as exc:                      # pragma: no cover
         jit = {"error": type(exc).__name__}
     emit("identity",
@@ -197,75 +223,37 @@ def report_network():
     finally:
         listener.close()
 
-    # The real workflow's database is a container published on the loopback
-    # port, so a round-trip through docker's published port is the closest
-    # available analogue of a per-query cost.
-    client = "docker" if os.path.exists("/usr/bin/docker") else None
-    if not client:
-        emit("rtt_container", error="no docker client")
-        return
-    name = "runway-probe-echo"
-    subprocess.run([client, "rm", "-f", name],
-                   capture_output=True, check=False)
-    run = subprocess.run(
-        [client, "run", "-d", "--rm", "-p", "80",
-         "python:3.12-slim", "python", "-c",
-         "import socket;s=socket.socket();s.setsockopt("
-         "socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('0.0.0.0',80));"
-         "s.listen(8)\n"
-         "while True:\n"
-         "    c,_=s.accept()\n"
-         "    d=c.recv(4096)\n"
-         "    c.sendall(b'x')\n"
-         "    c.close()\n"],
-        capture_output=True, text=True)
-    if run.returncode != 0:
-        emit("rtt_container", error="container start failed",
-             stderr=run.stderr.strip()[:200])
-        return
-    try:
-        deadline = time.monotonic() + 30
-        samples = None
-        while time.monotonic() < deadline:
-            # The published port is only assigned once the container is up, so
-            # this is polled rather than read once.
-            out = subprocess.run([client, "port", name, "80/tcp"],
-                                 capture_output=True, text=True).stdout.strip()
-            mapped = out.rsplit(":", 1)[-1].strip()
-            if not mapped.isdigit():
-                time.sleep(0.5)
-                continue
-            try:
-                samples = _rtt("127.0.0.1", int(mapped))
-                break
-            except OSError:
-                time.sleep(0.5)
-        if samples is None:
-            emit("rtt_container", error="never accepted a connection")
-        else:
-            emit("rtt_container",
-                 median_us=round(statistics.median(samples), 2),
-                 p95_us=round(samples[int(0.95 * (len(samples) - 1))], 2),
-                 rounds=len(samples))
-    finally:
-        subprocess.run([client, "rm", "-f", name],
-                       capture_output=True, check=False)
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Measure per-operation latency on a CI runner platform.",
+        epilog="With no arguments every section runs, which takes about a minute.")
+    parser.add_argument("--section", action="append", choices=sorted(SECTIONS),
+                        help="run only this section; repeatable (default: all)")
+    parser.add_argument("--list-sections", action="store_true",
+                        help="print the sections and their descriptions, then exit")
+    args = parser.parse_args(argv)
 
-def main():
+    if args.list_sections:
+        for name in ORDER:
+            print(f"{name:14} {SECTIONS[name]}")
+        return 0
+
+    chosen = args.section or ORDER
+    runners = {
+        "identity": report_identity,
+        "clocksource": report_clocksource,
+        "clock": report_clock_cost,
+        "interpreter": report_interpreter,
+        "network": report_network,
+    }
     # Each section is independent and optional. A probe that cannot take one
     # measurement has to say so and keep going: a diagnostic whose failure mode
     # is to abort loses every later measurement, and the caller cannot tell an
     # absent number from a crashed run.
-    for name, section in (
-        ("identity", report_identity),
-        ("clocksource", report_clocksource),
-        ("clock_cost", report_clock_cost),
-        ("interpreter", report_interpreter),
-        ("network", report_network),
-    ):
+    for name in chosen:
         try:
-            section()
+            runners[name]()
         except Exception as exc:
             emit("section_failed", section=name,
                  error=type(exc).__name__, detail=str(exc)[:200])

@@ -42,6 +42,16 @@ class TransportTests(unittest.TestCase):
         (root / 'actions-runner/bin/Runner.Listener').write_text('')
         (root / 'sudoers').mkdir(parents=True, exist_ok=True)
         (root / 'docker').mkdir(parents=True, exist_ok=True)
+        (root / 'clocksource').mkdir(parents=True, exist_ok=True)
+        # A kernel that offers tsc alongside the MSR-backed kvm-clock, which is what
+        # Firecracker's guest boots with because it passes no pvclock page.
+        (root / 'clocksource/available_clocksource').write_text('kvm-clock tsc\n')
+        (root / 'clocksource/current_clocksource').write_text('kvm-clock\n')
+        # The kernel exposes these as root-owned 0644. write_text honours the umask,
+        # which here would leave them group-writable, and a group-writable attribute is
+        # exactly what the guest program refuses, so the mode is set rather than assumed.
+        for attribute in ('available_clocksource', 'current_clocksource'):
+            os.chmod(root / 'clocksource' / attribute, 0o644)
         # The cache and workspace directories are deliberately left out: sealing empties
         # them, so a fresh guest arrives without either and preparation has to create one.
         program = transport.GUEST_PROGRAM
@@ -50,21 +60,30 @@ class TransportTests(unittest.TestCase):
                                          ('/home/runner/.cache', root / 'cache'),
                                          ('/etc/sudoers.d/runway-runner', root / 'sudoers/runway-runner'),
                                          ('/etc/sudoers.d', root / 'sudoers'),
-                                         ('/etc/docker/daemon.json', root / 'docker/daemon.json')):
+                                         ('/etc/docker/daemon.json', root / 'docker/daemon.json'),
+                                         ('/sys/devices/system/clocksource/clocksource0',
+                                          root / 'clocksource')):
             program = program.replace(guest_path, str(private_path))
         # The workspace is redirected here too, so no test can reach a real guest's
         # directory even when it never enables that opt-in.
         program = program.replace('/home/runner/work', str(root / 'work'))
         # Every file this code may create is root-owned in the guest. The test user
         # cannot own them, so the recorded ownership stands in for that.
+        # Both clocksource attributes are in `owned` because the guest program now
+        # requires them to be root-owned sysfs, which an unprivileged test user cannot
+        # create: fake_lstat rewrites their recorded ownership to root's.
         return program, root / 'sudoers/runway-runner', [root / 'sudoers/runway-runner',
-                                                        root / 'docker/daemon.json']
+                                                        root / 'docker/daemon.json',
+                                                        root / 'clocksource/current_clocksource',
+                                                        root / 'clocksource/available_clocksource']
 
     def execute_guest(self, program, sudoers, payload, *, present=('sudo', 'visudo'),
                       results=None, plant=None, root_owned=(), meminfo=None):
         """Run the embedded guest program locally: no SSH and no real guest binary."""
         real_lstat = os.lstat
         real_open = builtins.open
+        real_write = os.write
+        real_os_open = os.open
         recorded, ownership = [], []
         # A probe this program issues more than once in a single run is answered in
         # order, so the mount table read before a mount can differ from the one after.
@@ -94,6 +113,29 @@ class TransportTests(unittest.TestCase):
                 return io.StringIO(MEMINFO if meminfo is None else meminfo)
             return real_open(path, *rest, **options)
 
+        sysfs_descriptors = {}
+
+        def fake_os_open(path, flags, *rest, **options):
+            descriptor = real_os_open(path, flags, *rest, **options)
+            # os.open is patched process-wide, so a caller passing an already-open
+            # descriptor as its first argument must not be turned into an fspath.
+            if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path) in owned:
+                sysfs_descriptors[descriptor] = os.fspath(path)
+            return descriptor
+
+        def fake_write(descriptor, data):
+            # sysfs replaces an attribute's whole value on write, whatever the offset or
+            # length. A temporary file cannot: a raw write appends and leaves a tail the
+            # kernel would never leave. Truncating first makes the stand-in behave like
+            # the sysfs it stands in for, so the guest program's readback is a real test.
+            if descriptor in sysfs_descriptors:
+                try:
+                    os.ftruncate(descriptor, 0)
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                except OSError:
+                    pass
+            return real_write(descriptor, data)
+
         def fake_lstat(path):
             if os.fspath(path) not in owned:
                 return os.stat_result(list(real_lstat(os.fspath(path))))
@@ -112,6 +154,8 @@ class TransportTests(unittest.TestCase):
               patch('builtins.open', side_effect=fake_open),
               patch.object(transport.os, 'fchown', side_effect=fake_fchown),
               patch.object(transport.os, 'lstat', side_effect=fake_lstat),
+              patch.object(transport.os, 'open', side_effect=fake_os_open),
+              patch.object(transport.os, 'write', side_effect=fake_write),
               patch.object(transport.subprocess, 'run', side_effect=fake_run)):
             with self.assertRaises(SystemExit) as stopped:
                 exec(program, {})
@@ -649,6 +693,173 @@ class TransportTests(unittest.TestCase):
                 payload = json.loads(run.call_args.kwargs['input'])
                 self.assertIs(payload['allow_guest_sudo'], expected)
 
+    def test_tsc_opt_in_is_explicit_and_carried_in_the_payload(self):
+        # A typo in either half of this wiring would make prepare silently skip the
+        # opt-in and still report the guest ready, which is the one outcome an opt-in
+        # must never produce.
+        for flag, expected in (([], False), (['--prefer-guest-tsc'], True)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv', self.arguments('prepare') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                payload = json.loads(run.call_args.kwargs['input'])
+                self.assertIs(payload['prefer_tsc_clocksource'], expected)
+
+    def test_tsc_opt_in_is_reached_by_prepare_alone(self):
+        # bootstrap, status, collect and stop must not touch a kernel setting, and a
+        # guest that already carries a registration must never be reconfigured.
+        for action in ('bootstrap', 'status', 'collect', 'stop'):
+            with self.subTest(action=action):
+                with tempfile.TemporaryDirectory() as directory:
+                    program, sudoers, owned = self.guest_paths(directory)
+                    current = Path(directory) / 'clocksource/current_clocksource'
+                    payload = {'action': action, 'runner_name': 'runway-lease-123',
+                               'prefer_tsc_clocksource': True}
+                    self.execute_guest(program, sudoers, payload, root_owned=owned)
+                    self.assertEqual(current.read_text().strip(), 'kvm-clock')
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            # A recorded registration moves the guest out of `installed`, which is the
+            # only state preparation reconfigures.
+            (Path(directory) / 'bootstrap.json').write_text(
+                json.dumps({'runner_name': 'runway-lease-123'}))
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True}
+            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
+
+    def test_tsc_opt_in_refuses_a_kernel_that_marks_its_own_tsc_unstable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            # Selecting tsc on a kernel that has declared the TSC unstable would trade
+            # clock accuracy for speed, which is the opposite of what this opt-in is for.
+            (Path(directory) / 'clocksource/unstable').write_text('')
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True}
+            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
+
+    def test_tsc_opt_in_refuses_an_attribute_others_could_have_written(self):
+        for mode, label in ((0o664, 'group-writable'), (0o606, 'world-writable')):
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                program, sudoers, owned = self.guest_paths(directory)
+                current = Path(directory) / 'clocksource/current_clocksource'
+                current.chmod(mode)
+                payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                           'prefer_tsc_clocksource': True}
+                # Recorded as root-owned, so the refusal has to be the mode and not the
+                # owner. A group- or world-writable attribute means somebody other than
+                # root could have selected a clocksource already, so this code did not
+                # verify what it was writing.
+                code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                                                         root_owned=owned)
+                self.assertEqual(code, 1, label)
+                self.assertEqual(json.loads(output), {'state': 'unknown'}, label)
+                self.assertEqual(current.read_text().strip(), 'kvm-clock', label)
+
+    def test_tsc_opt_in_refuses_an_attribute_another_account_owns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            # Deliberately outside `owned`, so the recorded owner is this test user
+            # rather than root. An attribute the job's own account could have written
+            # is not one this code verified.
+            code, output, _, _ = self.execute_guest(
+                program, sudoers,
+                {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                 'prefer_tsc_clocksource': True},
+                root_owned=())
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
+
+    def test_tsc_opt_in_selects_the_clocksource_and_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True}
+            code, output, recorded, _ = self.execute_guest(program, sudoers, payload,
+                                                           root_owned=owned)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(current.read_text().strip(), 'tsc')
+            # Nothing is installed and nothing is downloaded: tsc is a clocksource the
+            # guest kernel already offers, so this must not reach for a package manager.
+            self.assertEqual([argv for argv in recorded
+                              if any(part in ('apt', 'apt-get', 'curl', 'wget') for part in argv)], [])
+            # A controller that died before recording the phase prepares the same guest
+            # again. A guest already on tsc is confirmed and left alone, so the
+            # attribute is made unwritable first: a second write would fail loudly
+            # rather than pass unnoticed.
+            os.chmod(current, 0o444)
+            repeated, _, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            self.assertEqual(repeated, 0)
+            self.assertEqual(current.read_text().strip(), 'tsc')
+
+    def test_tsc_opt_in_refuses_an_offer_list_it_cannot_trust(self):
+        # Both attributes are checked, not only the one written. The offer list is what
+        # decides whether the write is attempted at all, so a list another account
+        # could have rewritten is not one this code verified.
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            trusted = [p for p in owned if 'available_clocksource' not in str(p)]
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True}
+            code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                                                     root_owned=trusted)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
+
+    def test_tsc_opt_in_refuses_a_kernel_that_does_not_offer_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            current = Path(directory) / 'clocksource/current_clocksource'
+            (Path(directory) / 'clocksource/available_clocksource').write_text('kvm-clock hpet\n')
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True}
+            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            # An image whose kernel cannot select tsc fails preparation instead of being
+            # mutated, and reports the same generic state as every other refusal.
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
+
+    def test_tsc_opt_in_refuses_a_clocksource_attribute_it_cannot_prove(self):
+        for mutate, label in (
+            (lambda root: None, 'absent'),
+            (lambda root: (root / 'clocksource/current_clocksource').symlink_to(
+                root / 'canary'), 'a symlink'),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                program, sudoers, owned = self.guest_paths(directory)
+                root = Path(directory)
+                # A canary inside this temporary tree, never a real system file: if the
+                # symlink guard were ever removed, a write-capable run would otherwise
+                # truncate something outside the test's control.
+                (root / 'canary').write_text('planted')
+                (root / 'clocksource/current_clocksource').unlink()
+                mutate(root)
+                payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                           'prefer_tsc_clocksource': True}
+                code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                                                         root_owned=owned)
+                self.assertEqual(code, 1, label)
+                self.assertEqual(json.loads(output), {'state': 'unknown'}, label)
+                # The refusal has to be the guard, not a permission error that happens
+                # to produce the same exit code.
+                self.assertEqual((root / 'canary').read_text(), 'planted', label)
+
     def test_prepare_without_opt_in_checks_only_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             program, sudoers, owned = self.guest_paths(directory)
@@ -659,6 +870,10 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(list(sudoers.parent.iterdir()), [])
             self.assertEqual(ownership, [])
             self.assertEqual([argv for argv in recorded if any('sudo' in part for part in argv)], [])
+            # Off by default: a guest that did not ask for it keeps the clocksource its
+            # kernel booted with.
+            current = next(p for p in owned if 'clocksource' in str(p))
+            self.assertEqual(current.read_text().strip(), 'kvm-clock')
 
     def test_opt_in_prepare_installs_a_restrictive_rule_and_verifies_it(self):
         with tempfile.TemporaryDirectory() as directory:
