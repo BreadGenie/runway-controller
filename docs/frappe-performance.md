@@ -186,3 +186,28 @@ runner ownership and repeat preparation; the package cache was not mounted.
 That VM was deleted before the full workflow trial. The workspace cap includes
 checkout, virtualenvs, node modules, runner temporary files and job artifacts.
 Workflows requiring more space should retain the disk-backed default.
+
+
+The [workspace RAM trial](https://github.com/BreadGenie/frappe/actions/runs/37113881319)
+passed all 708 tests with coverage in 720 seconds: containers 18 seconds, setup
+161 seconds, tests 482 seconds, coverage upload 35 seconds and dispatch 44
+seconds. The [paired GitHub job](https://github.com/BreadGenie/frappe/actions/runs/37113883269)
+took 508 seconds (containers 25, setup 92, tests 384, coverage upload 1).
+The test phase was effectively unchanged from the 484-second baked-image trial.
+Setup saved 10 seconds, but the complete job was 20 seconds slower, including a
+longer coverage upload. This does not establish a useful overall gain; the
+workspace RAM profile is also left off in the dogfood configuration.
+
+| Profile, same source and 708 tests with coverage | Runway job | Paired GitHub job |
+| --- | ---: | ---: |
+| Baseline | 749 s | 512 s |
+| Loopback registry mirror | 762 s | 345 s |
+| Baked public service images | 700 s | 440 s |
+| Baked images + RAM package cache | 699 s | 340 s |
+| Baked images + RAM workspace | 720 s | 508 s |
+
+These are individual trials, not a statistically established speedup. GitHub
+reference times varied substantially. Retain the baked-image profile as the
+measured candidate, keep both RAM flags off, and reproduce multiple full runs
+before making broader performance claims. Overall GitHub timing parity has not
+been reached.
