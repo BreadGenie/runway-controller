@@ -45,8 +45,12 @@ preloading them alone cannot eliminate the restore step.
 
 An isolated fresh VM downloaded the 17 MB wkhtmltox release in 0.475 seconds
 (host: 0.583 seconds), and completed 200 sequential 4 KiB fsyncs in 0.296 seconds.
-These probes argue against a general network or fsync bottleneck; they do not
-prove that every workflow request or filesystem operation is fast.
+Those two probes were sequential, single-file and run on an idle guest with no
+job present. The download half still holds for large sequential fetches. The
+fsync half never generalised: 200 fsyncs in 0.296 s is 1.48 ms each, already
+5.2x the host's 285 µs, and it measures one file at a time rather than the many
+small cold reads a test phase is made of. See
+[what limits the test phase](#what-limits-the-test-phase).
 
 ## Test execution
 
@@ -108,6 +112,23 @@ python3 scripts/profile-frappe-run.py compare github.log runway.log
 python3 scripts/profile-frappe-run.py steps runway.log
 ```
 
+The guest-side block measurements need root, because a cold pass is only cold
+if the page cache was actually dropped. Without it the probe says
+`page_cache_dropped: false` on both passes and reports no I/O share, rather than
+presenting a warm read as a cold one:
+
+```sh
+python3 scripts/profile-frappe-run.py tree-read --tree /opt/hostedtoolcache/Python
+python3 scripts/profile-frappe-run.py tree-read --tree /opt/hostedtoolcache/Python --threads 8
+```
+
+The tree creates, deletes and mounts nothing. It does evict the page cache of
+the kernel it runs on, which is why it wants root and why that is not a harmless
+thing for a shared machine. To compare the same bytes against a RAM-backed
+path, point `--tree` at a tmpfs mount that is already set up. Repeating with
+`--threads 1`, `4` and `8`, dropping the host's cache between runs, is what
+separates a latency-bound path from a throughput-bound one.
+
 Logs and sampler captures may contain private workflow information. Keep raw
 captures outside the repository; publish only the relevant aggregate measurements.
 
@@ -168,7 +189,9 @@ The guest was about 3–7% slower on the integer loop and 4–5% slower on the f
 loop; its getpid loop was faster. These small synthetic probes do not reproduce
 the full Frappe workload, and compare native versus nested execution on this
 host, not this host versus GitHub's hardware. They do not establish a uniform
-virtualization penalty large enough to explain the full test-phase gap.
+virtualization penalty large enough to explain the full test-phase gap. They also
+do not rule one out: a pure-compute probe cannot see the small cold reads that
+the test phase is largely made of, which is measured separately below.
 
 
 ## Bounded workspace in RAM
@@ -196,18 +219,231 @@ took 508 seconds (containers 25, setup 92, tests 384, coverage upload 1).
 The test phase was effectively unchanged from the 484-second baked-image trial.
 Setup saved 10 seconds, but the complete job was 20 seconds slower, including a
 longer coverage upload. This does not establish a useful overall gain; the
-workspace RAM profile is also left off in the dogfood configuration.
-
-| Profile, same source and 708 tests with coverage | Runway job | Paired GitHub job |
-| --- | ---: | ---: |
-| Baseline | 749 s | 512 s |
-| Loopback registry mirror | 762 s | 345 s |
-| Baked public service images | 700 s | 440 s |
-| Baked images + RAM package cache | 699 s | 340 s |
-| Baked images + RAM workspace | 720 s | 508 s |
+workspace RAM profile is also left off in the dogfood configuration. Why it was
+a null result is in
+[what limits the test phase](#what-limits-the-test-phase): this trial already had
+the job's Python read path in RAM with 3 GB still available, and the phase was
+never storage-bound to begin with.
 
 These are individual trials, not a statistically established speedup. GitHub
 reference times varied substantially. Retain the baked-image profile as the
 measured candidate, keep both RAM flags off, and reproduce multiple full runs
 before making broader performance claims. Overall GitHub timing parity has not
 been reached.
+
+Neither RAM profile should be retried in that form, and the reason is now
+measured rather than guessed. Putting the package cache or the workspace in RAM
+was aimed at storage latency, and the guest really does spend most of a cold
+file read waiting on storage. But the test phase spends almost none of its time
+waiting on storage: 0.05% iowait on average, 0% at the 95th percentile,
+measured during the phase itself. The workspace trial already had the job's
+Python read path in RAM with 3 GB still free. Both profiles moved the test phase
+by about two seconds either way across five runs, which is the expected result
+once the phase is known not to be storage-bound. What they traded away was
+memory, and that trade was not free.
+
+## Open blocker on the paired live trial
+
+Attaching `scripts/profile-frappe-run.py sampler` to a real job is the
+outstanding measurement, and the one that would show what the workload spends
+its time on. The host and guest `vmstat` capture described in
+[what limits the test phase](#what-limits-the-test-phase) already answers the
+storage half of that; what is missing is per-process CPU and the MariaDB
+`SHOW GLOBAL STATUS` counters, which is what would test the round-trip
+hypothesis. Setting the sampler up got as far as a claimed pool and a fresh
+scale set, and then stopped on the GitHub side.
+
+`--action controller` reported `GitHub session unavailable; lease deadlines
+remain enforced by Central`, then stopped when Central returned HTTP 508 on
+ownership renewal, a query deadlock, handled by stopping rather than continuing
+with stale ownership. The same status appears elsewhere in that pool's earlier
+controller logs, on VM ensure and on delete, so it is not specific to renewal.
+The controller reports that one generic message for any failure to open the
+Actions message session, so the underlying status is not visible from its log.
+What is established:
+
+- The credential is not the problem. `--action lookup` succeeded against the
+  same token for a scale set created seconds earlier, returned live statistics,
+  and afterwards reported `scale set not found`, a message Runway only prints
+  when the SDK call itself succeeded, so the token and the Actions service
+  credential exchange both work.
+- `--action delete` also succeeded.
+- The failing call is message-session creation, `POST
+  _apis/runtime/runnerscalesets/{id}/sessions`. Runway sets `RetryMax = 0` on
+  the HTTP client for that call, so it is attempted once per loop and retried
+  every three seconds; no status code was ever observed, because the controller
+  does not log one.
+
+Not yet ruled out: whether a scale set needs time before it will open a message
+session, or whether the session endpoint rejects a repository-scoped scale set
+created moments earlier. The scale set was removed and the pool returned to
+Paused with `scale_set_id` restored, so nothing is left registered.
+
+Recreating the scale set and waiting before starting the controller is the next
+step, and it needs no new credentials. If it fails the same way, the error needs
+to be surfaced from the controller rather than collapsed into one generic
+health line, which is a change worth making in its own right: a failure that
+stops all side effects should say what failed.
+
+## What limits the test phase
+
+Everything above ranks profiles. This section asks what actually limits the
+`Run Tests` phase, and it revises an earlier conclusion in this document in the
+process.
+
+### The test phase is not I/O bound, and a live capture already showed it
+
+Host and guest `vmstat`, plus host `iostat`, were captured over SSH during the
+baseline Runway job and analysed with this repository's own `hostio`
+subcommand. The guest capture is 376 samples at two-second intervals, about
+752 s against the job's 749 s, ending when the guest stopped
+answering, so it spans the job rather than an idle probe. This was done before, not after, the
+question was asked; what is missing is the richer `sampler` JSONL, which adds
+per-process CPU and MariaDB counters.
+
+Over the last 237 samples, which fall inside the test phase:
+
+| Guest, during the test phase | mean | p50 | p95 | max |
+| --- | ---: | ---: | ---: | ---: |
+| user | 26.18 | 26.00 | 51.00 | 65.00 |
+| system | 8.18 | 9.00 | 14.00 | 20.00 |
+| **idle** | **64.00** | **63.00** | 94.00 | 96.00 |
+| **iowait** | **0.05** | **0.00** | **0.00** | 4.00 |
+| steal | 1.56 | 1.00 | 3.00 | 5.00 |
+| run queue | 1.45 | 1.00 | 3.00 | 6.00 |
+
+Busy CPU is 36%, which on three vCPUs is about 1.08 cores, with a run queue of
+1.45. Iowait is 0.05% on average and 0% at the 95th percentile: across the
+whole 474 s window that is roughly a quarter of a second spent waiting on I/O.
+Over the entire capture, iowait averages 0.93%, still about 7 s. The choice of
+window moves the answer by more than twentyfold, so the window matters, but
+neither choice gets near the 75.7–231.7 s the marginal term has to explain, and
+neither can be the mechanism. Steal tops out at 5%.
+
+So the test phase is not waiting on guest disk, not waiting on CPU, and barely
+loses anything to the hypervisor. It is latency-bound: something outside those
+three counters accounts for roughly two-thirds of the wall time while the
+guest's cores sit idle.
+
+This also settles what the two RAM profiles did and did not show. The workspace
+profile mounted `/home/runner/work`, which contains the job's
+`env/lib/python3.14/site-packages`, on a 2 GiB tmpfs, so the Python read path
+was in RAM for that trial. Its own capture during the test phase recorded
+3,020,528 kB `MemAvailable`, 1,594,880 kB `Shmem`, and 884,600,832 bytes free on
+the mount: a RAM-backed read path with 3 GB still available and no memory
+pressure. The test phase was 482 s against the baked image's 484 s. That is not
+a null result waiting for an explanation; it is the expected result, and it
+should not be read as evidence that the read path was cheap or that RAM was the
+constraint. The package-cache profile is a weaker version of the same
+experiment and likewise showed nothing.
+
+### The guest's block path is genuinely poor, and still is not the limit
+
+Measured on a never-registered VM booted from image `cffdaa3f24a245ca` at the
+pool's own 3 vCPU / 6144 MiB / 10240 MiB shape, with no job and no controller
+running; both probe VMs were deleted afterwards. The probe reads
+`/opt/hostedtoolcache/Python`, which holds 8,345 `.py`, `.pyc` and `.so`
+files totalling 267,925,688 bytes, the same read-mostly content class as a job's
+`site-packages`. Host baseline on the ext4 filesystem over `/dev/vda1`: 9,638 4 KiB random reads/s
+(mean 103.8 µs) and about 3,500 4 KiB durable writes/s (mean 285 µs).
+
+| Measurement | Result |
+| --- | ---: |
+| Tree read, host and guest caches both dropped | 3.66–4.11 s, 439–493 µs/file |
+| Tree read, guest cache dropped only | 1.89 s, 227 µs/file |
+| Tree read, warm | 0.086–0.108 s, 10–13 µs/file |
+| I/O share of a cold tree read | 95–97% |
+| Sequential read, cold | 710–993 MiB/s |
+| 4 KiB durable write | 438–449 ops/s, 2.23–2.28 ms |
+| Same tree from a 1 GiB tmpfs | 1.42 s, so 2.69x faster |
+| Tree read at 1 / 4 / 8 readers | 2,207 / 3,561 / 3,475 files/s |
+
+Three measurements, and one inference that is not one.
+
+A cold read of this tree is 95–97% I/O wait at 227–493 µs per file, against
+10–13 µs warm. That is a 22x to 34x lever along this path, and it is the
+number that makes the guest look bad on paper.
+
+Durable 4 KiB writes cost 2.23–2.28 ms against the host's 285 µs, a factor
+of 8.0, reproduced across both VMs.
+
+Reader concurrency saturates: eight readers buy 1.575x over one, and four buy
+1.614x. One sample per point, so treat the shape as indicative rather than a
+curve.
+
+The inference: why the block path behaves this way. metald hands Firecracker a
+raw ZFS zvol as `{path_on_host, is_root_device: true, cache_type: "Writeback"}`
+and sets no `io_engine`, so Firecracker falls back to its documented default of
+Sync, one in-flight request per virtqueue, and no vhost-user socket, so
+virtio-blk is serviced inside the Firecracker process. `grep` over the deployed
+`/usr/bin/metald` finds no occurrence of `io_engine` or `vhost`, and
+`metald.toml` exposes no drive-backend or device-tuning keys. Below that, the
+`metal` ZFS pool's only vdev is the *file* `/root/disks/atlas.img` on ext4
+over a virtio disk whose queue reports `rotational = 1`. That accounts for the
+queue-depth observation and for roughly half the cold-read cost surviving a
+host-cache drop (1.81 s of 3.55 s), but it is read off configuration that is
+absent, not measured. None of it is reachable from this repository: Runway picks
+pool size and guest preparation, and never configures the hypervisor.
+
+None of this explains the gap, because the test phase does not spend its time
+reading. It is recorded because it is real, because it will bound any future
+I/O-heavy workflow on this host, and because a workload that is genuinely
+read-bound on Runway should be told to expect it.
+
+### Where that leaves the gap
+
+Across the five logged pairs, the `Run Tests` step spans 484–492 s on Runway
+(1.017x) and 234–388 s on GitHub (1.661x). That asymmetry is more useful than
+either number. It is not explained by cache state, step set, image digest,
+service digests or test count: all ten logs ran the same 16 steps, the same 123
+classes, the same 708 tests, zero failures, identical action SHAs, the identical
+`ubuntu-24.04 20260927.320.1` image, identical service digests, and three cache
+hits each with no `Failed to restore` line. Within the five GitHub runs the
+whole step and its first segment correlate at Pearson r = +0.997 (n=5,
+indicative). Across platforms the step ratio and that segment's ratio correlate
+at +0.927, held down by the RAM-cache pair, whose Runway import segment was
+7.529 s against 5.358–6.001 s in the other four, which is a cold fresh VM
+rather than a platform property.
+
+So the test phase on both platforms is close to one machine-speed constant times
+a fixed workload. Runway is a slower machine and a steady one; GitHub-hosted
+runners are a variable machine that sometimes arrives faster than Runway and
+sometimes slower. Runway's stability is worth something in its own terms, but it
+does not make an absolute parity target well defined against a reference whose
+own spread is 1.661x.
+
+Normalising that constant out, the remaining platform difference is smaller than
+the raw ratios suggest. Marginal cost per test is 0.6079–0.6161 s on Runway
+(1.34% spread over five runs) against 0.2863–0.4828 on GitHub; with the constant
+divided out the per-test multiplier is 1.245–1.305, median 1.268. About
+97–103% of the gap is that marginal term; fixed per-class cost is at most
+0.10 s per class and is *lower* on Runway in four of the five pairs. These come
+from an out-of-tree analysis of the five pairs rather than from a documented
+`profile-frappe-run.py` subcommand, so the numbers are not reproducible from
+the tooling as it stands.
+
+The shape of what is left: a workload that keeps about 1.1 of 3 cores busy,
+shows no iowait, loses at most 5% to steal, and is still 1.27x slower per test
+after machine speed is normalised out, while a pure-compute probe puts the
+guest only 3–7% behind the host and a syscall probe ahead of it. That points at
+per-operation latency rather than throughput, and the largest untested candidate
+is MariaDB round-trips: the database runs in a container on tmpfs inside the
+guest, so a query wait is neither guest iowait nor guest CPU, and it is the one
+thing the existing captures cannot see. The network device is serviced in the
+same userspace Firecracker process as the block device, with the same absent
+vhost configuration, so it is exposed to the same class of overhead, but that is
+an inference, and the round-trip cost has not been measured on either platform.
+
+The measurement to take is therefore a MariaDB round-trip latency distribution,
+guest against host and Runway against a GitHub-hosted runner, taken during a job.
+That needs a live trial.
+
+Two per-class results from the paired-run analysis are outliers rather than
+platform properties and should not be carried into any comparison. `TestSMTP`,
+ratio 15.76x, is not hermetic: the logs show it connecting to public SMTP servers
+on port 587, five different Google addresses across the five GitHub runs and one
+fixed non-Google address across the five Runway runs, never the smtp4dev service
+the workflow starts. Its per-connect cost was 0.060–0.304 s on GitHub and
+1.056–1.295 s on Runway. Separately, the workspace trial's coverage-upload step
+took 35 s, of which about 28 s was a stall on a 172,005-byte artifact against
+1.8 s for 172,030 bytes in another run.

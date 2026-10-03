@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for scripts/profile-frappe-run.py.
 
-Two areas are covered.
+Three areas are covered.
 
 1. The log parser has to survive the two things that make CI logs awkward and
    that silently corrupt timings if handled wrongly:
@@ -18,15 +18,25 @@ Two areas are covered.
    CPU seconds by a wall interval, so its path handling, its argv and its
    interval arithmetic are all pinned by tests here.
 
+3. The tree-read probe.  Its entire output is a claim about how much of a cold
+   pass was I/O wait, so it must never report a split it did not measure: a pass
+   whose page cache was not dropped has to be visibly not-cold, and the cache
+   must be dropped once, for the cold pass only.  The probe evicts this
+   machine's page cache, so every test here stubs that out -- running this suite
+   as root must not evict the cache of whatever machine is running it.
+
 Every fixture is inline and deterministic; nothing reads a capture from a
 private directory.  Run: python3 scripts/test_profile_frappe_run.py
 """
 
+import contextlib
 import errno
 import importlib.util
+import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -886,6 +896,169 @@ class RealLogRegressionTests(unittest.TestCase):
         self.assertLess(gh.test_wall, rw.test_wall)
         # The documented ratio for this pair is about 1.25x.
         self.assertLess(rw.test_wall / gh.test_wall, 1.4)
+
+
+class TreeReadProbeTests(unittest.TestCase):
+    """The tree-read probe has to be honest about cold versus warm.
+
+    Its whole point is separating I/O wait from work, so a pass whose page
+    cache was never dropped must never be able to contribute to that split.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="tree-read-test-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        for i in range(12):
+            with open(os.path.join(self.root, f"mod{i}.py"), "wb") as fh:
+                fh.write(b"x" * 512)
+        with open(os.path.join(self.root, "notes.txt"), "w") as fh:
+            fh.write("ignored")
+        # Stubbed for the whole class.  The real thing evicts this machine's
+        # page cache for every process on it, and docs/development.md tells
+        # operators to run this suite -- including as root, since the tool's own
+        # measurements need root.  A unit test must not do that behind their
+        # back; the tests that care about the cold/warm arithmetic inject
+        # timings instead, and the one test that cares about the drop itself
+        # patches this deliberately.
+        dropper = mock.patch.object(pfr, "_drop_page_cache", return_value=False)
+        self.drop_cache = dropper.start()
+        self.addCleanup(dropper.stop)
+
+    def _args(self, **overrides):
+        args = types.SimpleNamespace(tree=self.root, suffix=[".py"], threads=1,
+                                     host_cache_dropped=False)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def _run(self, times=None, **overrides):
+        """Run the probe and parse its JSON.
+
+        `times` supplies the (wall, bytes) each pass should report, so the I/O
+        split is exercised against known numbers instead of against whatever
+        this machine happens to do with a 6 KiB fixture.
+        """
+        buffer = io.StringIO()
+        if times is None:
+            with contextlib.redirect_stdout(buffer):
+                pfr.tree_read_probe(self._args(**overrides))
+        else:
+            with mock.patch.object(pfr, "_read_files",
+                                   side_effect=list(times)), \
+                 contextlib.redirect_stdout(buffer):
+                pfr.tree_read_probe(self._args(**overrides))
+        return json.loads(buffer.getvalue())
+
+    def test_only_matching_suffixes_are_walked(self):
+        report = self._run()
+        self.assertEqual(report["files"], 12)
+        self.assertNotIn("notes.txt", json.dumps(report))
+
+    def test_both_passes_are_reported_with_their_own_byte_totals(self):
+        report = self._run()
+        labels = [p["label"] for p in report["passes"]]
+        self.assertEqual(labels, ["cold", "warm"])
+        for entry in report["passes"]:
+            self.assertEqual(entry["bytes_read"], 12 * 512)
+            self.assertGreater(entry["us_per_file"], 0)
+
+    def test_a_pass_whose_cache_was_not_dropped_is_not_claimed_cold(self):
+        report = self._run()
+        self.assertIs(report["passes"][0]["page_cache_dropped"], False)
+        self.assertNotIn("io_share_of_cold_pass", report)
+        self.assertNotIn("warm_speedup", report)
+
+    def test_the_cache_is_dropped_once_and_only_for_the_cold_pass(self):
+        # If the warm pass dropped it too, the warm pass would measure a cold
+        # tree and the whole cold/warm split would collapse to nothing while
+        # still reporting a plausible-looking number.
+        self.drop_cache.side_effect = [True, False]
+        report = self._run(times=[(4.0, 6144), (1.0, 6144)])
+        self.assertEqual(self.drop_cache.call_count, 1)
+        self.assertIs(report["passes"][0]["page_cache_dropped"], True)
+        self.assertIs(report["passes"][1]["page_cache_dropped"], False)
+
+    def test_a_failed_drop_is_retried_rather_than_reported_as_cold(self):
+        # Only two passes exist, so a failed first drop must not be retried into
+        # the warm pass -- but it must also not be mistaken for one.
+        report = self._run()
+        self.assertEqual(self.drop_cache.call_count, 1)
+        self.assertIs(report["passes"][1]["page_cache_dropped"], False)
+
+    def test_the_io_split_is_only_reported_when_the_cold_pass_was_cold(self):
+        with mock.patch.object(pfr, "_drop_page_cache", return_value=True):
+            report = self._run(times=[(4.0, 6144), (1.0, 6144)])
+        self.assertIs(report["passes"][0]["page_cache_dropped"], True)
+        self.assertEqual(report["io_seconds"], 3.0)
+        self.assertEqual(report["io_share_of_cold_pass"], 0.75)
+        self.assertEqual(report["warm_speedup"], 4.0)
+
+    def test_a_warm_tree_reports_a_negative_io_share_rather_than_hiding_it(self):
+        # Cold came out faster than warm.  That is noise, not a finding, and the
+        # report must show it rather than clamp or omit it.
+        with mock.patch.object(pfr, "_drop_page_cache", return_value=True):
+            report = self._run(times=[(1.0, 6144), (2.0, 6144)])
+        self.assertEqual(report["io_seconds"], -1.0)
+        self.assertEqual(report["io_share_of_cold_pass"], -1.0)
+
+    def test_more_than_one_reader_still_covers_the_whole_tree(self):
+        # The pool path is a different code path from threads=1, and the cold
+        # pass through it was otherwise untested.
+        report = self._run(threads=4)
+        self.assertEqual(report["threads"], 4)
+        for entry in report["passes"]:
+            self.assertEqual(entry["bytes_read"], 12 * 512)
+            self.assertGreater(entry["files_per_s"], 0)
+            self.assertGreater(entry["mib_per_s"], 0)
+
+    def test_zero_readers_is_refused_instead_of_crashing_the_pool(self):
+        with self.assertRaises(SystemExit):
+            self._run(threads=0)
+
+    def test_the_report_says_which_host_produced_it(self):
+        self.assertEqual(self._run()["hostname"], socket.gethostname())
+
+    def test_a_hand_dropped_host_cache_is_recorded_not_assumed(self):
+        self.assertIs(self._run()["host_cache_dropped"], False)
+        self.assertIs(self._run(host_cache_dropped=True)["host_cache_dropped"], True)
+
+    def test_a_missing_tree_is_refused_rather_than_reported_as_zero(self):
+        with self.assertRaises(SystemExit):
+            self._run(tree=os.path.join(self.root, "absent"))
+
+    def test_a_tree_with_no_matching_files_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self._run(tree=self.root, suffix=[".nothing-matches-this"])
+
+
+class TreeReadRobustnessTests(unittest.TestCase):
+    """An unreadable entry must not abort a pass, nor inflate the total.
+
+    A file that cannot be opened counts as a read of zero bytes, so the byte
+    total is a floor rather than an exact figure.  That is stated in
+    `_read_files`' docstring; this pins that it neither raises nor over-reports.
+    """
+
+    def test_unreadable_entries_do_not_abort_the_pass(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bit under test")
+        root = tempfile.mkdtemp(prefix="tree-read-perm-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        readable = []
+        for i in range(4):
+            path = os.path.join(root, f"m{i}.py")
+            with open(path, "wb") as fh:
+                fh.write(b"y" * 128)
+            readable.append(path)
+        blocked = os.path.join(root, "m4.py")
+        with open(blocked, "wb") as fh:
+            fh.write(b"y" * 128)
+        os.chmod(blocked, 0o000)
+        self.addCleanup(os.chmod, blocked, 0o600)
+        readable.append(blocked)
+
+        _wall, nbytes = pfr._read_files(readable)
+        self.assertEqual(nbytes, 4 * 128)
 
 
 # Fixture logs are written to disk because the parser reads paths.  They are
