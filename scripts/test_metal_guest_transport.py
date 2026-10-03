@@ -1263,15 +1263,33 @@ class TransportTests(unittest.TestCase):
         # Refused before a key or a channel is used: two reservations against one 6 GiB
         # guest would be an aggregate, so the trial could never attribute a result.
         run.assert_not_called()
+        # The presence of the two keys is what is refused, as on the command line, so a
+        # payload that spells either one as zero cannot slip the pair past the guest and
+        # then have the falsy half quietly mean "not requested" further down.
+        for cache, workspace in ((2048, 2048), (2048, 0), (0, 2048), (0, 0)):
+            with self.subTest(cache=cache, workspace=workspace):
+                with tempfile.TemporaryDirectory() as directory:
+                    code, output, recorded, _, _, _, _ = self.workspace_guest(
+                        directory, payload={'action': 'prepare', 'runner_name': 'runway-lease-123',
+                                            'cache_tmpfs_mib': cache,
+                                            'workspace_tmpfs_mib': workspace})
+                    # A payload written any other way is refused by the guest itself, before
+                    # it has read the guest's state, created a directory or mounted
+                    # anything at all.
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(output), {'state': 'unknown'})
+                    self.assertEqual(recorded, [])
+                    self.assertFalse(self.cache_path(directory).exists())
+                    self.assertFalse(self.workspace_path(directory).exists())
         with tempfile.TemporaryDirectory() as directory:
+            # One key alone still means what it always meant: a falsy size is no request, so
+            # this is prepared without a tmpfs rather than refused as an impossible pair.
             code, output, recorded, _, _, _, _ = self.workspace_guest(
                 directory, payload={'action': 'prepare', 'runner_name': 'runway-lease-123',
-                                    'cache_tmpfs_mib': 2048, 'workspace_tmpfs_mib': 2048})
-            # A payload written any other way is refused by the guest itself, before it has
-            # read the guest's state, created a directory or mounted anything at all.
-            self.assertEqual(code, 1)
-            self.assertEqual(json.loads(output), {'state': 'unknown'})
-            self.assertEqual(recorded, [])
+                                    'cache_tmpfs_mib': 0})
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(self.mount_calls(recorded), [])
             self.assertFalse(self.cache_path(directory).exists())
             self.assertFalse(self.workspace_path(directory).exists())
 

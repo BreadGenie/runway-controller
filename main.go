@@ -113,7 +113,7 @@ func run() error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"id": set.ID, "name": set.Name, "statistics": set.Statistics})
 	case "jit":
-		jit, err := client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: *name, WorkFolder: "_work"}, *id)
+		jit, err := client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: *name, WorkFolder: guestWorkFolder}, *id)
 		if err != nil {
 			return errors.New("JIT generation failed; keep this runner name reserved and reconcile its registration before retrying")
 		}

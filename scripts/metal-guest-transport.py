@@ -21,9 +21,10 @@ name = payload['runner_name']
 # The two RAM-backed directories each reserve memory against the same guest, so asking for
 # both would be an aggregate reservation rather than one measured variable: on a 6 GiB
 # guest two of them together can exceed what a job can see. The command line refuses the
-# pair before it opens a channel; this refuses a payload written any other way, before
-# anything has been created, mounted or configured.
-if payload.get('cache_tmpfs_mib') and payload.get('workspace_tmpfs_mib'):
+# pair before it opens a channel; this refuses a payload written any other way, on the
+# presence of the two keys exactly as the command line does, before anything has been
+# created, mounted or configured.
+if 'cache_tmpfs_mib' in payload and 'workspace_tmpfs_mib' in payload:
     print(json.dumps({'state': 'unknown'}))
     sys.exit(1)
 marker = Path('/var/lib/runway/bootstrap.json')
