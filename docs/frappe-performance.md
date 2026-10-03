@@ -244,46 +244,48 @@ memory, and that trade was not free.
 
 ## Open blocker on the paired live trial
 
-Attaching `scripts/profile-frappe-run.py sampler` to a real job is the
-outstanding measurement, and the one that would show what the workload spends
-its time on. The host and guest `vmstat` capture described in
-[what limits the test phase](#what-limits-the-test-phase) already answers the
-storage half of that; what is missing is per-process CPU and the MariaDB
+Attaching `scripts/profile-frappe-run.py sampler` to a real job was the
+outstanding measurement. The host and guest `vmstat` capture described in
+[what limits the test phase](#what-limits-the-test-phase) already answered the
+storage half of it; what was missing was per-process CPU and the MariaDB
 `SHOW GLOBAL STATUS` counters, which is what would test the round-trip
-hypothesis. Setting the sampler up got as far as a claimed pool and a fresh
-scale set, and then stopped on the GitHub side.
+hypothesis. That is now done, and
+[the trial section](#the-clocksource-trial-and-the-round-trip-count) reports it.
 
-`--action controller` reported `GitHub session unavailable; lease deadlines
-remain enforced by Central`, then stopped when Central returned HTTP 508 on
-ownership renewal, a query deadlock, handled by stopping rather than continuing
-with stale ownership. The same status appears elsewhere in that pool's earlier
-controller logs, on VM ensure and on delete, so it is not specific to renewal.
-The controller reports that one generic message for any failure to open the
-Actions message session, so the underlying status is not visible from its log.
-What is established:
+Setting it up first failed, and the cause was not GitHub. `--action controller`
+reported `GitHub session unavailable; lease deadlines remain enforced by
+Central`, then stopped when Central returned HTTP 508 on ownership renewal, a
+query deadlock, handled by stopping rather than continuing with stale ownership.
+The same status appears elsewhere in that pool's earlier controller logs, on VM
+ensure and on delete, so it is not specific to renewal.
 
-- The credential is not the problem. `--action lookup` succeeded against the
-  same token for a scale set created seconds earlier, returned live statistics,
-  and afterwards reported `scale set not found`, a message Runway only prints
-  when the SDK call itself succeeded, so the token and the Actions service
-  credential exchange both work.
-- `--action delete` also succeeded.
-- The failing call is message-session creation, `POST
-  _apis/runtime/runnerscalesets/{id}/sessions`. Runway sets `RetryMax = 0` on
-  the HTTP client for that call, so it is attempted once per loop and retried
-  every three seconds; no status code was ever observed, because the controller
-  does not log one.
+What the investigation established, in the order it mattered:
 
-Not yet ruled out: whether a scale set needs time before it will open a message
-session, or whether the session endpoint rejects a repository-scoped scale set
-created moments earlier. The scale set was removed and the pool returned to
-Paused with `scale_set_id` restored, so nothing is left registered.
+- The credential was never the problem. `--action lookup` and `--action jit`
+  both succeeded against the same token, the latter returning a runner ID, so the
+  token and the Actions service credential exchange both work.
+- A standalone probe of `Client.MessageSessionClient` against the same scale set
+  opened a session with no error at all.
+- The controller was in fact being pointed at a scale set that no longer existed.
+  An operator helper used to set the pool's `scale_set_id` and status saved the
+  document without committing it, so the writes never reached the database while
+  the helper reported success from the in-memory document. The controller
+  therefore read the previous `scale_set_id` and tried to open a session against
+  a deleted scale set.
+- Two things made this slow to see. A paused pool answers a claim with
+  `enabled: false`, so a pool that was never activated is a quiet no-op rather
+  than an error. And the controller collapses every message-session failure into
+  one generic health line, so a configuration mistake presented as a GitHub
+  outage.
 
-Recreating the scale set and waiting before starting the controller is the next
-step, and it needs no new credentials. If it fails the same way, the error needs
-to be surfaced from the controller rather than collapsed into one generic
-health line, which is a change worth making in its own right: a failure that
-stops all side effects should say what failed.
+The last point is a real defect worth fixing on its own terms and independent of
+this investigation: a failure that stops all side effects should say what failed.
+Surfacing the underlying error is what would have made this a two-minute
+diagnosis. Reading a pool's configuration back through the API, rather than
+trusting a helper's own report of what it wrote, is the other half.
+
+The trial has since been run twice successfully, and the scale set has again
+been removed and the pool returned to Paused with `scale_set_id` restored.
 
 ## What limits the test phase
 
@@ -702,6 +704,163 @@ rather than whatever the scheduler chose.
   708-test phase is unmeasured, and the aggregate effect of the clock and the
   round trip on job time remains an estimate rather than a trial.
 - The cost per round trip is now measured; the number of round trips the 708
-  tests actually make is not. `scripts/profile-frappe-run.py sampler` would
-  count them, and it is still blocked as described in
-  [open blocker on the paired live trial](#open-blocker-on-the-paired-live-trial).
+  tests actually make is not. The next section counts them, from a live job
+  rather than from `sampler`, and closes both this and the clocksource question.
+
+## The clocksource trial and the round-trip count
+
+The two items the previous section left open are now both measured: a job has run
+end to end with `tsc` selected in the guest, and the number of database round trips
+that 708 tests make has been counted. Neither closes the gap, and the second
+narrows it by less than half.
+
+The opt-in was set in the controller's `transport_command` with
+`--prefer-guest-tsc`, so guest `prepare` selects `tsc` rather than leaving the
+kernel's default `kvm-clock`. Two jobs ran on the dogfood pool and both passed all
+708 tests with coverage. The clock was confirmed applied inside the job rather than
+assumed from the controller's configuration: the counter capture records the
+guest's own `current_clocksource` at every sample and reads `cs=tsc` at all 179 of
+the samples inside the second job's test phase. The counters below come from that
+same capture, so the confirmed clocksource and the round-trip count describe one
+window of one job rather than two separate claims.
+
+### The opt-in was applied and bought nothing
+
+| Trial run | `Run Tests` step | Initialize containers | Environment Setup | Tests passed |
+| --- | ---: | ---: | ---: | ---: |
+| Run 1 | 488.25 s | 16.40 s | 173.08 s | 708 of 708 |
+| Run 2 | 493.63 s | 18.08 s | 183.42 s | 708 of 708 |
+
+Step durations are from the job logs, measured the same way as the five earlier
+Runway runs so the comparison is like for like. Those five, which did not set the
+clocksource, took 485.53, 490.45, 482.86, 486.80 and 480.05 s: a mean of 485.14 s
+and a sample standard deviation of 3.94 s. The two trial runs average 490.94 s.
+That is **+5.80 s, and the trial shows no improvement**.
+
+Two runs cannot resolve anything much smaller than that. With a sample standard
+deviation of 3.94 s across the five prior runs, the standard error of a two-run
+mean is 2.79 s, so the difference between two such means carries about 3.94 s. The
+trial is therefore silent about an effect at that scale, and the +5.80 s it does
+show sits 1.47 standard deviations from the earlier mean, which is unremarkable.
+
+The figures elsewhere in this document that give 484 to 492 s for the same runs
+are GitHub API step durations rather than log-derived ones, and sit about 1.5 s
+higher. Nothing turns on the choice, but the comparison above uses one measure
+throughout.
+
+The reason is now available, and it is not that the microbenchmark was wrong. The
+microbenchmark did not predict this and could not have. The switch moves a clock
+read from 205.5 ns to 56.5 ns, a saving of 149.0 ns. At one clock read per database
+round trip and the 474 round trips a test makes, that is 70.6 µs per test, or 0.05 s
+across all 708 tests. For the change to move the phase by the roughly 4 s this trial can
+resolve, the workload would have to spend about 80 clock reads per round trip. It
+evidently does not, so the workload is not clock-bound on its critical path and the
+4.16x that motivated the opt-in was real and irrelevant to the phase.
+
+### 474 round trips per test
+
+The capture is a read-only poll inside the guest for the life of one job: MariaDB's
+`SHOW GLOBAL STATUS` for a fixed list of variables, plus `MemAvailable` from
+`/proc/meminfo` and `pgmajfault` from `/proc/vmstat`, sampled every three seconds.
+It is 224 sample blocks in total. The window used here is the 179-sample run that
+brackets run 2's test phase, 19:15:17 to 19:23:26 UTC, 489 s wide. MariaDB's own
+`Uptime` counter moves 195 to 684 across the same two samples, so the window is
+489 s by the database's clock as well as by the capture's. The step itself runs
+19:15:15.343 to 19:23:28.977, which puts the bracket 1.7 s late at the start and
+3.0 s early at the end.
+
+| Counter | Delta over the 489 s | Per test |
+| --- | ---: | ---: |
+| `Questions` | 335,599 statements | 474.0 statements |
+| `Com_select` | 216,486 statements | 305.8 statements |
+| `Com_insert` | 44,764 statements | 63.2 statements |
+| `Com_update` | 9,438 statements | 13.3 statements |
+| `Com_delete` | 15,554 statements | 22.0 statements |
+| `Com_commit` | 7,191 statements | 10.2 statements |
+| `Innodb_data_reads` | 302 pages | 0.4 pages |
+| `Innodb_data_writes` | 2,154 pages | 3.0 pages |
+| `Bytes_sent` | 485,419,944 bytes | 685,621 bytes |
+
+The two InnoDB counters are data-page reads and writes. That is **474 database
+round trips per test and 686 per second**, and `Bytes_sent` alone is 485 MB out of
+the database during the phase, about 0.99 MB/s. The five captured `Com_*` counters
+sum to 293,433, so 42,166 statements, 12.6% of the total, fall outside them: the
+capture's variable list did not include `Com_rollback`, `Com_connect`,
+`Com_change_db` or the administrative statements. `Questions` is the complete count
+for the phase; the breakdown beneath it is not.
+
+The same capture answers the storage question again, from inside the same window,
+and it agrees with the retraction above:
+
+| Guest, over the same 489 s | Value |
+| --- | ---: |
+| `pgmajfault` | +299 faults, or 0.61 faults/s |
+| `MemAvailable` | 4.04 GB to 4.68 GB |
+
+299 major page faults while running 708 tests is 0.42 per test, and `MemAvailable`
+never left a 4.04–4.68 GB band. The phase was not waiting on storage and was not
+short of memory either, which is why the tmpfs profile and the two RAM profiles
+could not pay, and it is why the database round trips were the next thing to count.
+
+### What the round trips account for, and what is left
+
+The marginal term to explain is the 1.268x per-test multiplier on a 484 s
+no-clocksource baseline: 0.268 of 484 s is 130 s, and 0.268 of 492 s is 132 s, so
+the denominator does not depend on which prior run is taken as the baseline. It
+sits inside the 75.7–231.7 s the previous section already gives for the same term.
+Multiplying 335,599 round trips by each of the three per-round-trip penalties
+measured there:
+
+| Assumed penalty per round trip | Guest | GitHub-hosted | Implied extra time | Share of 130 s |
+| --- | ---: | ---: | ---: | ---: |
+| Bare loopback | 81.08 µs | 27.36 µs | 18.0 s | 13.9% |
+| Published port, low end | 115 µs | 27.36 µs | 29.4 s | 22.6% |
+| Published port, high end | 190 µs | 27.36 µs | 54.6 s | 42.0% |
+
+Each guest cost above less 27.36 µs is a penalty: 53.72 µs, 87.64 µs and 162.64 µs.
+Multiplying each by the 335,599 round trips gives the last two columns.
+
+So the round trips are a real and measurable contributor worth between 14% and 42%
+of the marginal term on their own, roughly a seventh to two fifths. The
+GitHub-hosted container round trip was never measured, only its loopback path,
+which is why the range is this wide and why the low end is the better-supported
+figure. It also means the two published-port rows subtract a loopback figure from a
+container figure, so if GitHub's own published-port path costs more than its
+loopback, those two rows overstate the penalty rather than understate it.
+
+The remainder is the point. Taking off the 54.6 s and the 18.0 s ends leaves 75 s
+to 112 s, 58% to 86% of the marginal term, unaccounted for by round trips. It sits
+in the other measured per-operation gaps, principally allocation at 1.53x and
+bytecode dispatch at 1.15x, plus whatever is still unmeasured. This section does
+not break that remainder down further, because nothing in this capture can: the
+counters count round trips, not the work the client does between them.
+
+### What this section does not establish
+
+- One job, one window. The counters are from a single run on a single pool, and the
+  two bracketing samples are 3 s apart at the median, so the phase boundaries are
+  good to about 3 s out of 489 s and the counter window slightly overshoots the
+  486.2 s of test execution inside it.
+- `Questions` counts statements, not client-server round trips. A statement that
+  returns rows and one that does not cost different amounts of waiting, so 474 per
+  test is an upper bound on round trips and a lower bound on their cost. The two
+  errors run in opposite directions, so their product is a bound in neither.
+- Two trial runs are the only ones with the clocksource set, and Runway's own
+  test-phase spread is 4.00 s across five prior runs. Nothing under roughly 4 s is
+  resolvable from this comparison.
+- The clock-save estimate above assumes the clock reads happen inside the database
+  round trips. Coverage tracing, logging and the HTTP calls to `smtp4dev` read
+  clocks too, and none of them are counted here.
+- The capture was streamed off the guest to the Metal host rather than written
+  inside it, because the controller reclaims the VM within seconds of the job ending
+  and the first attempt, which wrote to a file in the guest, lost its data that way.
+  Raw captures are kept outside the repository; only aggregates are published here.
+
+The opt-in works, is free, and is not a speedup, because this workload is not
+clock-bound on its critical path. The round-trip count is now measured at 474 per
+test and accounts for between a seventh and two fifths of the marginal gap on its
+own. The largest remaining unattributed share sits in allocation and bytecode
+dispatch, and neither is reachable from this repository: the same pinned Python
+build runs on both platforms, so it cancels out of any comparison, and Runway
+configures neither the allocator nor the interpreter. Parity has not been reached
+and the gap is not closed.
