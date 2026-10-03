@@ -23,7 +23,7 @@ bash seal-runner-image.sh --inside-unregistered-image-builder
 
 The installer checks runner execution and Docker access. The sealing script refuses a registered runner, stops guest services, clears Docker state, SSH identities, cloud-init instance data, machine identity, logs, package caches, and user history. It leaves Docker enabled for a new clone's first boot.
 
-To ship an image that a Frappe workflow can use directly, add the dependency profile between the installer and the sealing script. See [Add the Frappe dependency profile](#add-the-frappe-dependency-profile).
+To ship an image that a Frappe workflow can use directly, add the dependency profile between the installer and the sealing script. See [Add the Frappe dependency profile](#add-the-frappe-dependency-profile). The same builder can also bake the workflow's service container images; see [Add the service container images](#add-the-service-container-images).
 
 Stop the builder through Central's `AtlasClient.vm_action(vm_id, "stop")`. Poll until its observed state is stopped. Do not restart or register the sealed builder.
 
@@ -55,6 +55,39 @@ This recipe installs dependencies only. It does not install Frappe, bench, Pytho
 
 After sealing and publishing, verify a fresh clone by reading the manifest, running the tool cache `python3.14` and `node` by path, `yarn --version`, `psql --version`, `mariadb --version`, and `wkhtmltopdf --version`, confirming both tool cache entries belong to the runner user, and confirming `.runner` and `.credentials` are still absent.
 
+## Add the service container images
+
+A Frappe job declares three services, so the runner pulls them on every job, on a fresh VM, over the region's path to the registry. Measured on the paired baseline, `Initialize containers` took 20 s on GitHub-hosted and 45 s on Runway. A local registry mirror only closed that to 42 s, because a mirror still hands the job compressed layers to decompress. Baking the layers into the image removes both, since by the time the job runs they are already uncompressed content in the guest's own store.
+
+[`guest/prepare-frappe-container-images.sh`](../guest/prepare-frappe-container-images.sh) pulls them once, in the builder. Run it as root inside the same builder, after the guest installer and after the dependency profile, and before sealing:
+
+```sh
+bash prepare-frappe-container-images.sh --inside-unregistered-image-builder
+bash seal-runner-image.sh --inside-unregistered-image-builder --preserve-container-images
+```
+
+The recipe pulls each image pinned by index digest and tags it with the reference the workflow actually requests, because a job pulls by tag and a digest-pinned pull alone would not leave the tag resolvable. It refuses a builder that is registered, that carries a JIT bootstrap marker, that has run containers or volumes, or that holds a Docker auth config: a credential in this guest would ship inside the published image, and deleting it afterwards cannot make a pull the credential authenticated un-credential-free. The flag is required rather than advisory, for the same reason sealing requires it.
+
+Sealing then validates the result before anything is destroyed: the guest must be fresh, the manifest must parse and name exactly the three reviewed references, the store must hold exactly those three images and nothing else, each workflow tag must resolve to the content pinned for it, and no registry credential may remain. Only after all of that does it stop the daemons and freeze the store. The pinned list is repeated in the sealer on purpose. The manifest is written by the bake recipe, and the guard that decides what enters a public artifact must not be satisfied by the script that produced the content.
+
+`--preserve-container-images` is opt-in. Without it the sealer stops Docker and removes `/var/lib/docker` and `/var/lib/containerd` exactly as before, and the resulting image has no container content at all.
+
+### Where the images live
+
+Docker 29 on Ubuntu 24.04 uses the containerd image store, so the image content is in `/var/lib/containerd` and `/var/lib/docker` holds little more than metadata. Measuring only the Docker data root reported 184 KB for 1.4 GB of images. The manifest therefore records both roots and a total, and both directories are preserved.
+
+`/etc/runway-container-images.json` records what the run actually observed: the pinned reference, and the amd64 image id taken from the store rather than copied from anywhere else. It is credential-free by construction, because every value in it is a public image reference or a measurement of the builder's own filesystem.
+
+### Size
+
+Baked service images need more room than the 4 GiB default. The builder that produced this profile used a fresh 10 GiB guest, one vCPU and 2 GiB RAM, and measured 4.7 GiB used, so the export is published at `--size-gib 7`:
+
+```sh
+bash scripts/finalize-runner-image.sh --size-gib 7 /private/runner.ext4
+```
+
+`--size-gib` accepts 4 through 16 and defaults to 4, so the runner-only publish path is unchanged. A 10 GiB export publishing at 7 GiB is a shrink, and the finalizer resizes rather than refusing: it runs `resize2fs` first and lets that fail if the content does not fit, then confirms the filesystem is the target size before it truncates the file. Do not compare a builder's capacity against the published size yourself, because capacity is not content.
+
 ## Capture and export
 
 Atlas's normal Machine image transfer uses object storage. For a bootstrap region without object storage, capture a stopped disk through Metal's snapshot API and publish the resulting sanitized filesystem as a System Site File image. Site File images are public artifacts, so this path is restricted to credential-free System images.
@@ -82,7 +115,7 @@ The finalizer repairs the filesystem before it inspects it. A stopped VM's expor
 
 `e2fsck -p` never answers yes on the operator's behalf and never makes a change it is unsure about. When it cannot finish, the finalizer stops and says so instead of inspecting an unrepaired export, because those file checks are the only credential guard a published image gets. Review the unmounted export yourself, repeat the finalizer on a clean result, and verify a fresh VM afterwards. An export that needed unreviewed repair is not evidence for anything.
 
-The finalizer then resizes the filesystem to 4 GiB before truncation, replaces the ext4 journal, and zeroes unused blocks. The last two steps remove residual deleted identity material from free blocks and the old journal. It then writes a fresh compressed artifact and prints both hashes. Never run it against a mounted filesystem or a live VM disk. The Frappe profile image exposed this ordering: `e2fsck -f -p` exited 4 on the export, a manual `-f -y` pass repaired an orphaned inode, and the finalizer then completed and published. Treat that as the reason the repair comes first, not as a routine step.
+The finalizer then resizes the filesystem to the requested size before truncation, replaces the ext4 journal, and zeroes unused blocks. The last two steps remove residual deleted identity material from free blocks and the old journal. It then writes a fresh compressed artifact and prints both hashes. Never run it against a mounted filesystem or a live VM disk. The Frappe profile image exposed this ordering: `e2fsck -f -p` exited 4 on the export, a manual `-f -y` pass repaired an orphaned inode, and the finalizer then completed and published. Treat that as the reason the repair comes first, not as a routine step.
 
 After a successful export, delete staging through `client.delete_snapshot(snapshot_id)`. Terminate the builder through the Central helper and wait for tenant-scoped `404`.
 
@@ -106,6 +139,6 @@ publish_ubuntu_image(
 
 The publisher expects `runner.ext4.zst` beside the raw filesystem. Commit the transaction, record the new image ID and digests, and confirm it is Available and enabled. Use a distinct title when preserving an earlier image for rollback; publishing a changed image under the same title retires its predecessor.
 
-Boot a second fresh VM from the published image. Without installing packages, check that the runner prints its expected version, Docker responds as the runner user, a published Docker Redis port returns `PONG`, and cloud-init generated fresh SSH host keys and machine identity. Confirm that `.runner` and `.credentials` are absent before any JIT handoff. Delete this verification VM after validation. Retain its test evidence and the image's package manifest at `/etc/runway-runner-image.txt`.
+Boot a second fresh VM from the published image. Without installing packages, check that the runner prints its expected version, Docker responds as the runner user, a published Docker Redis port returns `PONG`, and cloud-init generated fresh SSH host keys and machine identity. Confirm that `.runner` and `.credentials` are absent before any JIT handoff. For an image that carries baked service images, also confirm each workflow tag resolves to its pinned digest and that `/etc/runway-container-images.json` is present with no `.docker` config anywhere. Delete this verification VM after validation. Retain its test evidence and the image's package manifest at `/etc/runway-runner-image.txt`.
 
 The resulting image accelerates bootstrap. It does not implement GitHub-hosted image parity, automatic package updates, image signing, or an image promotion policy.
