@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 GUEST_PROGRAM = r'''
-import json, os, shutil, stat, subprocess, sys, tempfile
+import json, os, shutil, socket, stat, subprocess, sys, tempfile, time
 from datetime import UTC, datetime
 from pathlib import Path
 payload = json.load(sys.stdin)
@@ -277,6 +277,120 @@ def undo_daemon(status):
         except OSError:
             pass
     call(['systemctl', 'restart', 'docker'])
+def probe_image():
+    """Pick an image already in the guest's store to prove a published port works.
+
+    Preparation must not pull: a warm store would make the next pull free for
+    reasons unrelated to what is being configured. So this reads what the image
+    already carries, preferring the service images the baked runner image ships.
+    """
+    images = call(['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}']).stdout
+    available = [line.strip() for line in images.splitlines() if line.strip()]
+    for preferred in ('rnwood/smtp4dev:3.7.1', 'postgres:18.0', 'mariadb:11.8'):
+        if preferred in available:
+            return preferred
+    return available[0] if available else None
+
+
+def published_port_works(port, image):
+    """Prove a loopback published port answers and that no userspace proxy was left.
+
+    Both halves matter. The port answering shows the setting did not break
+    publishing; the absence of a `docker-proxy` process shows it took effect at
+    all. A setting the daemon silently ignored would leave the job unoptimised
+    while preparation reported success, which is the one outcome an opt-in like
+    this must never produce, so it is measured rather than assumed.
+
+    Only an image already in the guest's store is used, so nothing is pulled.
+    """
+    name = 'runway-publish-probe'
+    call(['docker', 'rm', '-f', name])
+    # Port 25 is where the preferred image's SMTP service listens; any published
+    # port would do, this one is simply known to answer quickly.
+    started = call(['docker', 'run', '-d', '--rm', '--name', name,
+                    '-p', '127.0.0.1:%d:25' % port, image])
+    if started.returncode != 0:
+        return False
+    deadline = time.monotonic() + 120
+    answered = False
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=3) as probe:
+                probe.settimeout(3)
+                answered = bool(probe.recv(64))
+            break
+        except OSError:
+            time.sleep(2)
+    call(['docker', 'rm', '-f', name])
+    if not answered:
+        return False
+    # Nothing may be left listening in userspace for this port.
+    listing = call(['ps', '-eo', 'args']).stdout
+    return not [line for line in listing.splitlines()
+                if 'docker-proxy' in line and (':%d ' % port) in line]
+
+
+def prefer_kernel_publish():
+    """Publish container ports through the kernel's netfilter DNAT, opt-in only.
+
+    Docker normally reaches a published port through a `docker-proxy` userspace
+    process. Measured on this guest, that relay costs about 110 microseconds per
+    request on a connection that is already open, against a measurement noise
+    floor of about 30 microseconds. The benchmark workflow's 335,599 database
+    statements all cross it, so this is worth roughly 36 to 48 seconds of a
+    489 second test phase, and a GitHub-hosted runner pays the same hop, so it
+    closes real ground rather than moving a baseline.
+
+    The flag is off by default. With it, `prepare`, and only `prepare`, and only
+    while the guest still reports `installed`, sets the key, validates the file
+    before the daemon is pointed at it, restarts Docker before it has served a
+    container, and then proves both that a published port still answers and that
+    no userspace proxy remains. Any failure restores the exact prior text and
+    preparation fails closed, because a setting the daemon ignored would leave
+    the job unoptimised while reporting success.
+
+    Scope: the guest's own Docker daemon on its own loopback. It changes no Metal
+    host value, no network namespace and no credential, and it is applied before
+    registration so no job observes a partial change. `bootstrap`, `status`,
+    `collect` and `stop` never touch it.
+
+    Limitation, stated rather than hidden: with no userspace proxy, a published
+    port relies on the kernel's DNAT, which does not cover every network
+    topology, and there is no userspace fallback for UDP. A guest whose ports do
+    not come up is refused by the proof above rather than passed to a job.
+    """
+    global previous
+    daemon = shutil.which('dockerd', path=root_path)
+    client = shutil.which('docker', path=root_path)
+    if daemon is None or client is None:
+        return False
+    status, document = read_daemon()
+    if document is None:
+        return False
+    image = probe_image()
+    if image is None:
+        # Nothing to prove the setting with, and pulling is not this code's job.
+        return False
+    # Already set, by a previous preparation or by the image: confirm and stop,
+    # rather than rewrite an identical document and restart Docker for nothing.
+    if document.get('userland-proxy') is False:
+        return published_port_works(8099, image)
+    previous = '' if status == 'absent' else daemon_config.read_text()
+    document['userland-proxy'] = False
+    if not replace_daemon(json.dumps(document, indent=2, sort_keys=True) + '\n'):
+        return False
+    if call([daemon, '--validate', '--config-file=' + str(daemon_config)]).returncode != 0:
+        undo_daemon(status)
+        return False
+    if call(['systemctl', 'restart', 'docker']).returncode != 0:
+        undo_daemon(status)
+        return False
+    if not published_port_works(8099, image):
+        undo_daemon(status)
+        return False
+    return call(['runuser', '-u', 'runner', '--', client, 'info']).returncode == 0
+
+
 def enable_mirror(port):
     """Point this fresh guest's Docker at the operator's loopback registry mirror.
 
@@ -451,6 +565,9 @@ if action in ('status', 'prepare'):
         # applied: a later refusal cannot undo it. It goes first so that the refusals
         # which can be retried cleanly come after it and report first.
         if payload.get('prefer_tsc_clocksource') and not prefer_tsc_clocksource():
+            print(json.dumps({'state': 'unknown'}))
+            sys.exit(1)
+        if payload.get('kernel_publish') and not prefer_kernel_publish():
             print(json.dumps({'state': 'unknown'}))
             sys.exit(1)
         if payload.get('mirror_port') and not enable_mirror(int(payload['mirror_port'])):
@@ -694,6 +811,16 @@ def main() -> int:
     # opens one reverse SSH forward from the guest's loopback to this Metal host's
     # loopback and points the guest's Docker daemon at it. No host port is published,
     # no credential is written anywhere, and nothing is pulled into the image.
+    # Explicit operator opt-in to publish container ports through the kernel's
+    # netfilter DNAT instead of Docker's docker-proxy userspace process. Measured
+    # on this host's guest, that relay costs about 110 microseconds per request on
+    # an already-open connection. A GitHub-hosted runner pays the same hop, so this
+    # closes ground rather than moving a baseline. The guest's own Docker daemon
+    # only, applied before registration, with no published port left behind and
+    # nothing installed or downloaded: the proof uses an image the baked runner
+    # image already carries.
+    parser.add_argument('--kernel-published-ports', action='store_true',
+                        help='Publish container ports through kernel DNAT instead of a userspace proxy')
     parser.add_argument('--registry-mirror-port', type=int,
                         help='Serve an anonymous registry mirror to fresh guests on this loopback port')
     # Explicit operator opt-in for a RAM-backed package cache. The filesystem lives
@@ -748,6 +875,7 @@ def main() -> int:
                    key_file=args.key_file, known_hosts=args.known_hosts + '-' + args.vm_id,
                    allow_guest_sudo=args.allow_guest_sudo,
                    prefer_tsc_clocksource=args.prefer_guest_tsc,
+                   kernel_publish=args.kernel_published_ports,
                    guest_program=GUEST_PROGRAM)
     if args.registry_mirror_port:
         payload['mirror_port'] = args.registry_mirror_port

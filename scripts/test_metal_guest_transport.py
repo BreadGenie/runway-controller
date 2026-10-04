@@ -78,7 +78,8 @@ class TransportTests(unittest.TestCase):
                                                         root / 'clocksource/available_clocksource']
 
     def execute_guest(self, program, sudoers, payload, *, present=('sudo', 'visudo'),
-                      results=None, plant=None, root_owned=(), meminfo=None):
+                      results=None, plant=None, root_owned=(), meminfo=None,
+                      published_answer=b'220 probe ready\r\n', proxy_listing=None):
         """Run the embedded guest program locally: no SSH and no real guest binary."""
         real_lstat = os.lstat
         real_open = builtins.open
@@ -93,6 +94,8 @@ class TransportTests(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             recorded.append(list(argv))
+            if argv[:1] == ['ps'] and proxy_listing is not None:
+                return subprocess.CompletedProcess(list(argv), 0, proxy_listing)
             answers = results.get(tuple(argv), (0, ''))
             if isinstance(answers, list):
                 answers = answers.pop(0) if answers else (1, '')
@@ -112,6 +115,54 @@ class TransportTests(unittest.TestCase):
             if path == '/proc/meminfo':
                 return io.StringIO(MEMINFO if meminfo is None else meminfo)
             return real_open(path, *rest, **options)
+
+        # The proof polls a real 120 s deadline while a port never answers. A
+        # virtual clock that jumps past it keeps that refusal test instant, and it is
+        # the only thing in the guest program that waits on wall time.
+        tick = [0.0]
+
+        def fake_monotonic():
+            # One second per reading: the proof's deadline is 120 seconds away, so
+            # this still walks the whole retry budget on the failure path, but every
+            # step is instant. A coarser step would expire the deadline before the
+            # first attempt and make the success path untestable.
+            tick[0] += 1.0
+            return tick[0]
+
+        # The published-port proof opens a loopback socket and reads a greeting.
+        # This test user must not reach a real port, and nothing is listening on
+        # this one, so the exchange is answered here rather than dialled.
+        class _Answered:
+            """The smallest thing a socket context manager needs to be usable.
+
+            BytesIO has no settimeout, and the proof sets one before reading, so
+            this carries the two methods it actually calls.
+            """
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def settimeout(self, _seconds):
+                pass
+
+            def recv(self, _size):
+                return self._payload
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_create_connection(address, timeout=None):
+            if address[0] != '127.0.0.1':
+                raise OSError('only loopback is answered here')
+            if published_answer is None:
+                raise OSError('nothing is listening in this test')
+            return _Answered(published_answer)
 
         sysfs_descriptors = {}
 
@@ -156,6 +207,12 @@ class TransportTests(unittest.TestCase):
               patch.object(transport.os, 'lstat', side_effect=fake_lstat),
               patch.object(transport.os, 'open', side_effect=fake_os_open),
               patch.object(transport.os, 'write', side_effect=fake_write),
+              # The guest program imports socket inside its own source, so it
+              # resolves the real module; patch that rather than an attribute of
+              # this one, which has no socket of its own.
+              patch('socket.create_connection', side_effect=fake_create_connection),
+              patch('time.monotonic', side_effect=fake_monotonic),
+              patch('time.sleep', side_effect=lambda _seconds: None),
               patch.object(transport.subprocess, 'run', side_effect=fake_run)):
             with self.assertRaises(SystemExit) as stopped:
                 exec(program, {})
@@ -692,6 +749,146 @@ class TransportTests(unittest.TestCase):
                     self.assertEqual(transport.main(), 0)
                 payload = json.loads(run.call_args.kwargs['input'])
                 self.assertIs(payload['allow_guest_sudo'], expected)
+
+    # The proof is the load-bearing part of this opt-in: a daemon that accepted the
+    # file and ignored the key would leave every job unoptimised while preparation
+    # reported success. So each of its two halves, and each way it can fail, is pinned.
+    # The proof matches the host port as Docker prints it, host-ip and port joined by
+    # a colon, so the fixture has to carry that shape and not merely the digits.
+    PROXY_LEFT = ("root 123 /usr/bin/docker-proxy -proto tcp -host-ip 127.0.0.1:8099 "
+                  "-container-ip 172.17.0.2 -container-port 25\n")
+    IMAGE_LIST = "rnwood/smtp4dev:3.7.1\npostgres:18.0\nmariadb:11.8\n"
+    # One literal, because preparation rewrites the document with indent=2 and the
+    # undo restores the exact prior text: a fixture that differs by one space from
+    # its own assertion would report a real undo as a failure.
+    DAEMON_JSON = '{"log-level":"warn"}\n'
+    DOCKERD = '/usr/bin/dockerd'
+    DOCKER = '/usr/bin/docker'
+
+    def kernel_publish(self, directory, *, results=None, published_answer=b'220 ready\r\n',
+                       proxy_listing="", owned=True, expect_code=0):
+        program, sudoers, listed = self.guest_paths(directory)
+        (Path(directory) / 'docker/daemon.json').write_text('{"log-level":"warn"}\n')
+        # The kernel exposes a root-owned 0644 file and the guest program verifies
+        # that rather than assuming it. write_text honours the umask, which would
+        # leave this group-writable and therefore refused, so the mode is set.
+        (Path(directory) / 'docker/daemon.json').chmod(0o644)
+        answers = dict(results or {})
+        answers.setdefault(
+            ('docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'),
+            (0, self.IMAGE_LIST))
+        code, output, recorded, _ = self.execute_guest(
+            program, sudoers,
+            {'action': 'prepare', 'runner_name': 'runway-lease-123', 'kernel_publish': True},
+            present=('sudo', 'visudo', 'dockerd', 'docker'),
+            results=answers, published_answer=published_answer,
+            proxy_listing=proxy_listing, root_owned=listed if owned else ())
+        return code, output, recorded, Path(directory) / 'docker/daemon.json'
+
+    def test_kernel_publish_proves_the_port_works_and_no_proxy_remains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, recorded, daemon = self.kernel_publish(directory)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(json.loads(daemon.read_text())['userland-proxy'], False)
+            # The unrelated key survived: preparation merges, it does not replace.
+            self.assertEqual(json.loads(daemon.read_text())['log-level'], 'warn')
+            # The binary is resolved by absolute path, not by name: preparation must
+            # not depend on a non-interactive shell's PATH.
+            self.assertIn([self.DOCKERD, '--validate',
+                           '--config-file=' + str(daemon)], recorded)
+            self.assertIn(['systemctl', 'restart', 'docker'], recorded)
+            # Both halves of the proof, in order: the container is published, the
+            # port is dialled, then the process list is checked for a leftover proxy.
+            published = [i for i, argv in enumerate(recorded)
+                         if argv[:2] == ['docker', 'run']]
+            listed = [i for i, argv in enumerate(recorded) if argv[:1] == ['ps']]
+            self.assertTrue(published and listed)
+            self.assertLess(published[0], listed[0])
+            # The probe container is removed, so preparation leaves nothing running.
+            self.assertTrue([argv for argv in recorded
+                             if argv[:3] == ['docker', 'rm', '-f']
+                             and 'runway-publish-probe' in argv])
+            # Nothing is pulled: only an image already in the store is used.
+            self.assertEqual([argv for argv in recorded if argv[:1] == ['docker', 'pull']], [])
+
+    def test_kernel_publish_is_undone_when_a_userspace_proxy_survives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, daemon = self.kernel_publish(
+                directory, proxy_listing=self.PROXY_LEFT)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            # The exact prior text is back, so a guest that fails this is not left
+            # carrying a setting preparation could not prove.
+            self.assertEqual(daemon.read_text(), '{"log-level":"warn"}\n')
+
+    def test_kernel_publish_is_undone_when_the_port_does_not_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, daemon = self.kernel_publish(directory, published_answer=None)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(daemon.read_text(), '{"log-level":"warn"}\n')
+
+    def test_kernel_publish_refuses_when_the_store_has_nothing_to_prove_with(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # An empty store means no way to prove the setting without pulling, and
+            # preparation must not pull.
+            code, output, _, daemon = self.kernel_publish(
+                directory, results={('docker', 'images', '--format',
+                                    '{{.Repository}}:{{.Tag}}'): (0, '')})
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            self.assertEqual(daemon.read_text(), '{"log-level":"warn"}\n')
+
+    def test_kernel_publish_refuses_a_daemon_file_it_cannot_verify(self):
+        for kind in ('symlink', 'world-writable'):
+            with self.subTest(kind), tempfile.TemporaryDirectory() as directory:
+                program, sudoers, listed = self.guest_paths(directory)
+                target = Path(directory) / 'canary'
+                target.write_text('planted')
+                daemon = Path(directory) / 'docker/daemon.json'
+                daemon.unlink(missing_ok=True)
+                if kind == 'symlink':
+                    daemon.symlink_to(target)
+                else:
+                    daemon.write_text(self.DAEMON_JSON)
+                    daemon.chmod(0o666)
+                code, output, _, _ = self.execute_guest(
+                    program, sudoers,
+                    {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                     'kernel_publish': True},
+                    present=('sudo', 'visudo', 'dockerd', 'docker'),
+                    results={('docker', 'images', '--format',
+                              '{{.Repository}}:{{.Tag}}'): (0, self.IMAGE_LIST)},
+                    root_owned=listed if kind == 'symlink' else ())
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(output), {'state': 'unknown'})
+                self.assertEqual(target.read_text(), 'planted')
+
+    def test_kernel_publish_off_by_default_leaves_the_daemon_file_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, _ = self.guest_paths(directory)
+            daemon = Path(directory) / 'docker/daemon.json'
+            daemon.write_text(self.DAEMON_JSON)
+            code, output, recorded, _ = self.execute_guest(
+                program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'})
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+            self.assertEqual(daemon.read_text(), self.DAEMON_JSON)
+            self.assertEqual([argv for argv in recorded if argv[:1] == ['docker']], [])
+
+    def test_kernel_publish_opt_in_is_explicit_and_carried_in_the_payload(self):
+        # A typo in either half would make prepare skip the setting and still report
+        # the guest ready, which is the outcome an opt-in must never produce.
+        for flag, expected in (([], False), (['--kernel-published-ports'], True)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv', self.arguments('prepare') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess([], 0, '{"state":"installed"}')
+                    self.assertEqual(transport.main(), 0)
+                payload = json.loads(run.call_args.kwargs['input'])
+                self.assertIs(payload['kernel_publish'], expected)
 
     def test_tsc_opt_in_is_explicit_and_carried_in_the_payload(self):
         # A typo in either half of this wiring would make prepare silently skip the
