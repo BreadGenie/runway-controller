@@ -340,12 +340,20 @@ def prefer_kernel_publish():
     """Publish container ports through the kernel's netfilter DNAT, opt-in only.
 
     Docker normally reaches a published port through a `docker-proxy` userspace
-    process. Measured on this guest, that relay costs about 110 microseconds per
+    process. Measured on this guest, that relay costs 101 to 116 microseconds per
     request on a connection that is already open, against a measurement noise
     floor of about 30 microseconds. The benchmark workflow's 335,599 database
-    statements all cross it, so this is worth roughly 36 to 48 seconds of a
-    489 second test phase, and a GitHub-hosted runner pays the same hop, so it
-    closes real ground rather than moving a baseline.
+    statements all cross it, which predicts 34 to 39 seconds of a 489 second test
+    phase, and a GitHub-hosted runner pays the same hop, so it closes real ground
+    rather than moving a baseline.
+
+    Two live jobs on the dogfood pool with this set and the clocksource opt-in
+    left off shortened the 708-test phase by 57.92 seconds against five runs that
+    set neither, 14.7 sample standard deviations, reproducing to 1.40 seconds,
+    both passing all 708 tests. That is larger than the 34 to 39 seconds the relay
+    cost predicts, and the microbenchmark's raw capture was not preserved, so
+    treat the end-to-end figure as the result and the relay cost only as the
+    mechanism. See docs/frappe-performance.md.
 
     The flag is off by default. With it, `prepare`, and only `prepare`, and only
     while the guest still reports `installed`, sets the key, validates the file
@@ -817,18 +825,19 @@ def main() -> int:
     # opens one reverse SSH forward from the guest's loopback to this Metal host's
     # loopback and points the guest's Docker daemon at it. No host port is published,
     # no credential is written anywhere, and nothing is pulled into the image.
-    # Explicit operator opt-in to publish container ports through the kernel's
-    # netfilter DNAT instead of Docker's docker-proxy userspace process. Measured
-    # on this host's guest, that relay costs about 110 microseconds per request on
-    # an already-open connection. A GitHub-hosted runner pays the same hop, so this
-    # closes ground rather than moving a baseline. The guest's own Docker daemon
-    # only, applied before registration, with no published port left behind and
-    # nothing installed or downloaded: the proof uses an image the baked runner
-    # image already carries.
-    parser.add_argument('--kernel-published-ports', action='store_true',
-                        help='Publish container ports through kernel DNAT instead of a userspace proxy')
     parser.add_argument('--registry-mirror-port', type=int,
                         help='Serve an anonymous registry mirror to fresh guests on this loopback port')
+    # Explicit operator opt-in to publish container ports through the kernel's
+    # netfilter DNAT instead of Docker's docker-proxy userspace process. Measured on
+    # this host's guest, that relay costs 101 to 116 microseconds per request on an
+    # already-open connection, and two live jobs with this set shortened the 708-test
+    # phase by 57.92 seconds against five runs that set neither. A GitHub-hosted
+    # runner pays the same hop, so this closes ground rather than moving a baseline.
+    # The guest's own Docker daemon only, applied before registration, with no
+    # published port left behind and nothing installed or downloaded: the proof uses
+    # an image the baked runner image already carries.
+    parser.add_argument('--kernel-published-ports', action='store_true',
+                        help='Publish container ports through kernel DNAT instead of a userspace proxy')
     # Explicit operator opt-in for a RAM-backed package cache. The filesystem lives
     # inside the disposable guest and dies with the lease: it holds only the yarn and
     # uv downloads one job makes, so it moves those writes out of the guest's disk

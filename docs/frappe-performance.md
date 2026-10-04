@@ -864,3 +864,150 @@ dispatch, and neither is reachable from this repository: the same pinned Python
 build runs on both platforms, so it cancels out of any comparison, and Runway
 configures neither the allocator nor the interpreter. Parity has not been reached
 and the gap is not closed.
+
+## The kernel-published port trial
+
+This is the first measured improvement to the benchmark's test phase in this document. The only
+other candidate that moved the phase at all was the clocksource opt-in, and it moved it 5.80 s in
+the wrong direction, so this is the first change worth writing up as a result. The change is one
+key in the guest's Docker daemon, `"userland-proxy": false`, which publishes container ports
+through the kernel's own netfilter DNAT instead of a `docker-proxy` userspace process. It is off
+by default and is set in the controller's `transport_command` with `--kernel-published-ports`.
+
+Two jobs ran on the dogfood pool with that opt-in set and the clocksource opt-in deliberately
+left off, so exactly one variable changed against the five earlier runs that set neither. Both
+passed 708 of 708 tests with coverage, so the kernel-published path carried the database, the
+other services and the whole suite. Preparation also fails closed if it cannot prove the
+setting, by starting a throwaway container from the image's own store and requiring its
+loopback port to answer with no `docker-proxy` left listening for it, so a job that reaches
+the suite is itself evidence that the key took effect.
+
+### The relay cost, and the order control that makes it believable
+
+Docker can reach a published port either through a `docker-proxy` userspace process or, with
+`"userland-proxy": false`, through the kernel's own netfilter DNAT. The benchmark workflow
+publishes MariaDB's port and its test process reaches it on the guest's loopback, so all
+335,599 database statements of a 489 s phase cross that path, and a GitHub-hosted runner pays
+the same hop, so removing it closes ground rather than moving a baseline. That is what made it
+worth measuring rather than dismissing.
+
+Measured on a never-registered guest from image `cffdaa3f24a245ca` at the pool's 3 vCPU /
+6144 MiB shape, which by definition ran no job, with a throwaway `rnwood/smtp4dev:3.7.1`
+container from the image's own store publishing `127.0.0.1:2526`. The timed operation is an
+SMTP NOOP, a real request and a real response, on one connection that is already open: 5
+passes of 400 round trips each. A held connection is the discriminator, because this workload
+holds its connection open and issues hundreds of statements on it, so whether the relay is
+charged per request or only at setup is the whole question.
+
+The order of the two paths was alternated between the configurations, which is what makes the
+result usable:
+
+| path | measured first | measured second |
+| --- | ---: | ---: |
+| published port, userspace proxy against kernel DNAT | 186.27 → 84.98 µs | 212.64 → 96.86 µs |
+| bridge address, which never involves the proxy | 121.86 → 91.82 µs | 82.88 → 79.09 µs |
+
+So the proxy costs 101.29 µs per request when the bridge went first and 115.78 µs when the
+published port went first, against 30.04 µs and 3.79 µs on the control path, which cannot
+involve it. Call the relay cost roughly 110 µs per request.
+
+The control is what makes that number trustworthy rather than the size of it. The bridge path
+never crosses a published port, so nothing about it should depend on which daemon
+configuration was measured first, and its two answers still disagree by 26.25 µs. That
+disagreement is this measurement's noise floor, and it is a quarter of the effect being
+claimed. Without the control, a session that happened to put the slow configuration first
+would be indistinguishable from a proxy cost.
+
+Establishing a connection was measured separately, at 408.85 µs with the proxy against 205.59 µs
+without. That figure comes from an earlier probe, on a different protocol against a different
+container, and it is the less well controlled of the two because it did not alternate its
+order. Quote the held-connection result instead.
+
+### The end-to-end result
+
+`Run Tests` step, derived from the job logs the same way for all nine runs, first to last line
+of the step, with `sd` the sample standard deviation across those runs:
+
+| configuration | `Run Tests` step |
+| --- | ---: |
+| five runs, neither opt-in | 485.53, 490.45, 482.86, 486.80, 480.05 s; mean 485.14 s, sd 3.94 s |
+| clocksource opt-in only, two runs | 488.25, 493.63 s; mean 490.94 s |
+| kernel published ports only, two runs | 427.92, 426.52 s; mean 427.22 s |
+
+All nine ran the same 16 steps and reported `Tests: 708, Failing: 0, Errors: 0`. The
+kernel-published change is **57.92 s faster than the five untouched runs, which is 14.7 sample
+standard deviations**. Both of its runs finish below the fastest of those five, by 52.13 s and
+53.53 s, and they agree with each other to 1.40 s, so the effect reproduces rather than resting
+on one lucky job. Container start did not regress: `Initialize containers` took 16.36 s and
+17.33 s against 16.28, 17.09 and 18.75 s on the three baked-image runs.
+
+This is the largest single improvement measured in this document, and it is far larger than
+the 34.0 s to 38.9 s that 335,599 statements at the measured 101.29 µs to 115.78 µs each
+predicts. The reason that prediction was low is worth giving rather than leaving as a puzzle,
+but it is an explanation to be checked rather than a measurement, because it was not measured.
+The probe timed one NOOP at a time on a lightly loaded guest. The real phase runs a database
+under concurrency, and a relay charged per packet costs more when the packets belong to many
+overlapping conversations than when a single client sends a single request at a time. If that
+is the mechanism, the end-to-end figure is the better one and the microbenchmark understated
+the hop. Nothing here establishes that.
+
+### What the survey said, and how it turned out
+
+The survey that chose this technique estimated 12 to 39 s for it, from the published-port
+figure less the container's own bridge figure. The measured result is 57.92 s. The technique
+was chosen for the right reason, on the mechanism rather than on the machine speed, and it
+delivered more than predicted.
+
+Two of that survey's other entries did not apply here, and both are the natural next things
+someone will try:
+
+- A GitHub-hosted runner starts on an already-warm service container, where a fresh guest pays
+  to pull and start them. The baked images already address that: container start is 16.28 s to
+  18.75 s log-derived, against 45.71 s on the uncached baseline.
+- Splitting the suite into more matrix shards shortens each job and multiplies dispatch
+  overhead. Dispatch is the largest non-test number in this report at about 65 s against 10 s,
+  and it is a property of the infrastructure rather than of the workflow, so sharding
+  multiplies the worse side of it.
+
+Two gaps in the survey's literature are worth carrying forward, because they save the search.
+No primary source attributes CI agent slowness to hypervisor scheduling specifically, and none
+compares network-attached workspace storage against local NVMe for build wall time. Both are
+recorded there as gaps rather than filled with a weak citation.
+
+### The corrected attribution, and what this leaves
+
+The previous section worked out that the database round trips account for 14% to 42% of the
+roughly 130 s marginal term, depending on which per-round-trip cost applies, and bracketed this
+hop alone at a penalty of 87.64 µs to 162.64 µs per round trip. The measured 101.29 µs to
+115.78 µs falls inside that bracket rather than at either edge of it, so the account now closes
+on a measured per-request cost instead of on a two-ended range. The closing number is larger
+than the bracket predicted, which is the same discrepancy the previous section already flagged
+for its own high end.
+
+The consequence is worth stating without softening. 57.92 s of the roughly 130 s is now explained
+and removed. What remains is the cross-vCPU wakeup cost behind the rest of the round trips, plus
+the allocation and dispatch penalties. Both are properties of the virtualization boundary, which
+is the same position [the round-trip section](#the-round-trip-is-vcpu-placement-not-networking)
+records for Firecracker's `Sync` io engine and the absent vhost configuration, and neither is
+reachable from this repository.
+
+So this is the largest Runway-side win available on this workload, and it does not reach parity
+on its own.
+
+### Method caveats
+
+- Two runs for the winning configuration. That is enough here, because the effect is 14.7 sample
+  standard deviations and the two runs agree to 1.40 s, but it says nothing about a smaller
+  interaction with any other setting.
+- The five comparison runs are from the morning of the previous day, about nine hours before
+  the two clocksource runs and eighteen hours before the winning ones. The clocksource pair
+  sits 63.72 s higher and was run about eight hours earlier on the same evening, so the effect
+  is bounded against drift within a day as well as across one.
+- The microbenchmark is an SMTP exchange with a throwaway container from the image's own store,
+  not a measured MariaDB query under load, and its per-pass raw capture was not preserved, so
+  only its arithmetic can be checked and not its dispersion. That is a reason to treat the
+  microbenchmark as having chosen the technique and nothing more. The end-to-end job logs are the
+  load-bearing numbers and every one of them is recomputable from a preserved log.
+- The first health line after each controller claim logged `guest prepare failed or timed out`
+  and the next one cleared, identically in the earlier controller logs in this repository, so
+  that pattern predates this work.
