@@ -67,6 +67,23 @@ func holdOwnership(ctx context.Context, renew func(context.Context) error, every
 	}
 }
 
+// sessionUnavailableError names the scale set a session failed for and wraps the
+// underlying error, so the health line says what failed instead of only that
+// something did.
+//
+// This call is the one place a controller can be stopped by something outside its
+// own control, and the causes are indistinguishable from the outside: a scale set
+// that does not exist, a token that cannot open a session, a network blip. One
+// generic line for all of them cost hours of diagnosis, because the health log
+// read "GitHub session unavailable" while the real fault was a pool still naming
+// a scale set that had been deleted, and nothing the controller printed could
+// tell those apart. Wrapping rather than formatting keeps the cause reachable
+// with errors.Is and errors.As.
+func sessionUnavailableError(scaleSetID int, pool string, cause error) error {
+	return fmt.Errorf("GitHub session unavailable for scale set %d (pool %s): %w; lease deadlines remain enforced by Central",
+		scaleSetID, pool, cause)
+}
+
 func runController(path string) error {
 	cfg, err := loadControllerConfig(path)
 	if err != nil {
@@ -133,7 +150,7 @@ func runController(path string) error {
 		sessionHTTP.RetryMax = 0
 		session, err := github.MessageSessionClient(ctx, snapshot.Pool.ScaleSetID, "runway-pool-"+snapshot.Pool.ID, scaleset.WithRetryableHTTPClint(sessionHTTP), scaleset.WithTimeout(70*time.Second))
 		if err != nil {
-			report(errors.New("GitHub session unavailable; lease deadlines remain enforced by Central"))
+			report(sessionUnavailableError(snapshot.Pool.ScaleSetID, cfg.Pool, err))
 			if fresh, renewErr := central.Renew(ctx, lastError.Load().(string)); renewErr == nil {
 				engine.snapshot = fresh
 				_ = engine.Reconcile(ctx)

@@ -345,3 +345,48 @@ func TestCentralRenewRejectsChangedPoolIdentity(t *testing.T) {
 		})
 	}
 }
+
+// The health line is the only thing an operator sees when the controller cannot
+// open an Actions message session, and that session has failed for a deleted
+// scale set, an unusable token and a network blip alike. One generic message for
+// all three is what turned a five-minute configuration mistake into an afternoon,
+// so the fields an operator needs have to be pinned here.
+func TestSessionUnavailableErrorNamesTheScaleSetAndKeepsTheCause(t *testing.T) {
+	cause := errors.New("unexpected status code: 404 Not Found")
+	got := sessionUnavailableError(7, "pool-abc", cause).Error()
+
+	for _, want := range []string{"7", "pool-abc", "404 Not Found"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("health line %q does not mention %q", got, want)
+		}
+	}
+	if !strings.Contains(got, "lease deadlines remain enforced") {
+		t.Errorf("health line %q drops the reassurance that Central still holds the deadline", got)
+	}
+	// Wrapped, not flattened: the caller's own inspection has to keep working.
+	if !errors.Is(sessionUnavailableError(7, "pool-abc", cause), cause) {
+		t.Error("cause is not reachable with errors.Is")
+	}
+}
+
+func TestSessionUnavailableErrorDistinguishesTwoScaleSets(t *testing.T) {
+	cause := errors.New("boom")
+	stale := sessionUnavailableError(6, "pool-abc", cause).Error()
+	fresh := sessionUnavailableError(8, "pool-abc", cause).Error()
+	if stale == fresh {
+		t.Error("two scale sets produce identical health lines, so the log cannot say which one failed")
+	}
+}
+
+func TestSessionUnavailableErrorIsSafeForAnArbitraryCause(t *testing.T) {
+	// The SDK's error can carry a response body. Whatever it is, the line has to
+	// render it rather than dropping it, because that is the whole point of the
+	// change; and a nil cause must not panic a controller that is already failing.
+	got := sessionUnavailableError(1, "p", errors.New("body: {\"message\":\"Not Found\"}")).Error()
+	if !strings.Contains(got, "Not Found") {
+		t.Errorf("health line %q drops the response body", got)
+	}
+	if sessionUnavailableError(1, "p", nil) == nil {
+		t.Error("a nil cause produced a nil error, which the health report would drop silently")
+	}
+}
