@@ -311,7 +311,13 @@ def published_port_works(port, image):
                     '-p', '127.0.0.1:%d:25' % port, image])
     if started.returncode != 0:
         return False
-    deadline = time.monotonic() + 120
+    # This whole proof runs inside `prepare`, which the controller bounds with its
+    # `transport_timeout_seconds`, 90 s in the dogfood configuration. A budget of
+    # more than that turns a container that is merely slow to start into a
+    # preparation that times out, which the controller reports as a guest failure
+    # rather than as this setting. Keep the wait well inside the smaller of the two
+    # and treat a port that is not up by then as a refusal.
+    deadline = time.monotonic() + 25
     answered = False
     while time.monotonic() < deadline:
         try:
