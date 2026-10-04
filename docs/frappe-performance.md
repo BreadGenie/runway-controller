@@ -874,10 +874,10 @@ key in the guest's Docker daemon, `"userland-proxy": false`, which publishes con
 through the kernel's own netfilter DNAT instead of a `docker-proxy` userspace process. It is off
 by default and is set in the controller's `transport_command` with `--kernel-published-ports`.
 
-Two jobs ran on the dogfood pool with that opt-in set and the clocksource opt-in deliberately
-left off, so exactly one variable changed against the five earlier runs that set neither. Both
-passed 708 of 708 tests with coverage, so the kernel-published path carried the database, the
-other services and the whole suite. Preparation also fails closed if it cannot prove the
+Three jobs ran on the dogfood pool with that opt-in set and the clocksource opt-in deliberately
+left off, so exactly one variable changed against the five earlier runs that set neither. All
+three passed 708 of 708 tests with coverage, so the kernel-published path carried the database,
+the other services and the whole suite. Preparation also fails closed if it cannot prove the
 setting, by starting a throwaway container from the image's own store and requiring its
 loopback port to answer with no `docker-proxy` left listening for it, so a job that reaches
 the suite is itself evidence that the key took effect.
@@ -925,21 +925,22 @@ order. Quote the held-connection result instead.
 
 ### The end-to-end result
 
-`Run Tests` step, derived from the job logs the same way for all nine runs, first to last line
+`Run Tests` step, derived from the job logs the same way for all ten runs, first to last line
 of the step, with `sd` the sample standard deviation across those runs:
 
 | configuration | `Run Tests` step |
 | --- | ---: |
 | five runs, neither opt-in | 485.53, 490.45, 482.86, 486.80, 480.05 s; mean 485.14 s, sd 3.94 s |
 | clocksource opt-in only, two runs | 488.25, 493.63 s; mean 490.94 s |
-| kernel published ports only, two runs | 427.92, 426.52 s; mean 427.22 s |
+| kernel published ports only, three runs | 427.92, 426.52, 425.91 s; mean 426.78 s, sd 1.03 s |
 
-All nine ran the same 16 steps and reported `Tests: 708, Failing: 0, Errors: 0`. The
-kernel-published change is **57.92 s faster than the five untouched runs, which is 14.7 sample
-standard deviations**. Both of its runs finish below the fastest of those five, by 52.13 s and
-53.53 s, and they agree with each other to 1.40 s, so the effect reproduces rather than resting
-on one lucky job. Container start did not regress: `Initialize containers` took 16.36 s and
-17.33 s against 16.28, 17.09 and 18.75 s on the three baked-image runs.
+All ten ran the same 16 steps and reported `Tests: 708, Failing: 0, Errors: 0`. The
+kernel-published change is **58.35 s faster than the five untouched runs, which is 14.8 sample
+standard deviations**. All three of its runs finish below the fastest of those five, by 52.13 s,
+53.53 s and 54.14 s, and they agree with each other to 2.01 s, tighter than the five untouched
+runs agree to each other, so the effect reproduces rather than resting on one lucky job. Container
+start did not regress: `Initialize containers` took 16.36 s, 17.33 s and 16.16 s against 16.28 s,
+17.09 s and 18.75 s on the three baked-image runs.
 
 This is the largest single improvement measured in this document, and it is far larger than
 the 34.0 s to 38.9 s that 335,599 statements at the measured 101.29 µs to 115.78 µs each
@@ -954,7 +955,7 @@ the hop. Nothing here establishes that.
 ### What the survey said, and how it turned out
 
 The survey that chose this technique estimated 12 to 39 s for it, from the published-port
-figure less the container's own bridge figure. The measured result is 57.92 s. The technique
+figure less the container's own bridge figure. The measured result is 58.35 s. The technique
 was chosen for the right reason, on the mechanism rather than on the machine speed, and it
 delivered more than predicted.
 
@@ -965,9 +966,9 @@ someone will try:
   to pull and start them. The baked images already address that: container start is 16.28 s to
   18.75 s log-derived, against 45.71 s on the uncached baseline.
 - Splitting the suite into more matrix shards shortens each job and multiplies dispatch
-  overhead. Dispatch is the largest non-test number in this report at about 65 s against 10 s,
-  and it is a property of the infrastructure rather than of the workflow, so sharding
-  multiplies the worse side of it.
+  overhead, which is the largest non-test number in this report. Dispatch is decomposed in the
+  next section but one, and it is a property of the infrastructure rather than of the workflow, so
+  sharding multiplies the worse side of it.
 
 Two gaps in the survey's literature are worth carrying forward, because they save the search.
 No primary source attributes CI agent slowness to hypervisor scheduling specifically, and none
@@ -984,7 +985,7 @@ on a measured per-request cost instead of on a two-ended range. The closing numb
 than the bracket predicted, which is the same discrepancy the previous section already flagged
 for its own high end.
 
-The consequence is worth stating without softening. 57.92 s of the roughly 130 s is now explained
+The consequence is worth stating without softening. 58.35 s of the roughly 130 s is now explained
 and removed. What remains is the cross-vCPU wakeup cost behind the rest of the round trips, plus
 the allocation and dispatch penalties. Both are properties of the virtualization boundary, which
 is the same position [the round-trip section](#the-round-trip-is-vcpu-placement-not-networking)
@@ -994,10 +995,55 @@ reachable from this repository.
 So this is the largest Runway-side win available on this workload, and it does not reach parity
 on its own.
 
+### Dispatch, decomposed
+
+The 65 s in the same-day baseline above is the whole span from workflow creation to the job's
+first step, so it mixes four different things. Central records the boundaries, and the three trial
+runs resolve them. Times are seconds, and each column is a difference between two records of the
+same run, so none of them depends on how the two systems number their fields:
+
+| stage | baseline, 2026-10-03 | trial 1 | trial 2 | trial 3 |
+| --- | ---: | ---: | ---: | ---: |
+| workflow to job created, GitHub's own overhead | 11.0 s | 11.0 s | 9.0 s | 9.0 s |
+| job created to lease created, controller discovery | 0.7 s | 75.0 s | 0.7 s | 1.7 s |
+| lease created to dispatched, controller claim | 0.3 s | 2.9 s | 2.6 s | 1.8 s |
+| dispatched to job started, provision and register | 45.3 s | 25.5 s | 30.5 s | 29.0 s |
+| job started to first step | 7.7 s | 6.7 s | 6.3 s | 6.5 s |
+| Dispatch to job start | 65 s | 121 s | 49 s | 47 s |
+
+Central stores its timestamps in site time, which is UTC+5:30, so read as UTC they shift every
+Central-derived column by five and a half hours. The column is correct only after converting, and
+the run-to-run spread is what makes the mistake obvious: 19,800 s is not a dispatch latency.
+
+Trial 1 is the interesting row. Its discovery column is 75.0 s where every other run is under 2 s,
+and it is the run that went out with the first version of this flag, whose port proof waited up to
+120 s inside a 90 s transport timeout. A proof that outlived its timeout did not only fail, it
+occupied the controller's reconcile loop, and a job arriving during that window sat unclaimed
+until the loop came back. The proof's deadline is now 25 s, and the two runs since discover in 0.7
+s and 1.7 s. That stall was invisible in the test phase, so reading only the test phase would have
+missed it entirely.
+
+What remains is the fourth row. Provision and registration costs 29.0 s to 30.5 s, and it is now
+the whole of the dispatch excess: 47 s to 49 s of dispatch against GitHub-hosted's 10 s, of which
+about 30 s is provision and the rest is a 2.6 s claim and a 6.4 s pickup that GitHub-hosted also
+pays. The usual remedy for that row is a warm standby, a second runner already created, prepared
+and registered while no job is queued, so a job finds an idle runner instead of paying for a boot.
+It does not fit this host. The guest is 6144 MiB and the host has 7936 MiB, so two guests would
+need 12,288 MiB and overshoot by 4352 MiB. A standby is not a cheaper runner, it is a second
+concurrent guest, and this host cannot hold one. The pilot's own configuration agrees: the
+controller refuses to start unless the pool is fenced and `max_concurrency` is 1, and it sets the
+listener's `MaxRunners` from that single slot, so the design is single-runner by construction
+rather than by accident.
+
+The proof costs about 4 s of that row, comparing trial 1's 25.5 s against the two fixed runs' 30.5
+s and 29.0 s, and it is charged here rather than to the test phase because preparation finishes
+before the runner registers and therefore before GitHub can start the job. That is the honest
+accounting for the flag: it spends about 4 s of dispatch to remove 58.35 s of test phase.
+
 ### Method caveats
 
-- Two runs for the winning configuration. That is enough here, because the effect is 14.7 sample
-  standard deviations and the two runs agree to 1.40 s, but it says nothing about a smaller
+- Three runs for the winning configuration. That is enough here, because the effect is 14.8
+  sample standard deviations and the three agree to 2.01 s, but it says nothing about a smaller
   interaction with any other setting.
 - The five comparison runs are from the morning of the previous day, about nine hours before
   the two clocksource runs and eighteen hours before the winning ones. The clocksource pair
