@@ -1057,3 +1057,115 @@ accounting for the flag: it spends about 4 s of dispatch to remove 58.35 s of te
 - The first health line after each controller claim logged `guest prepare failed or timed out`
   and the next one cleared, identically in the earlier controller logs in this repository, so
   that pattern predates this work.
+
+### Environment Setup, and why baking a bench is not the answer
+
+With the test phase addressed, `Environment Setup` is the largest remaining excess in the job. It
+is the second longest step and it is slower than the tests were on GitHub-hosted. Four runs on the
+kernel-published configuration, against the same hosted run this document has used throughout:
+
+| measurement | GitHub-hosted | Runway | excess |
+| --- | ---: | ---: | ---: |
+| Environment Setup, whole step | 93.30 s | 166.01 s, sd 9.21 s over four runs | 72.71 s |
+| the workflow's own four timed stages | 78 s | 104.0 s, sd 1.8 s | 26.0 s |
+| everything else in the step | 15.3 s | 62.0 s | 46.7 s |
+
+The workflow times four stages itself and prints the totals, so those come straight from the log.
+The split within them is:
+
+| stage the workflow times | GitHub-hosted | Runway, mean of four | excess |
+| --- | ---: | ---: | ---: |
+| Install System Dependencies and bench tool | 33 s | 36.5 s, sd 2.1 s | +3.5 s |
+| Init Bench | 9 s | 23.5 s, sd 1.7 s | +14.5 s |
+| Install dev and test deps | 3 s | 2.8 s, sd 0.5 s | -0.2 s |
+| Create Site and Build Assets | 33 s | 41.2 s, sd 0.5 s | +8.2 s |
+
+So the bench work is 26 s of a 72.71 s excess, and the remaining 46.7 s is the actions block:
+`actions/checkout`, `actions/setup-python`, `actions/setup-node` with its 308 MB yarn cache,
+`astral-sh/setup-uv` with its cache, and `actions/cache`. Nothing in that block is Frappe's code,
+and nothing in it is something a runner image can pre-bake.
+
+That is the answer to the question this section was written to settle. Frappe Cloud v2 gets a
+bench ready quickly because it bakes the bench:
+`cargo/cargo/image_builder/conf/pilot/provision.sh` runs `pilot init`, installs the Python
+environment, runs `yarn install --frozen-lockfile` per app and calls `pilot new-site`, so its
+image ships a working site. Runway's own recipe says the same thing about itself in
+`docs/image-building.md:54`, that it installs dependencies only and "the workflow still performs
+setup, `bench init`, and its own dependency installs on every run". But v2 has no per-job model at
+all: its unit is a tenant bench that lives for days, so it pays that once per image rather than
+once per job. And the part of the bill that a bake would remove here is the 26 s of stage time, of
+which the dependency installs are already 2.8 s because `actions/setup-node` has already restored
+the yarn cache by the time they run. A bake is a multi-hour image build, it only works for a
+workflow the runner vendor co-owns, and it cannot help a customer whose checkout is a different
+ref than the one baked. It does not pay for itself.
+
+#### What the guest is actually made of
+
+The actions block is the larger half of the excess, so it was measured from inside a live job
+rather than inferred. `.github/actions/guest-caps` in the benchmark repository runs before
+`Environment Setup` and is off unless a dispatch asks for it, because it costs about 8 s and its
+answer is only interesting while something is being changed.
+
+It first settled a question this document had answered wrongly. Earlier readings of the yarn cache
+download's progress bar suggested roughly 1 MB per second here against roughly 100 on a hosted
+runner, which pointed at the network. Timed transfers in the guest say otherwise: 18.6 MB per
+second to GitHub's release CDN for a 17.3 MB artifact in 0.93 s, and 98.5 MB per second to
+nodejs.org for 31.9 MB in 0.32 s. A progress bar reports one sample, not an average, and a sparse
+one. The network is fine and that earlier reading was an artifact of how it was collected.
+
+The cache itself is a narrower case. Its 323 MB download runs at 16.7 to 21.1 MB per second here
+against 111.8 MB per second on the hosted runner, which is about 19 s of the difference, and
+extracting it with `tar -xf` and `unzstd` costs 7.4 s against 1.8 s. So egress to GitHub is
+roughly 5x slower than from inside GitHub's network, which no guest-side change can fix.
+
+Storage is the other difference. In the guest, on the ext4 root:
+
+| measurement | Runway guest, ext4 | Runway guest, workspace tmpfs |
+| --- | ---: | ---: |
+| sequential write, 512 MiB with fdatasync | 100 MB per second | 198 MB per second |
+| sequential read, 512 MiB, warm | 1.7 GB per second | 5.2 GB per second |
+
+Against a hosted runner's local NVMe both numbers are roughly an order of magnitude low, and the
+extraction and `yarn install` timings are consistent with that.
+
+#### Workspace tmpfs, which is worth having
+
+`--workspace-tmpfs-mib` already existed and mounts a tmpfs over `/home/runner/work`, which covers
+the checkout, the action cache staging directory, `node_modules`, the Python environment and the
+built assets. At 2560 MiB, the most the guest's 2048 MiB reserve allows alongside the database's
+own 2 GiB, one run took `Environment Setup` to 147.95 s against the four-run ext4 mean of 166.01
+s. That is 18.06 s at about two sample standard deviations, and the same run's test phase was the
+fastest of the session at 423.37 s.
+
+One run is not a result, and this one sits inside a distribution with a 9.21 s standard deviation,
+so it stands as a candidate worth three runs rather than as a keeper. The direction is consistent
+with the sequential write number doubling and nothing contradicts it.
+
+#### Four vCPUs, which is worse than three
+
+The pool asks for 3000 millicores. A GitHub-hosted standard Linux runner has 4. Matching it is the
+obvious structural move, so it was tried: `cpu_millicores` set to 4000, everything else unchanged.
+
+| measurement | 3 vCPU | 4 vCPU | change |
+| --- | ---: | ---: | ---: |
+| Environment Setup | 147.95 s | 178.87 s | +30.92 s |
+| Run Tests | 423.37 s | 473.56 s | +50.19 s |
+| whole job | 630 s | 699 s | +69 s |
+
+The guest confirmed `nproc=4`, so the shape did apply. The Metal host has four physical cores, one
+thread each, and was at load 0.14 before the run. Handing all four to the guest leaves
+Firecracker, the host kernel, Docker and the transport with nothing, and the test phase is the
+part that suffers most, which is what the round-trip section's cross-vCPU finding predicts: more
+vCPUs means more chance that MariaDB and the test process sit on different ones. Three vCPUs is
+not an under-provisioning against a 4 vCPU reference on this host. It is close to the ceiling.
+
+#### Where this leaves the job
+
+The whole job is 630 s against GitHub-hosted's 512 s, so the excess is 118 s where the same-day
+baseline started at 237 s. Half the gap is gone and the ratio is 1.230x where it was 1.463x.
+
+What is left is not a list of inefficiencies that better engineering removes. It is a 3 vCPU, 6
+GiB guest on a four-core host, with storage around 100 MB per second and egress to GitHub around
+20 MB per second, measured against a 4 vCPU, 16 GiB runner on local NVMe inside GitHub's own
+network. Closing it means changing the runner's shape or its region, both of which are decisions
+about what a runner costs rather than things this repository controls.
