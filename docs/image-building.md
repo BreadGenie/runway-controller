@@ -137,6 +137,18 @@ publish_ubuntu_image(
 )
 ```
 
+### Why the host must retain the image, and how to check that it does
+
+A fresh guest waits about 1.4 s for Metal to start the VM and then about 12 s to boot, but Metal's own start phase is not reliably 1.4 s. Across five consecutive starts it was 1.40, 1.40, 1.39, 37.12 and 37.76 s, so two of five paid an extra 37 s that nothing in the guest did.
+
+That phase is the image being fetched. The path is `machine.Start`, which finds neither a disk nor a matching memory snapshot and takes `coldBoot`, which calls `relaunch`, which calls `prepareBoot`, which calls the storage layer's `PrepareBoot`, which calls `ensureImage`. `ensureImage` returns at once when the image is already stored on the host and complete, and otherwise downloads and extracts the rootfs, which is the 37 s. It is host work, so it happens before the guest exists and cannot be observed from inside it.
+
+Whether the image is already stored is a policy decision, not a side effect. The host is told what to retain through an image policy that Atlas builds from every image with `cache_image` set, and `get_desired_images` selects on exactly that field. The default is unset, and this recipe's publisher never set it, so the policy on the Metal host is an empty list: nothing is meant to be retained, and the copy that happens to be on the host is there because something fetched it rather than because anything asked for it. That is not a durable state, and an operator pruning unused images is explicitly documented as safe when no VM uses them.
+
+So the published image needs `cache_image` set on its record. With the current publisher that is a field on the image rather than an argument, so it has to be ticked on the record after publishing, and it has to be verified rather than assumed, because an image that looks published and is not in any host's policy fails open: the first job after a prune is slow and nothing reports an error.
+
+Two checks, in order. Read the image record and confirm `cache_image` is set. Then read the host's `/var/lib/metal/image-policies.json` and confirm the image's reference appears in it, because that file is what Metal actually acts on and it is the only one of the two that proves the host was told.
+
 ### Ask for a warm artifact, and what it commits you to
 
 Metal can keep a paused microVM of an image on each host and resume one on first boot, which replaces the guest kernel and init with a memory restore. That matters here because a fresh guest spends about 27 s booting before the runner starts, against about 1.4 s for Metal's own VM start and about 6 s connecting to GitHub, so boot is the largest identified part of what a job waits for. Pass the pool's exact shape to ask for it:
