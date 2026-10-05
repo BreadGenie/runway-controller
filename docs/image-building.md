@@ -137,8 +137,32 @@ publish_ubuntu_image(
 )
 ```
 
+### Ask for a warm artifact, and what it commits you to
+
+Metal can keep a paused microVM of an image on each host and resume one on first boot, which replaces the guest kernel and init with a memory restore. That matters here because a fresh guest spends about 27 s booting before the runner starts, against about 1.4 s for Metal's own VM start and about 6 s connecting to GitHub, so boot is the largest identified part of what a job waits for. Pass the pool's exact shape to ask for it:
+
+```python
+publish_ubuntu_image(
+    "Runway Ubuntu 24.04 runner 2.337.0 warm",
+    "24.04",
+    "amd64",
+    Path("/private/runner.ext4"),
+    Path("/private/vmlinux-5.10.223-fc-ci"),
+    storage="Site File",
+    memory_snapshot_shape=(3, 6144, 10240),
+)
+```
+
+The three values are `(virtual_cpu_count, memory_mib, disk_mib)` and they are the pool's `cpu_millicores` divided by 1000, its `memory_mib`, and its `disk_mib`. Metal restores the artifact only on an **exact** match of all three, and only on a **first boot from a fresh disk clone**, which is what a per-job guest is. A shape recorded here that the pool does not request buys nothing and falls back to a cold boot without saying so, so the two have to be published together. The publisher also sets `cache_image`, because a host only builds an artifact for an image it is told to retain locally.
+
+Two costs are worth weighing before publishing one:
+
+- **The shape becomes fixed.** A warm artifact serves exactly one shape, so the pool cannot change `cpu_millicores`, `memory_mib` or `disk_mib` without a new image, because the field cannot change after creation and an existing warm guest is only valid at the shape it was captured at. - **The artifact is built lazily, per host.** Metal boots an isolated guest, waits about five minutes for it to settle, pauses it and promotes the result, so the first job after a publish pays for the build and later ones do not. A host that has never built it cold boots, again without saying so.
+
+Verify rather than assume. Metal logs a warm start distinctly from a cold one, and the record's `memory_snapshot` and `memory_snapshot_configuration` fields are readable on the published image. Absence of a warm start in the log for a shape you published is the failure to look for, because every other signal reports success.
+
 The publisher expects `runner.ext4.zst` beside the raw filesystem. Commit the transaction, record the new image ID and digests, and confirm it is Available and enabled. Use a distinct title when preserving an earlier image for rollback; publishing a changed image under the same title retires its predecessor.
 
-Boot a second fresh VM from the published image. Without installing packages, check that the runner prints its expected version, Docker responds as the runner user, a published Docker Redis port returns `PONG`, and cloud-init generated fresh SSH host keys and machine identity. Confirm that `.runner` and `.credentials` are absent before any JIT handoff. For an image that carries baked service images, also confirm each workflow tag resolves to its pinned digest and that `/etc/runway-container-images.json` is present with no `.docker` config anywhere. Delete this verification VM after validation. Retain its test evidence and the image's package manifest at `/etc/runway-runner-image.txt`.
+Boot a second fresh VM from the published image. Without installing packages, check that the runner prints its expected version, Docker responds as the runner user, a published Docker Redis port returns `PONG`, and cloud-init generated fresh SSH host keys and machine identity. For an image published with a warm artifact, confirm from Metal's log that the boot resumed rather than cold booted, because every check below passes either way. Confirm that `.runner` and `.credentials` are absent before any JIT handoff. For an image that carries baked service images, also confirm each workflow tag resolves to its pinned digest and that `/etc/runway-container-images.json` is present with no `.docker` config anywhere. Delete this verification VM after validation. Retain its test evidence and the image's package manifest at `/etc/runway-runner-image.txt`.
 
 The resulting image accelerates bootstrap. It does not implement GitHub-hosted image parity, automatic package updates, image signing, or an image promotion policy.
