@@ -1250,7 +1250,7 @@ class TransportTests(unittest.TestCase):
                                          size_mib * 1048576, options))
 
     def cache_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
-                    cache=None):
+                    cache=None, timings=None):
         """Prepare a fresh guest with the RAM cache opt-in and the guest's own answers."""
         program, sudoers, owned = self.guest_paths(directory)
         if cache is not None:
@@ -1258,7 +1258,7 @@ class TransportTests(unittest.TestCase):
             # parent is not the real home directory.
             program = program.replace(str(self.cache_path(directory)), str(cache))
         payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
-                   'cache_tmpfs_mib': mib}
+                   'cache_tmpfs_mib': mib, 'timings': timings}
         return (self.execute_guest(program, sudoers, payload, root_owned=owned,
                                    present=self.MOUNT_TOOLS if present is None else present,
                                    results=results, meminfo=meminfo)
@@ -1954,6 +1954,59 @@ class TransportTests(unittest.TestCase):
                     for binary in self.MOUNT_TOOLS:
                         self.assertEqual(self.mount_calls(recorded, binary), [])
 
+
+    def timed_guest(self, directory, timings):
+        """Prepare a fresh guest with timings asked for or not, and the guest's answers."""
+        program, sudoers, owned = self.guest_paths(directory)
+        payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                   'prefer_tsc_clocksource': True, 'timings': timings}
+        return self.execute_guest(program, sudoers, payload, root_owned=owned)
+
+    def test_the_status_document_is_unchanged_unless_timings_are_asked_for(self):
+        # The controller parses this document, so an unasked-for field is a contract change
+        # rather than an observation, and every existing assertion here depends on it.
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, _ = self.timed_guest(directory, False)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {'state': 'installed'})
+
+    def test_timings_name_the_steps_that_ran(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, _ = self.timed_guest(directory, True)
+
+        document = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(document['state'], 'installed')
+        # Step names are the ones the code uses, so a number is traceable to a line.
+        self.assertEqual(set(document['timings_ms']),
+                         {'state', 'prefer_tsc_clocksource'})
+        for step, milliseconds in document['timings_ms'].items():
+            self.assertIsInstance(milliseconds, int, step)
+            self.assertGreaterEqual(milliseconds, 0, step)
+
+    def test_a_refused_step_still_reports_what_it_managed_to_time(self):
+        # A failure is exactly when an operator wants the numbers, so the refusal path
+        # carries them too rather than only the success path.
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True, 'timings': True}
+            # The clocksource attributes are deliberately left out of `owned`, so the
+            # recorded owner is this test user rather than root and the opt-in refuses.
+            code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                                                    root_owned=())
+
+        self.assertEqual(code, 1)
+        document = json.loads(output)
+        self.assertEqual(document['state'], 'unknown')
+        self.assertIn('prefer_tsc_clocksource', document['timings_ms'])
+
+    def test_the_timings_flag_is_off_unless_the_operator_asks(self):
+        # The default has to be off, or every caller pays for measurement and every
+        # status document a controller has parsed gains a field.
+        self.assertNotIn('--timings', self.arguments('prepare'))
+        self.assertIn('--timings', self.arguments('prepare') + ['--timings'])
 
 if __name__ == '__main__':
     unittest.main()

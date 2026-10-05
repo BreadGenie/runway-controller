@@ -65,6 +65,37 @@ previous = None
 root_path = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 def call(argv):
     return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
+TIMINGS = {}
+# Off unless an operator asks, so the status document a controller parses stays exactly
+# what it was before anything here was measured. Preparation is the largest part of what a
+# job waits for, and with this the only way to attribute it was to change one setting and
+# run a whole job.
+WANT_TIMINGS = bool(payload.get('timings'))
+
+
+def timed(name, function, *arguments):
+    """Run one step, recording how long it took in milliseconds when timings are wanted.
+
+    The step name is the one the code already uses, so a number in the report is
+    traceable to a line rather than to a counter somewhere else.
+    """
+    if not WANT_TIMINGS:
+        return function(*arguments)
+    started = time.monotonic()
+    try:
+        return function(*arguments)
+    finally:
+        TIMINGS[name] = round((time.monotonic() - started) * 1000)
+
+
+def report(state):
+    """Print the status, adding the step timings only when they were asked for."""
+    document = {'state': state}
+    if TIMINGS:
+        document['timings_ms'] = TIMINGS
+    print(json.dumps(document))
+
+
 def state():
     if marker.exists():
         recorded = json.loads(marker.read_text())
@@ -567,39 +598,41 @@ def tmpfs_filesystem(path, source, mib):
     call([umount, str(path)])
     return False
 if action in ('status', 'prepare'):
-    current = state()
+    current = timed('state', state)
     if action == 'prepare' and current == 'installed':
         # Operator opt-ins, and only while this is an unregistered fresh clone: any
         # resulting root is the disposable Firecracker guest's own, never Metal's.
-        if payload.get('allow_guest_sudo') and not grant_runner_sudo():
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('allow_guest_sudo') and not timed('grant_runner_sudo', grant_runner_sudo):
+            report('unknown')
             sys.exit(1)
         # Before the mirror and the two mounts, so that this setting, which is the
         # only one preparation cannot put back, is the one most likely to be left
         # applied: a later refusal cannot undo it. It goes first so that the refusals
         # which can be retried cleanly come after it and report first.
-        if payload.get('prefer_tsc_clocksource') and not prefer_tsc_clocksource():
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('prefer_tsc_clocksource') and not timed('prefer_tsc_clocksource', prefer_tsc_clocksource):
+            report('unknown')
             sys.exit(1)
-        if payload.get('kernel_publish') and not prefer_kernel_publish():
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('kernel_publish') and not timed('kernel_publish', prefer_kernel_publish):
+            report('unknown')
             sys.exit(1)
-        if payload.get('mirror_port') and not enable_mirror(int(payload['mirror_port'])):
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('mirror_port') and not timed('registry_mirror', enable_mirror, int(payload['mirror_port'])):
+            report('unknown')
             sys.exit(1)
         # A refusal from here on leaves the three opt-ins above applied, including the
         # clocksource, which this code cannot put back. That is deliberate: this is a
         # disposable guest and preparation is idempotent, so the retry re-verifies them
         # rather than rolling them back.
-        if payload.get('cache_tmpfs_mib') and not tmpfs_filesystem(
-                cache, cache_source, int(payload['cache_tmpfs_mib'])):
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('cache_tmpfs_mib') and not timed(
+                'cache_tmpfs', tmpfs_filesystem, cache, cache_source,
+                int(payload['cache_tmpfs_mib'])):
+            report('unknown')
             sys.exit(1)
-        if payload.get('workspace_tmpfs_mib') and not tmpfs_filesystem(
-                workspace, workspace_source, int(payload['workspace_tmpfs_mib'])):
-            print(json.dumps({'state': 'unknown'}))
+        if payload.get('workspace_tmpfs_mib') and not timed(
+                'workspace_tmpfs', tmpfs_filesystem, workspace, workspace_source,
+                int(payload['workspace_tmpfs_mib'])):
+            report('unknown')
             sys.exit(1)
-    print(json.dumps({'state': current}))
+    report(current)
     sys.exit(0 if action == 'status' or current == 'installed' else 1)
 if action == 'collect':
     report = call(['journalctl', '-u', 'runway-runner.service', '--no-pager', '-n', '200'])
@@ -838,6 +871,10 @@ def main() -> int:
     # an image the baked runner image already carries.
     parser.add_argument('--kernel-published-ports', action='store_true',
                         help='Publish container ports through kernel DNAT instead of a userspace proxy')
+    # Report how long each preparation step took, in the status document's timings_ms.
+    # Off by default so the status a controller parses is unchanged unless asked for.
+    parser.add_argument('--timings', action='store_true',
+                        help='Report per-step preparation timings in the status document')
     # Explicit operator opt-in for a RAM-backed package cache. The filesystem lives
     # inside the disposable guest and dies with the lease: it holds only the yarn and
     # uv downloads one job makes, so it moves those writes out of the guest's disk
@@ -887,6 +924,7 @@ def main() -> int:
     if args.action == 'bootstrap' and (not secret or len(secret) > 65536 or '\n' in secret):
         parser.error('Expected one JIT configuration on stdin')
     payload = dict(action=args.action, runner_name=args.runner_name, vm_id=args.vm_id,
+                   timings=args.timings,
                    key_file=args.key_file, known_hosts=args.known_hosts + '-' + args.vm_id,
                    allow_guest_sudo=args.allow_guest_sudo,
                    prefer_tsc_clocksource=args.prefer_guest_tsc,
