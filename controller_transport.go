@@ -46,10 +46,20 @@ func (t commandTransport) Call(ctx context.Context, action string, lease pilotLe
 		return "unknown", errors.New("guest " + action + " failed or timed out")
 	}
 	var status struct {
-		State string `json:"state"`
+		State     string         `json:"state"`
+		TimingsMs map[string]int `json:"timings_ms"`
 	}
 	if output.Len() > 4096 || json.Unmarshal(output.Bytes(), &status) != nil {
 		return "unknown", errors.New("guest transport returned invalid status")
+	}
+	// Preparation is the largest part of what a job waits for, and the guest reports what
+	// each step cost when an operator asks. Emit it here, because the caller only ever
+	// sees the state string and a field nothing reads is a measurement nobody gets.
+	if len(status.TimingsMs) > 0 {
+		_ = json.NewEncoder(os.Stderr).Encode(map[string]any{
+			"event": "guest_prepare_timings", "runner": lease.RunnerName,
+			"timings_ms": status.TimingsMs,
+		})
 	}
 	switch status.State {
 	case "installed", "running", "completed", "unknown":

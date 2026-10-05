@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -53,4 +55,57 @@ func TestControllerTransportHelper(t *testing.T) {
 	}
 	fmt.Println(`{"state":"running"}`)
 	os.Exit(0)
+}
+
+// TestControllerTransportTimingsHelper stands in for the guest program when the transport
+// is asked to read a status document that carries preparation timings.
+func TestControllerTransportTimingsHelper(t *testing.T) {
+	if !strings.Contains(strings.Join(os.Args, " "), "runway-timings-helper") {
+		return
+	}
+	fmt.Println(`{"state":"installed","timings_ms":{"state":3,"kernel_publish":41}}`)
+	os.Exit(0)
+}
+
+func TestControllerTransportEmitsPreparationTimingsWhenTheGuestReportsThem(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := commandTransport{
+		command: []string{executable, "-test.run=TestControllerTransportTimingsHelper", "--", "runway-timings-helper"},
+		timeout: time.Second * 5,
+	}
+	// The caller only ever reads the state string, so a field nobody looks at is a
+	// measurement nobody gets. Capture what the transport writes to stderr.
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = write
+	state, callErr := transport.Call(context.Background(), "prepare",
+		pilotLease{RunnerName: "runway-lease-timings", VMID: "vm-123"}, "")
+	os.Stderr = saved
+	write.Close()
+	emitted, _ := io.ReadAll(read)
+	read.Close()
+
+	if callErr != nil || state != "installed" {
+		t.Fatalf("a status document with timings returned %q, %v", state, callErr)
+	}
+	var event struct {
+		Event     string         `json:"event"`
+		Runner    string         `json:"runner"`
+		TimingsMs map[string]int `json:"timings_ms"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(emitted), &event); err != nil {
+		t.Fatalf("transport emitted %q, which is not one event: %v", emitted, err)
+	}
+	if event.Event != "guest_prepare_timings" || event.Runner != "runway-lease-timings" {
+		t.Fatalf("emitted %+v, want the timings attributed to this runner", event)
+	}
+	if event.TimingsMs["kernel_publish"] != 41 || event.TimingsMs["state"] != 3 {
+		t.Fatalf("timings arrived as %v, not the numbers the guest reported", event.TimingsMs)
+	}
 }
