@@ -1194,3 +1194,126 @@ GiB guest on a four-core host, with storage around 100 MB per second and egress 
 20 MB per second, measured against a 4 vCPU, 16 GiB runner on local NVMe inside GitHub's own
 network. Closing it means changing the runner's shape or its region, both of which are decisions
 about what a runner costs rather than things this repository controls.
+
+### What the rest of the industry publishes, and how it lines up
+
+The diagnosis above says the remaining excess is a smaller machine on a slower path. The obvious
+next question is whether anyone else has solved either half, so this section records what is
+actually published rather than what is asserted. Two of the three findings change what is worth
+attempting, and one of them removes a constraint this document has been treating as fixed.
+
+#### Boot to ready, and why a warm pool is unaffordable
+
+The 29.0 s to 30.5 s of provision is not an unusual number. GitLab's own maintainer reports
+machine creation into an idle pool at a mean of 42.19 s, from their own Grafana. Depot publish the
+most thorough breakdown available, 40 s down to under 5 s on EC2, and the mechanism was EBS lazy
+loading rather than anything about the hypervisor. No CI vendor publishes a per-job overhead floor
+at all.
+
+What every one of them converged on is a warm pool, and GitHub says so plainly in the
+larger-runners documentation: standard runners "are always in a 'warm' state", and with larger
+runners "a warm VM may not be ready to pick up a job on first request", so GitHub may have to
+create a new VM, which "increases the queue to assign time". They keep a subset warm for 24 hours
+and admit the fast path is the warm pool. GitLab's autoscale documentation names the same trade
+and advises users they would rather the machines were running jobs than sitting idle.
+
+That is the constraint this document keeps running into, and AWS states the arithmetic. From the
+Firecracker paper: "at 125 ms creation time, one pooled MicroVM is required for every 8 creations
+per second", so pool size is creation rate times creation latency. A 30 s creation latency makes a
+pool worth holding enormous, and it is precisely why AWS could keep its pools small and this
+service cannot. The pool is unaffordable because the boot is slow, so boot speed is upstream of
+the pool question rather than an alternative to it.
+
+That points somewhere useful. The published per-phase breakdowns say the guest, not Firecracker,
+dominates. One independent measurement puts 852 ms of a 1133 ms cold boot in guest boot and
+readiness against 38 ms for Firecracker's own instance start. The Firecracker paper attributes 900
+ms to booting an Ubuntu kernel against a tuned one, up to 70 ms to serial console logging, and
+about 40 ms to compressed kernel decompression. Depot removed cloud-init from their runner image
+because "it contributed heavily to both boot and reboot time". This service already builds its own
+guest kernel in `scripts/build-ci-kernel.sh`, so the largest identified component of the 30 s is
+the one piece of it this repository already owns.
+
+#### A paused snapshot costs no memory, which dissolves the standby constraint
+
+The reason a standby runner was ruled out earlier is arithmetic: a 6144 MiB guest against 7936 MiB
+of host means two guests do not fit. That reasoning is wrong, and Firecracker's own snapshot
+documentation is why. Fresh microVMs are booted with anonymous memory, while a microVM resumed
+from a snapshot "load memory on demand from the snapshot and copy-on-write to anonymous memory"
+through a private mapping. A paused snapshot therefore commits no anonymous guest RAM. It costs
+disk plus whatever page cache the host chooses to keep.
+
+So a pool of paused standbys is not blocked by the memory wall at all: only the standby actually
+being resumed consumes anonymous memory. The published restore figures are 176 ms end to end for
+one independent measurement and a 179 ms median for another, against cold boots of 1133 ms and
+about 3000 ms for the same two. AWS is the only party publishing these numbers per unit of work,
+for Lambda and for Aurora DSQL, and in both cases outside CI. No CI vendor publishes a
+memory-snapshot restore figure at all, which is itself the finding.
+
+The cost is a security model that inverts. Firecracker's documentation states that state other
+than the guest kernel entropy pool "will still be replicated across multiple microVMs", names
+`/proc/sys/kernel/random/boot_id` as identical across clones, notes that the guest wall clock
+continues from the moment the snapshot was taken, and calls a multi-clone restore insecure by its
+own definition unless the original never resumes. The runner's registration files cannot be in the
+snapshot, so registration has to happen after resume, which leaves the roughly 10 s GitHub
+delivery tail. This is a substantial and security-sensitive build, not a flag.
+
+#### vCPU pinning does not exist, and this host is not the configuration people warn about
+
+Firecracker does not pin vCPU threads to cores. Its affinity is NUMA-node granularity, and the
+request for per-core pinning, so as to "not share threads of the same core across micro-VM", is
+issue 1617, answered by a maintainer with "we also need some time to dive deep on cpu pinning and
+its implications". The design documentation states plainly that microVMs "can oversubscribe host
+CPU and memory" and that "the degree of oversubscription is controlled by customers". Nothing in
+the industry quantifies what that costs; there is no vendor document or maintainer statement of an
+oversubscription penalty for CI agents.
+
+One plausible explanation for the 4 vCPU regression above is that hypervisor threads landed on
+sibling hardware threads and shared execution units. That cannot be what happened here, because
+this host has SMT disabled: 4 CPUs, one thread per core, 4 cores per socket. The guest's 4 vCPUs
+had 4 real cores. The regression is therefore plain host contention, with Firecracker's VMM
+thread, the `kvm-pit` kernel thread that its own production notes describe as unbudgeted, and the
+host kernel all competing for the same 4 cores while the guest believed it owned them.
+
+The other actionable host finding is already satisfied. Firecracker's snapshot tests record
+`KVM_CREATE_VM` at 0.7 ms on cgroups v2 against 26 to 45 ms on cgroups v1, because v1 takes a
+percpu write lock in `cgroup_attach_task_all`. This host is `cgroup2fs`, so it is already on the
+fast path and there is nothing to reclaim there.
+
+#### The actions block, and why its cost cannot be argued down
+
+The 46.7 s in the actions block is now explained by something outside this repository, and the
+explanation is documented rather than inferred. The cache archive is served from Azure Blob
+Storage, not from a GitHub CDN, which `actions/toolkit` reveals by branching on the hostname.
+Regional slowness is a known characteristic with the cause named by maintainers: in
+`actions/cache` issue 267 a 1 GB transfer took 43 s EastUS to EastUS against 141 s EastUS to
+WestUS, and in issue 928 a maintainer writes that "hosted runners are present in the same regional
+cloud network as the blob storage". The 3x to 5x ratio is the same one measured in this guest.
+
+Two of the obvious responses are already exhausted. The restore is already an eight-way parallel
+ranged GET, so there is no concurrency left to add, and GitHub declined the other one: the 2025
+cache-v2 rewrite was about 80% faster on upload, and explicitly not on download.
+
+Pointing the runner at a different cache endpoint is not available to a runner operator.
+`ACTIONS_CACHE_URL` is honoured by the toolkit, but `actions/runner` rewrites it from the job
+message, so the variable cannot be set from the runner side. Two requests to change this are
+closed unmerged, one of them opened by a GitHub employee, and a maintainer wrote "I do not believe
+we have plans to support this path at the moment". There is no changelog entry about cache
+infrastructure in the documentation, and no published statement of which region serves the blobs.
+
+One operational consequence is worth knowing regardless: restore failures are silent. Everything
+except a validation error becomes a warning and a reported cache miss, so a job can spend minutes
+on a cache step and still report success. A slow or failing cache cannot be detected from job
+status, which means the 51.2 s measured in the actions block is a floor that no amount of
+monitoring would reveal as an error.
+
+The last piece is a source-level asymmetry that explains the 7.4 s against 1.8 s extraction. Cache
+creation compresses with `zstdmt -T0`, using every core, while extraction uses single-threaded
+`unzstd`. The same archive on the same disk is therefore faster to create than to read on any
+machine, and that difference is in the toolkit rather than in the runner.
+
+Interposing a TLS-terminating proxy in the guest that serves Azure-shaped hostnames is the one
+option that needs no change to the customer's workflow, and it is what two commercial vendors now
+sell. It also means re-implementing the `ac` claim check on the token, because a proxy that does
+not is a cross-branch cache poisoning hole, and it risks silently dropping to a single stream with
+a 5 s socket timeout if the hostname does not match. Given that the underlying cause is documented
+and unfixable by GitHub, this is a cost decision rather than an engineering one.
