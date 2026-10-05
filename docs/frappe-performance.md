@@ -1257,6 +1257,46 @@ own definition unless the original never resumes. The runner's registration file
 snapshot, so registration has to happen after resume, which leaves the roughly 10 s GitHub
 delivery tail. This is a substantial and security-sensitive build, not a flag.
 
+#### A wedged pool blocks the warm-start change, and the cause is in Central
+
+Recording this because it is now the blocker for the change above, and because the shape of it is
+worth knowing before anyone tries it.
+
+An idle pool was left with `scale_set_id` pointing at a deleted scale set, and setting it back is
+refused with "Drain every runner lease before changing pool identity or image". Every lease is
+already `phase: deleted` and every runner is gone from GitHub, so the message points at nothing.
+The count that produces it is `active_leases`, which treats a lease as active when `phase !=
+"deleted"`
+**or** `jit_state != "removed"`; exactly one lease is `phase: deleted` with `jit_state: ready`.
+
+The reconciler is what put it there. `mark_deleted` in `central/integrations/runway.py` sets the
+phase and `vm_state`, then clears the JIT state only when it was `none`:
+
+```python
+if lease.jit_state == "none": lease.jit_state = "removed"
+```
+
+A lease whose VM disappears *after* its JIT configuration was issued therefore keeps `jit_state:
+ready` forever. That state is unreachable by reconciliation, because `reconcile_lease` returns
+early once the phase is `deleted`, and it is not reachable by running a controller, because the
+same early return applies. The only transition that clears it is a `runner_removed` event, and
+that needs the controller's own fence.
+
+The consequence is not cosmetic. `scale_set_id` and `image_id` are both immutable pool fields, so
+a pool in this state cannot be repointed at a new image at all, which is exactly the operation the
+warm artifact requires. The trigger is ordinary: stop the controller between a lease being issued
+and its teardown, which is what an operator does every time they stop one deliberately.
+
+Two things follow. The recovery needs a Central-side answer, either clearing `jit_state` when the
+phase goes to `deleted` or having `active_leases` ignore a JIT state on a lease that is already
+deleted. And until one of those exists, the operational rule is to let the controller finish the
+lease it is holding rather than killing it, because the pool's identity cannot be changed again
+afterwards.
+
+This is recorded rather than fixed. The runner pool and lease code is uncommitted local work in
+the control plane's installed app, so changing its state machine belongs with whoever owns that
+work.
+
 #### vCPU pinning does not exist, and this host is not the configuration people warn about
 
 Firecracker does not pin vCPU threads to cores. Its affinity is NUMA-node granularity, and the
