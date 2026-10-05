@@ -1128,18 +1128,42 @@ Storage is the other difference. In the guest, on the ext4 root:
 Against a hosted runner's local NVMe both numbers are roughly an order of magnitude low, and the
 extraction and `yarn install` timings are consistent with that.
 
-#### Workspace tmpfs, which is worth having
+#### Workspace tmpfs, which turned out to be much worse
 
-`--workspace-tmpfs-mib` already existed and mounts a tmpfs over `/home/runner/work`, which covers
-the checkout, the action cache staging directory, `node_modules`, the Python environment and the
-built assets. At 2560 MiB, the most the guest's 2048 MiB reserve allows alongside the database's
-own 2 GiB, one run took `Environment Setup` to 147.95 s against the four-run ext4 mean of 166.01
-s. That is 18.06 s at about two sample standard deviations, and the same run's test phase was the
-fastest of the session at 423.37 s.
+`--workspace-tmpfs-mib` mounts a tmpfs over `/home/runner/work`, which covers the checkout, the
+action cache staging directory, `node_modules`, the Python environment and the built assets. One
+run at 2560 MiB, the most the guest's 2048 MiB reserve allows alongside the database's own 2 GiB,
+took `Environment Setup` to 147.95 s against a four-run ext4 mean of 166.01 s. That is 18.06 s at
+about two sample standard deviations, which is why this section originally recorded it as a
+candidate for three runs rather than as a keeper.
 
-One run is not a result, and this one sits inside a distribution with a 9.21 s standard deviation,
-so it stands as a candidate worth three runs rather than as a keeper. The direction is consistent
-with the sequential write number doubling and nothing contradicts it.
+The three runs said the opposite.
+
+Three runs of each, matched, both carrying the kernel-published opt-in so the tmpfs is the only
+variable:
+
+| configuration | `Environment Setup` | `Run Tests` | whole job |
+| --- | ---: | ---: | ---: |
+| three runs, ext4 workspace | 168.50 s, sd 9.50 s | 426.78 s, sd 1.03 s | 639.3 s |
+| three runs, workspace tmpfs at 2560 MiB | 220.94 s, sd 13.12 s | 436.10 s | 701.3 s |
+
+That is **52.44 s worse** on the step, at 5.5 sample standard deviations, 9.32 s worse on the test
+phase, and 62.0 s worse on the whole job. The single run that motivated the flag is 5.6
+standard deviations below the mean of the three that followed it, so it was an outlier and the
+flag is a regression at this guest size.
+
+The mechanism is memory rather than the filesystem. The guest has 5.81 GiB. A 2 GiB tmpfs for the
+database and a 2.5 GiB tmpfs for the workspace leave roughly 1.3 GiB for page cache and everything
+else, and tmpfs pages cannot be swapped, so the working set is competing with the page cache for
+what is left. The one run that failed says the same thing from the other direction: its only
+failure was `test_rq_pool_idle_cpu_usage`, which asserts the worker's idle CPU is 10% or less and
+measured 11.0. It is a load-sensitive assertion, and this is a configuration that adds load.
+
+Storage itself is not the constraint it looked like. Moving the workspace to RAM doubled
+sequential write from 100 MB per second to 198 MB per second and bought nothing, because the guest
+was already I/O idle at 0.05% mean iowait and the time was never spent waiting for the disk. A
+faster disk would still be worth having for the actions block, where the 308 MB cache extraction
+genuinely does read 323 MB, but it is not worth trading page cache for.
 
 #### Four vCPUs, which is worse than three
 
@@ -1161,8 +1185,9 @@ not an under-provisioning against a 4 vCPU reference on this host. It is close t
 
 #### Where this leaves the job
 
-The whole job is 630 s against GitHub-hosted's 512 s, so the excess is 118 s where the same-day
-baseline started at 237 s. Half the gap is gone and the ratio is 1.230x where it was 1.463x.
+The whole job on the best configuration measured here is 639.3 s, the mean of the three
+kernel-published runs, against GitHub-hosted's 512 s. So the excess is 127 s where the same-day
+baseline started at 237 s, and the ratio is 1.249x where it was 1.463x. That is 46% of the gap.
 
 What is left is not a list of inefficiencies that better engineering removes. It is a 3 vCPU, 6
 GiB guest on a four-core host, with storage around 100 MB per second and egress to GitHub around
