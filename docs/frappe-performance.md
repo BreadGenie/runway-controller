@@ -1344,12 +1344,16 @@ for the rest. After, all three are 1.37 to 1.39 s with a spread of 0.02 s. The h
 `image-policies.json` now lists the image with `cache_image` set, and the ZFS dataset is still
 present with a `@ready` snapshot beside it, where before it had been pruned within the hour.
 
-Two things this does not establish, both stated rather than glossed. The image was already on the
-host when these three ran, so none of them performed a cold fetch; what the three prove is that a
-retained image starts consistently fast and that the retention is now policy rather than accident.
-The causal step, that a retained image is what removes the 37 s, rests on the prune-and-refetch
-cycle already recorded above and on `ensureImage` returning early when the image is stored, not on
-these three runs.
+The causal step needed an eviction to measure rather than infer, so the image was destroyed from the
+host and one job dispatched against it. Two VMs started inside that single run:
+
+| Metal `start` phase | 28.50 s | 1.37 s |
+| --- | ---: | ---: |
+| image present or absent | absent, fetched | present |
+
+The first is the fetch, measured rather than inferred, and it lands where the earlier 37 s did. The
+host re-fetched and re-retained it, so `cache_image` survives a cold miss. That closes the caveat
+the three retained-image runs could not close on their own.
 
 And the guest got slower, which this change should not be able to cause. Over the same three runs:
 
