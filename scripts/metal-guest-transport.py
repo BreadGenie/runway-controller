@@ -972,7 +972,13 @@ def main() -> int:
                 stream.write(str(status.get('diagnostics', ''))[-131072:])
                 stream.flush()
                 os.fsync(stream.fileno())
-        print(json.dumps({'state': status['state']}))
+        # The guest's document is re-serialised rather than forwarded, so anything it
+        # reports beyond the state is dropped here unless it is asked for. That is what a
+        # silent measurement looks like: the guest measured, and this line threw it away.
+        document = {'state': status['state']}
+        if args.timings and status.get('timings_ms'):
+            document['timings_ms'] = status['timings_ms']
+        print(json.dumps(document))
         return 0
     except (subprocess.TimeoutExpired, ValueError, OSError):
         print(json.dumps({'state': 'unknown'}))

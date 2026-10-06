@@ -297,6 +297,41 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(transport.main(), 1)
             self.assertEqual(json.loads(output.getvalue()), {'state': 'unknown'})
 
+    def test_preparation_timings_survive_the_outer_hop(self):
+        # The guest measures and this process re-serialises its document, so a field that
+        # is not carried here is a measurement nobody receives. That is exactly what
+        # happened: the guest reported timings, and this hop dropped them, and the unit
+        # tests missed it because they run the guest program directly and never come
+        # through main(). So this test drives main() and reads what it prints.
+        for flag, expected in ((['--timings'], True), ([], False)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('status') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess(
+                        [], 0, '{"state":"installed","timings_ms":{"state":3}}')
+                    printed = io.StringIO()
+                    with patch.object(transport.sys, 'stdout', printed):
+                        self.assertEqual(transport.main(), 0)
+                document = json.loads(printed.getvalue())
+                self.assertEqual(document['state'], 'installed')
+                self.assertEqual('timings_ms' in document, expected)
+                if expected:
+                    self.assertEqual(document['timings_ms'], {'state': 3})
+
+    def test_a_guest_timing_nobody_asked_for_is_not_forwarded(self):
+        # A guest that reports timings unasked, which a future guest might, must not widen
+        # the status document for a caller that did not opt in.
+        with (patch.object(transport.sys, 'argv', self.arguments('status')),
+              patch.object(transport.subprocess, 'run') as run):
+            run.return_value = subprocess.CompletedProcess(
+                [], 0, '{"state":"installed","timings_ms":{"state":3}}')
+            printed = io.StringIO()
+            with patch.object(transport.sys, 'stdout', printed):
+                self.assertEqual(transport.main(), 0)
+        self.assertEqual(json.loads(printed.getvalue()), {'state': 'installed'})
+
     def test_outer_ssh_refuses_agent_forwarding_to_metal(self):
         with (patch.object(transport.sys, 'argv', self.arguments('status')),
               patch.object(transport.sys, 'stdout', io.StringIO()),
