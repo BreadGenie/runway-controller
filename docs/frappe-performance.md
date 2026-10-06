@@ -1130,6 +1130,12 @@ extraction and `yarn install` timings are consistent with that.
 
 #### Workspace tmpfs, which turned out to be much worse
 
+There is now a second, independent reason not to use this option. The bake described above puts
+the bench at `/home/runner/work/frappe/frappe`, which is where a job's workspace is, so a tmpfs
+over that directory would cover the bench and a job would find nothing there. Guest preparation
+refuses the combination, reading the bake's own manifest rather than a path written here twice, so
+the opt-in now fails loudly instead of producing a job that silently tests an empty workspace.
+
 `--workspace-tmpfs-mib` mounts a tmpfs over `/home/runner/work`, which covers the checkout, the
 action cache staging directory, `node_modules`, the Python environment and the built assets. One
 run at 2560 MiB, the most the guest's 2048 MiB reserve allows alongside the database's own 2 GiB,
@@ -1324,6 +1330,16 @@ rewrite, a Docker restart and a container start. Baking the key into the image w
 preparation with only the verification, and the restart would disappear from the critical path
 entirely. That is the same argument as the warm artifact, in the guest rather than the host, and
 it needs an image rebuild rather than a flag.
+
+That rebuild has now been made. `guest/prepare-frappe-image.sh` writes the key into the daemon
+configuration, preserving every other key and validating the file with `dockerd --validate`
+before anything is pointed at it, and records the value it reads back in the image manifest. The
+guest preparation already had the path for a configuration that already carried the setting: it
+confirms the setting and stops, rather than rewriting an identical document and restarting Docker
+for nothing. What remains is the proof, which still starts a throwaway container on a loopback
+port and requires both that the port answers and that no `docker-proxy` process was left behind.
+The saving is the Docker restart, and it has not been measured on an image that carries the key
+yet.
 
 The same run recorded 190 `status` calls at 6 to 10 ms each, which is the controller's
 three-second reconcile ticker asking a question it almost always already knows the answer to. Each

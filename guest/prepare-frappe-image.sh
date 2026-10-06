@@ -5,8 +5,9 @@
 set -euo pipefail
 set +x
 
-if [[ $# != 1 || $1 != --inside-unregistered-image-builder ]]; then
-  echo 'Usage inside an unregistered builder guest: sudo bash prepare-frappe-image.sh --inside-unregistered-image-builder' >&2
+if [[ $# -lt 1 || $# -gt 2 || $1 != --inside-unregistered-image-builder ]]; then
+  echo 'Usage inside an unregistered builder guest:' >&2
+  echo '  sudo bash prepare-frappe-image.sh --inside-unregistered-image-builder [path/to/prepare-frappe-bench.sh]' >&2
   exit 2
 fi
 if [[ $EUID != 0 ]]; then
@@ -78,10 +79,21 @@ readonly node_version=24.21.0
 readonly node_archive_name=node-v${node_version}-linux-${tool_cache_arch}.tar.xz
 readonly node_archive_url=https://nodejs.org/dist/v${node_version}/${node_archive_name}
 readonly node_archive_sha256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
-# The published image is truncated to 4 GiB by the finalizer, so leave the
-# builder room to finish the tool cache and to clean its own scratch.
-readonly published_image_bytes=4294967296
-readonly image_budget_bytes=$((3584 * 1024 * 1024))
+# uv resolves the bench tool and drives every dependency install. The workflow used to
+# fetch it per job through setup-uv; baking it removes that download.
+readonly uv_version=0.12.23
+readonly uv_archive_name=uv-x86_64-unknown-linux-gnu.tar.gz
+readonly uv_archive_url=https://github.com/astral-sh/uv/releases/download/${uv_version}/${uv_archive_name}
+readonly uv_archive_sha256=9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6
+# The finalizer truncates the published image to this size. A baked bench needs room:
+# the profile alone fills about 4.4 GiB and the bench adds roughly 1.5 GiB, which leaves
+# a job starting on the old 7.06 GiB image with barely 1.3 GiB free once the image is
+# published. Sites and the test database are then created inside that margin.
+readonly published_image_bytes=$((10 * 1024 * 1024 * 1024))
+# Headroom below the published size, for the builder to finish the tool cache and clear
+# its own scratch. The finished image is expected to land near 5.8 GiB.
+readonly image_budget_bytes=$((8 * 1024 * 1024 * 1024))
+readonly bake_script=${2:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/prepare-frappe-bench.sh}
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -260,8 +272,63 @@ install_node_toolcache() {
   "$version_path/$tool_cache_arch/bin/node" --version
 }
 
+install_uv() {
+  # uv ships a single static binary. It goes on PATH rather than in the tool cache
+  # because it is a build-time tool, not a tool a job resolves by version: nothing in
+  # the workflow asks for a particular uv through RUNNER_TOOL_CACHE.
+  if [[ -x /usr/local/bin/uv ]] && [[ $(/usr/local/bin/uv --version 2>/dev/null) == "uv $uv_version "* ]]; then
+    printf 'uv %s is already installed; leaving it untouched.\n' "$uv_version"
+    return
+  fi
+  local archive=$staging/uv.tar.gz
+  # uv publishes a digest beside every asset, so require the published digest to agree
+  # with the pin rather than trusting the download alone.
+  local published
+  published=$(curl --fail --silent --show-error --location --retry 5 \
+    "https://github.com/astral-sh/uv/releases/download/${uv_version}/${uv_archive_name}.sha256" |
+    awk -v file="$uv_archive_name" '$2 == file || $2 == "*"file {print $1}')
+  if [[ $published != "$uv_archive_sha256" ]]; then
+    echo "The uv release reports $published for $uv_archive_name; this recipe pins $uv_archive_sha256." >&2
+    exit 1
+  fi
+  curl --fail --silent --show-error --location --retry 5 --output "$archive" "$uv_archive_url"
+  printf '%s  %s\n' "$uv_archive_sha256" "$archive" | sha256sum --check --status
+  tar -xzf "$archive" --no-same-owner -C "$staging" uv-x86_64-unknown-linux-gnu/uv
+  install -m 0755 -o root -g root "$staging/uv-x86_64-unknown-linux-gnu/uv" /usr/local/bin/uv
+  rm -rf -- "$staging/uv-x86_64-unknown-linux-gnu"
+  /usr/local/bin/uv --version
+}
+
+configure_docker_port_publishing() {
+  # A published container port is translated by the kernel's own netfilter rules instead
+  # of a per-port userspace proxy process. Measured at 58.35s saved across three jobs,
+  # which is the largest single change in this image.
+  #
+  # Existing keys are preserved: this adds one setting to whatever the daemon already
+  # has rather than replacing its configuration.
+  local config=/etc/docker/daemon.json
+  python3 - "$config" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+config = Path(sys.argv[1])
+document = {}
+if config.exists():
+    document = json.loads(config.read_text())
+document['userland-proxy'] = False
+config.parent.mkdir(parents=True, exist_ok=True)
+config.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n')
+PYTHON
+  # Validated before anything is pointed at the file, so a configuration this recipe
+  # cannot vouch for stops the build rather than the first job that needs a port.
+  dockerd --validate --config-file="$config"
+}
+
 install_python_toolcache
 install_node_toolcache
+install_uv
+configure_docker_port_publishing
 # The setup actions run as the runner user and must be able to complete, extend,
 # or replace an entry they manage, exactly as on a hosted image.
 chown -R runner:runner "$tool_cache"
@@ -269,17 +336,38 @@ chown -R runner:runner "$tool_cache"
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
+# Bake the bench into the image. This is the expensive part of a Frappe job: cloning
+# the app, resolving every dependency and building production assets. Doing it once here
+# removes it from every job that later finds the bake it asked for.
+if [[ ! -f $bake_script ]]; then
+  echo "No bench bake script at $bake_script." >&2
+  echo 'Pass its path as the second argument, or run it from the checkout beside it.' >&2
+  exit 1
+fi
+bash "$bake_script" --inside-unregistered-image-builder
+
 # Measure what the image will actually carry. The extracted tool archives and the
 # downloaded packages are this script's own scratch, not image content, so the
 # private staging tree goes first; the EXIT trap then has nothing left to remove.
 rm -rf -- "$staging"
 used_bytes=$(df -B1 --output=used / | tail -n 1 | tr -cd '0-9')
 if (( used_bytes > image_budget_bytes )); then
-  echo "Root filesystem holds ${used_bytes} bytes, over the ${image_budget_bytes}-byte budget for a 4 GiB image." >&2
+  echo "Root filesystem holds ${used_bytes} bytes, over the ${image_budget_bytes}-byte budget for a $((published_image_bytes / 1024 / 1024 / 1024)) GiB image." >&2
   echo 'Give the builder a larger disk, or find which package grew the image.' >&2
   df -h /
   exit 1
 fi
+
+# Read the setting back rather than echoing what was written, so the manifest says what
+# the daemon will actually be pointed at.
+docker_userland_proxy=$(python3 -c '
+import json
+try:
+    # json.dumps so the manifest reads like the JSON key it came from.
+    print(json.dumps(json.load(open("/etc/docker/daemon.json")).get("userland-proxy")))
+except (OSError, ValueError):
+    print("absent")
+' 2>/dev/null || printf absent)
 
 # Record what this image actually contains, replacing only a previous profile
 # section so a re-run never duplicates lines. dpkg-query reports nothing for an
@@ -305,9 +393,20 @@ profile_section=$(mktemp /var/tmp/runway-frappe-profile.XXXXXX)
   printf 'TOOLCACHE_NODE_VERSION=%s\n' "$node_version"
   printf 'TOOLCACHE_NODE_URL=%s\n' "$node_archive_url"
   printf 'TOOLCACHE_NODE_SHA256=%s\n' "$node_archive_sha256"
+  printf 'UV_VERSION=%s\n' "$uv_version"
+  printf 'UV_URL=%s\n' "$uv_archive_url"
+  printf 'UV_SHA256=%s\n' "$uv_archive_sha256"
+  # The bake records its own manifest next to this one; the sealer re-checks it before
+  # publication, because an image whose bench silently disagrees with the workflow is
+  # worse than one without a bench at all.
+  printf 'FRAPPE_BENCH_BAKED=%s\n' "$([ -f /etc/runway-frappe-bench.json ] && printf yes || printf no)"
+  printf 'FRAPPE_BENCH_MANIFEST=/etc/runway-frappe-bench.json\n'
   printf 'DISTRIBUTION_NODE_VERSION=%s\n' "$(node --version 2>/dev/null || printf absent)"
   printf 'NPM_VERSION=%s\n' "$(npm --version 2>/dev/null || printf absent)"
   printf 'YARN_VERSION=%s\n' "$(yarn --version 2>/dev/null || printf absent)"
+  # Recorded because the guest preparation proves a published port answers before it
+  # starts a job, and that proof is only meaningful if the setting is already here.
+  printf 'DOCKER_USERLAND_PROXY=%s\n' "$(docker_userland_proxy)"
   # Record capacity as measured on this build. A published image is truncated to
   # the size below, so the difference is what a clone starts with; it is not a
   # promise about the space a job needs.

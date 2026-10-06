@@ -69,6 +69,7 @@ GUEST_PATHS = (
     '/var/lib/docker',
     '/etc/runway-runner-image.txt',
     '/etc/runway-container-images.json',
+    '/etc/runway-frappe-bench.json',
     '/etc/machine-id',
     '/etc/ssh',
     '/etc/hostname',
@@ -624,6 +625,12 @@ sys.exit(0)
         routed = self.route(source).replace('$EUID', str(euid))
         path = Path(self.tmp / name)
         path.write_text(routed)
+        # The sealer resolves its validator relative to itself, so the harness places
+        # it beside the routed script rather than leaving the sealer to find nothing.
+        for sibling in ('validate_bench_manifest.py',):
+            source = HERE / sibling
+            if source.exists():
+                (self.tmp / sibling).write_text(source.read_text())
         environment = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}'}
         environment.pop('EUID', None)
         return subprocess.run(['bash', str(path), *arguments], capture_output=True,
@@ -783,6 +790,51 @@ class SealTests(Harness):
         self.touch('/home/runner/actions-runner/.runner')
         self.assertEqual(self.seal(PRESERVE_FLAG).returncode, 1)
         self.assertNotIn('docker.service', self.docker_state()['stops'])
+
+    # -- the baked bench -----------------------------------------------------
+    # A Frappe image can carry a bench with or without container images, so these
+    # cases run on both seal paths.
+    def claim_bench(self):
+        manifest = Path(self.root + '/etc/runway-runner-image.txt')
+        manifest.write_text(manifest.read_text() + 'FRAPPE_BENCH_BAKED=yes\n')
+
+    def test_a_claimed_bench_with_no_manifest_is_refused_on_both_paths(self):
+        for extra in ([], [PRESERVE_FLAG]):
+            with self.subTest(preserve=bool(extra)):
+                self.setUp()
+                self.fresh_guest()
+                self.claim_bench()
+                result = self.seal(*extra)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn('No bench manifest to validate', result.stderr)
+
+    def test_a_manifest_without_a_claim_is_refused(self):
+        """A half-baked guest must not be sealed as a plain profile by accident."""
+        for extra in ([], [PRESERVE_FLAG]):
+            with self.subTest(preserve=bool(extra)):
+                self.setUp()
+                self.fresh_guest()
+                self.touch('/etc/runway-frappe-bench.json')
+                result = self.seal(*extra)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn('does not claim one', result.stderr)
+
+    def test_an_invalid_bench_manifest_is_refused_on_both_paths(self):
+        for extra in ([], [PRESERVE_FLAG]):
+            with self.subTest(preserve=bool(extra)):
+                self.setUp()
+                self.fresh_guest()
+                self.claim_bench()
+                # A claim of a bench that is not there: the validator rejects it.
+                self.touch('/etc/runway-frappe-bench.json', json.dumps({
+                    'bench_root': str(self.root + '/home/runner/work/frappe/frappe'),
+                    'frappe_commit': '4' * 40, 'frappe_ref': '4' * 40,
+                    'frappe_repository': 'https://github.com/example/frappe.git',
+                    'node_version': '24.21.0', 'python_version': '3.14.7',
+                    'size_mib': {'app': 1, 'assets': 1, 'env': 1, 'node_modules': 1}}))
+                result = self.seal(*extra)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn('/etc/runway-frappe-bench.json', result.stderr)
 
     def test_preserve_requires_the_manifest(self):
         self.fresh_guest()

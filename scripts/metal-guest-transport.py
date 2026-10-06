@@ -548,6 +548,34 @@ def create_guest_directory(path):
         return True
     except OSError:
         return False
+def baked_bench_root():
+    """The bench root this image recorded, or None when it carries no bake.
+
+    Read from the manifest rather than assumed, so an image rebuilt with the bench
+    somewhere else is judged by where it actually is.
+    """
+    manifest = Path('/etc/runway-frappe-bench.json')
+    if not manifest.is_file():
+        return None
+    try:
+        document = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        # An unreadable manifest is treated as no bake. Sealing refuses to publish one in
+        # that state, so a guest reaching here was not sealed by this repository, and
+        # keeping the workspace as it is the safer reading.
+        return None
+    root = document.get('bench_root')
+    return Path(root) if isinstance(root, str) else None
+def workspace_tmpfs_hides_bench():
+    """Whether a tmpfs over the workspace would cover a bench the image carries."""
+    bench = baked_bench_root()
+    if bench is None:
+        return False
+    try:
+        bench.relative_to(workspace)
+    except ValueError:
+        return False
+    return True
 def tmpfs_filesystem(path, source, mib):
     """Back one fresh guest directory with bounded RAM, on the first preparation.
 
@@ -627,11 +655,21 @@ if action in ('status', 'prepare'):
                 int(payload['cache_tmpfs_mib'])):
             report('unknown')
             sys.exit(1)
-        if payload.get('workspace_tmpfs_mib') and not timed(
-                'workspace_tmpfs', tmpfs_filesystem, workspace, workspace_source,
-                int(payload['workspace_tmpfs_mib'])):
-            report('unknown')
-            sys.exit(1)
+        if payload.get('workspace_tmpfs_mib'):
+            # A tmpfs over /home/runner/work would cover the bench this image carries and
+            # the job would find nothing there. The bake's manifest says where it put the
+            # bench, so the refusal follows that rather than a path written here twice.
+            if workspace_tmpfs_hides_bench():
+                print('This image carries a baked bench under ' + str(workspace)
+                      + '; a tmpfs there would hide it. Run without --workspace-tmpfs-mib.',
+                      file=sys.stderr)
+                report('unknown')
+                sys.exit(1)
+            if not timed(
+                    'workspace_tmpfs', tmpfs_filesystem, workspace, workspace_source,
+                    int(payload['workspace_tmpfs_mib'])):
+                report('unknown')
+                sys.exit(1)
     report(current)
     sys.exit(0 if action == 'status' or current == 'installed' else 1)
 if action == 'collect':

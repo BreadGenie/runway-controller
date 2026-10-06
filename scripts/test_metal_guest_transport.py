@@ -61,6 +61,7 @@ class TransportTests(unittest.TestCase):
                                          ('/etc/sudoers.d/runway-runner', root / 'sudoers/runway-runner'),
                                          ('/etc/sudoers.d', root / 'sudoers'),
                                          ('/etc/docker/daemon.json', root / 'docker/daemon.json'),
+                                         ('/etc/runway-frappe-bench.json', root / 'runway-frappe-bench.json'),
                                          ('/sys/devices/system/clocksource/clocksource0',
                                           root / 'clocksource')):
             program = program.replace(guest_path, str(private_path))
@@ -1698,6 +1699,54 @@ class TransportTests(unittest.TestCase):
                     self.assertEqual(transport.main(), 0)
                 payload = json.loads(run.call_args.kwargs['input'])
                 self.assertEqual(payload['workspace_tmpfs_mib'], int(size))
+
+    def test_workspace_tmpfs_is_refused_when_the_image_carries_a_bench(self):
+        """A tmpfs over the workspace would cover the bench, and the job would not notice."""
+        # Enough memory for the request, and findmnt answers so the guest recognises it
+        # is preparing the mount rather than running it twice.
+        meminfo = 'MemAvailable:   %d kB\n' % (6144 * 1024)
+
+        def prepare(directory, mib):
+            answers = {self.workspace_findmnt(
+                directory): [self.enclosing(), self.workspace_mounted(directory)]}
+            return self.workspace_guest(
+                directory, results=answers, meminfo=meminfo,
+                payload={'action': 'prepare', 'runner_name': 'runway-lease-123',
+                         'workspace_tmpfs_mib': mib})
+
+        # No bake in this image: the opt-in means exactly what it always meant.
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, recorded, *_ = prepare(directory, 2048)
+            self.assertEqual(code, 0, output)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+
+        with tempfile.TemporaryDirectory() as directory:
+            # The bench is under this guest's workspace, so a tmpfs over it hides the bench.
+            Path(directory, 'runway-frappe-bench.json').write_text(
+                json.dumps({'bench_root': str(self.workspace_path(directory) / 'frappe/frappe')}))
+            code, output, recorded, *_ = prepare(directory, 2048)
+            self.assertEqual(code, 1, output)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            # Refused before anything was mounted: the refusal has to leave a guest the
+            # operator can still inspect. The claim is about mounts, because the guest
+            # runs other probes first and the findmnt answers this test supplies are its
+            # own stubs rather than observations.
+            self.assertEqual(self.mount_calls(recorded), [])
+
+        # Two manifests that do not put a bench under the workspace leave the opt-in
+        # exactly as it was: one names a bench elsewhere, and one cannot be read at all.
+        # Sealing refuses to publish an unreadable manifest, so treating it as no bake is
+        # the safer reading rather than covering the workspace on a claim nobody can check.
+        for case in ('elsewhere', 'unreadable'):
+            with self.subTest(manifest=case):
+                with tempfile.TemporaryDirectory() as directory:
+                    Path(directory, 'runway-frappe-bench.json').write_text(
+                        'not json' if case == 'unreadable'
+                        else json.dumps({'bench_root': '/opt/somewhere-else/frappe'}))
+                    code, output, recorded, *_ = prepare(directory, 2048)
+                    self.assertEqual(code, 0, output)
+                    self.assertEqual(json.loads(output), {'state': 'installed'})
+                    self.assertTrue(self.mount_calls(recorded))
 
     def test_the_cache_and_the_workspace_are_exclusive_on_the_command_line_and_in_the_guest(self):
         args = self.arguments('prepare') + ['--cache-tmpfs-mib', '2048',

@@ -81,6 +81,18 @@ def main() -> int:
     )
     parser.add_argument("--bench", type=Path, required=True)
     parser.add_argument("--site", default="central.localhost")
+    # The defaults are the smallest guest this tool creates, which suits looking at a
+    # published image and nothing else. Every documented bake needs more: the Frappe
+    # profile image was built on a 10 GiB guest, because the tool cache is written and
+    # expanded inside the guest before the finalizer truncates anything, and a bench bake
+    # needs room for the framework, a virtual environment, node modules and built assets
+    # on top of that image.
+    parser.add_argument("--cpu-millicores", type=int, default=1000,
+                        help="vCPU millicores for a new VM (default 1000)")
+    parser.add_argument("--memory-mib", type=int, default=2048,
+                        help="Memory in MiB for a new VM (default 2048)")
+    parser.add_argument("--disk-mib", type=int, default=4096,
+                        help="Disk in MiB for a new VM (default 4096)")
     parser.add_argument("--team", required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument(
@@ -139,9 +151,9 @@ def main() -> int:
             }
             payload = {
                 "image_id": args.image_id,
-                "cpu_millicores": 1000,
-                "memory_mib": 2048,
-                "disk_mib": 4096,
+                "cpu_millicores": args.cpu_millicores,
+                "memory_mib": args.memory_mib,
+                "disk_mib": args.disk_mib,
                 "hostname": f"runway-{attempt[:8]}",
                 "ssh_keys": [public_key],
                 "sleep_after_idle_seconds": 0,

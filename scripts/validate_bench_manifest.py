@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Check that a runner image's baked bench is really the bench its manifest describes.
+
+Run by scripts/seal-runner-image.sh before an image is published, and independently of
+the recipe that wrote the manifest. A claim is checked against the filesystem rather
+than believed: an image whose bench disagrees with its manifest would send every job
+down a fast path that tests code the image does not contain.
+
+The expected key set is exact, as in the container-image guard: an unexpected key is the
+only way an extra field could ride into a shared artifact.
+"""
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def validate(manifest_path):
+    """Return None when the manifest describes the bench, or raise SystemExit."""
+    path = Path(manifest_path)
+
+    def fail(message):
+        print(f"{path}: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        fail(f"is not readable JSON: {error}")
+
+    if not isinstance(manifest, dict):
+        fail("is not a JSON object.")
+
+    # An exact key set, for the reason the container guard uses one: an unexpected key is
+    # the only way an extra field could ride into a shared artifact.
+    expected = {'bench_root', 'frappe_commit', 'frappe_ref', 'frappe_repository',
+                'node_version', 'python_version', 'size_mib'}
+    if set(manifest) != expected:
+        fail(f"declares keys {sorted(manifest)}, expected {sorted(expected)}.")
+
+    for key, pattern in (('frappe_commit', r'[0-9a-f]{40}'),
+                         ('frappe_ref', r'[0-9a-f]{40}'),
+                         ('frappe_repository', r'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+'),
+                         ('node_version', r'[0-9]+\.[0-9]+\.[0-9]+'),
+                         ('python_version', r'[0-9]+\.[0-9]+\.[0-9]+')):
+        if not isinstance(manifest[key], str) or not re.fullmatch(pattern, manifest[key]):
+            fail(f"has {key}={manifest[key]!r}, which is not what this sealer accepts.")
+
+    # The baked source is what a job will test against, so it is resolved from the bench
+    # itself rather than from the manifest. A manifest that claims a commit the checkout
+    # does not carry would send every job to code that is not in the image.
+    # Git refuses to read a repository owned by another account, and sealing runs as root
+    # over a checkout the runner owns, so the query is made as the owner. Blanket
+    # safe.directory would silence that check everywhere rather than for this one read.
+    sizes = manifest['size_mib']
+    if not isinstance(sizes, dict) or set(sizes) != {'app', 'assets', 'env', 'node_modules'}:
+        fail(f"declares size_mib={sorted(sizes) if isinstance(sizes, dict) else sizes!r}, "
+             "expected app, assets, env and node_modules.")
+    for key, value in sizes.items():
+        if not isinstance(value, int) or value <= 0:
+            fail(f"declares size_mib.{key}={value!r}, which is not a positive size.")
+
+    root = Path(manifest['bench_root'])
+    if not root.is_dir():
+        fail(f"names a bench root {root} that is not a directory.")
+
+    app = root / 'apps' / 'frappe'
+    try:
+        if os.geteuid() == 0:
+            # runuser rejects a bare uid, so the owning account is named before being used.
+            owner = pwd.getpwuid(app.stat().st_uid).pw_name
+            query = ['sudo', '-u', owner, '--', 'git', '-C', str(app), 'rev-parse', 'HEAD']
+        else:
+            query = ['git', '-C', str(app), 'rev-parse', 'HEAD']
+        head = subprocess.run(query, capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, KeyError, subprocess.CalledProcessError):
+        fail(f"cannot read the baked app's commit from {app}.")
+    if head != manifest['frappe_commit']:
+        fail(f"claims the app at {manifest['frappe_commit']}, but the bench carries {head}.")
+
+    # Every directory the bake promised is measured against what it recorded. A job that
+    # finds a missing virtualenv or an unbuilt asset tree fails in the middle of a test
+    # run, which is a far worse place to learn that the image was incomplete.
+    def measure(relative):
+        # Named target, not path: fail() reads path to name the manifest in its
+        # message, and shadowing it here would report the wrong file.
+        target = root / relative
+        if not target.exists():
+            fail(f"records a size for {relative}, but {target} does not exist.")
+        total = subprocess.run(['du', '-sm', str(target)], capture_output=True, text=True,
+                               check=True).stdout.split()[0]
+        return int(total)
+
+    for relative, key in (('apps/frappe', 'app'), ('env', 'env'),
+                          ('apps/frappe/node_modules', 'node_modules'),
+                          ('sites/assets', 'assets')):
+        recorded = sizes[key]
+        # du counts whole MiB and block rounding moves either way, so the check is a
+        # tolerance rather than equality: it is here to catch a truncated or absent tree,
+        # not to re-measure something the bake already measured.
+        actual = measure(relative)
+        if abs(actual - recorded) > max(64, recorded // 4):
+            fail(f"records {key} at {recorded} MiB, but {relative} measures {actual} MiB.")
+
+    print(f"Bench manifest agrees with the image: {manifest['frappe_repository']} at "
+          f"{manifest['frappe_commit'][:12]}, {sum(sizes.values())} MiB recorded.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} MANIFEST", file=sys.stderr)
+        raise SystemExit(2)
+    validate(Path(sys.argv[1]))
