@@ -406,7 +406,7 @@ profile_section=$(mktemp /var/tmp/runway-frappe-profile.XXXXXX)
   printf 'YARN_VERSION=%s\n' "$(yarn --version 2>/dev/null || printf absent)"
   # Recorded because the guest preparation proves a published port answers before it
   # starts a job, and that proof is only meaningful if the setting is already here.
-  printf 'DOCKER_USERLAND_PROXY=%s\n' "$(docker_userland_proxy)"
+  printf 'DOCKER_USERLAND_PROXY=%s\n' "$docker_userland_proxy"
   # Record capacity as measured on this build. A published image is truncated to
   # the size below, so the difference is what a clone starts with; it is not a
   # promise about the space a job needs.
