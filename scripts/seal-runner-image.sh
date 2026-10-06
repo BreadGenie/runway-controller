@@ -348,6 +348,13 @@ else
 fi
 
 systemctl stop atlas-metadata.service
+# sshd has to be stopped before the host keys go, not merely after. sshd regenerates a
+# missing host key when it starts, so deleting the files while it is still running leaves
+# a guest that grows a fresh identity minutes later: an image built this way sealed
+# cleanly and still exported a host key, and the finalizer refused it. Stopping the
+# service first is what makes the deletion the last word. The guest is disposable and is
+# destroyed after export, so nothing here is needed afterwards.
+systemctl stop ssh.service ssh.socket sshd.service 2>/dev/null || true
 rm -rf "$runner/_diag" "$runner/_work"
 apt-get clean
 rm -rf /var/lib/apt/lists/*

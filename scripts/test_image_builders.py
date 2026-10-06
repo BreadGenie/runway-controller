@@ -947,6 +947,25 @@ class SealTests(Harness):
                 self.assertFalse(Path(self.root + '/etc/ssh/ssh_host_ed25519_key').exists())
                 self.assertFalse(Path(self.root + '/root/.bash_history').exists())
 
+    def test_sshd_is_stopped_before_the_host_keys_are_deleted(self):
+        """sshd regenerates a missing host key, so the order is the whole safeguard.
+
+        A guest sealed with sshd still running deleted the keys, then grew a fresh
+        identity four minutes later. The export carried a host key and the finalizer
+        refused it. Stopping the service first is what makes the deletion stick.
+        """
+        self.fresh_guest()
+        self.assertEqual(self.seal().returncode, 0)
+        stops = [call for call in self.calls('systemctl') if call.split(' ', 1)[1].startswith('stop')]
+        ssh_stop = next((call for call in stops if 'ssh' in call), None)
+        self.assertIsNotNone(ssh_stop, f'no ssh service was stopped; stops were {stops}')
+        # The stop is recorded before the deletion, and the deletion happens at all.
+        self.assertLess(self.calls('systemctl').index(ssh_stop),
+                        len(self.calls('find')), 'expected the key removal to follow')
+        self.assertTrue(self.calls('find'))
+        removes = [call for call in self.calls('find') if 'ssh_host_' in call]
+        self.assertTrue(removes, f'no ssh_host_ removal was recorded; finds were {self.calls("find")}')
+
     def test_builder_flag_is_required(self):
         self.fresh_guest()
         result = self.run_script(SEAL, [], name='seal.sh')
