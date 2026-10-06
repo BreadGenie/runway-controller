@@ -1297,6 +1297,39 @@ This is recorded rather than fixed. The runner pool and lease code is uncommitte
 the control plane's installed app, so changing its state machine belongs with whoever owns that
 work.
 
+#### What preparation actually costs, measured from inside the guest
+
+This section replaces an estimate with a measurement. `--timings` reports what each preparation
+step cost, and one job with the port opt-in set produced exactly one prepare:
+
+| step | cost |
+| --- | ---: |
+| `kernel_publish` | 5590 ms |
+| `state` | 465 ms |
+| `grant_runner_sudo` | 77 ms |
+| whole preparation | 6132 ms |
+
+The port proof is 91% of preparation. It restarts Docker and then starts a throwaway container
+from the guest's own store and waits for its loopback port to answer, which is the price of never
+reporting success for a setting the daemon ignored.
+
+That corrects an earlier estimate in this document, which put the opt-in at about 4 s of
+provision. That figure came from comparing two runs whose Metal start phases differed by 36 s, so
+it was measuring the wrong thing. The direct figure is 5.59 s, and the honest trade is now 5.59 s
+of dispatch for 58.35 s of test phase.
+
+It also says where the next saving is, if there is one. The proof exists only because the image
+does not already carry `"userland-proxy": false`; a fresh clone therefore always pays for a
+rewrite, a Docker restart and a container start. Baking the key into the image would leave
+preparation with only the verification, and the restart would disappear from the critical path
+entirely. That is the same argument as the warm artifact, in the guest rather than the host, and
+it needs an image rebuild rather than a flag.
+
+The same run recorded 190 `status` calls at 6 to 10 ms each, which is the controller's
+three-second reconcile ticker asking a question it almost always already knows the answer to. Each
+is cheap in the guest and more expensive in SSH, and nothing here suggests it is worth changing.
+
+
 #### The image retention fix, verified
 
 The 37 s start described above was `cache_image`, and it is fixed. Three runs after the host was
