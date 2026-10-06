@@ -1297,6 +1297,45 @@ This is recorded rather than fixed. The runner pool and lease code is uncommitte
 the control plane's installed app, so changing its state machine belongs with whoever owns that
 work.
 
+#### The image retention fix, verified
+
+The 37 s start described above was `cache_image`, and it is fixed. Three runs after the host was
+told to retain the image:
+
+| Metal `start` phase | 1.37 s | 1.39 s | 1.37 s |
+| --- | ---: | ---: | ---: |
+| slow starts | 0 of 3 | | |
+
+Before, two of five consecutive starts had cost 37.12 s and 37.76 s against 1.40, 1.40 and 1.39 s
+for the rest. After, all three are 1.37 to 1.39 s with a spread of 0.02 s. The host's
+`image-policies.json` now lists the image with `cache_image` set, and the ZFS dataset is still
+present with a `@ready` snapshot beside it, where before it had been pruned within the hour.
+
+Two things this does not establish, both stated rather than glossed. The image was already on the
+host when these three ran, so none of them performed a cold fetch; what the three prove is that a
+retained image starts consistently fast and that the retention is now policy rather than accident.
+The causal step, that a retained image is what removes the 37 s, rests on the prune-and-refetch
+cycle already recorded above and on `ensureImage` returning early when the image is stored, not on
+these three runs.
+
+And the guest got slower, which this change should not be able to cause. Over the same three runs:
+
+| measurement | kernel-published baseline | these three runs |
+| --- | ---: | ---: |
+| provision | 28.31 s | 29.41 s, sd 1.08 s |
+| Environment Setup | 168.50 s | 174.97 s |
+| Run Tests | 426.78 s | 438.32 s |
+| whole job | 639.3 s | 660 s |
+
+Provision is unchanged within its own spread, which is the phase this fix acts on. The test phase
+is 11.54 s slower and Environment Setup 6.47 s slower, so the job is about 21 s slower, and
+nothing here explains it. `cache_image` only affects whether the host fetches an artifact before
+the guest exists, so it cannot reach the guest's own execution, but a retained 9.7 GB image does
+compete with the host's page cache and this is the shape that would show it if it were real. It is
+recorded as an open question rather than a cost, because one afternoon of three runs cannot
+separate it from ordinary drift in a guest whose egress to GitHub varies by threefold.
+
+
 #### vCPU pinning does not exist, and this host is not the configuration people warn about
 
 Firecracker does not pin vCPU threads to cores. Its affinity is NUMA-node granularity, and the

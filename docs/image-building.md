@@ -147,7 +147,7 @@ Whether the image is already stored is a policy decision, not a side effect. The
 
 So the published image needs `cache_image` set on its record. With the current publisher that is a field on the image rather than an argument, so it has to be ticked on the record after publishing, and it has to be verified rather than assumed, because an image that looks published and is not in any host's policy fails open: the first job after a prune is slow and nothing reports an error.
 
-Two checks, in order. Read the image record and confirm `cache_image` is set. Then read the host's `/var/lib/metal/image-policies.json` and confirm the image's reference appears in it, because that file is what Metal actually acts on and it is the only one of the two that proves the host was told.
+This is worth doing: with the flag unset, two of five consecutive starts on one host paid an extra 37 s inside Metal's start phase, and with it set three consecutive starts were 1.37, 1.39 and 1.37 s. The measurement is in [the performance report](frappe-performance.md). Two checks, in order. Read the image record and confirm `cache_image` is set. Then read the host's `/var/lib/metal/image-policies.json` and confirm the image's reference appears in it, because that file is what Metal actually acts on and it is the only one of the two that proves the host was told.
 
 ### Ask for a warm artifact, and what it commits you to
 
