@@ -59,6 +59,14 @@ This recipe installs dependencies, and then the bench. `uv` is now baked rather 
 
 Two things about the bake are deliberate. The bench lives at the workspace path rather than a fixed directory, because a virtualenv carries absolute paths and a bench moved after the fact produces an interpreter that cannot import its own site-packages. And the app's remote is repointed at GitHub, because `bench init` leaves it pointing at the build-time staging directory, which the bake then deletes; a manifest check later refuses an image where any remote still names that path.
 
+The bake also leaves a compressed copy at `/opt/runway/bench.tar.zst`, outside any
+workspace, and records its digest and size in the manifest. That is not redundancy for its
+own sake: a job's own checkout clears its workspace, and a real job found the bench gone by
+the time it looked while the manifest beside the image still claimed one. Nothing a job
+does can reach the archive, so the setup action restores from it when the workspace has no
+bench, after checking the digest against the manifest. An archive that does not match is a
+different artifact, and restoring it would run code nobody vouched for.
+
 `scripts/validate_bench_manifest.py` decides whether a claimed bake is real, and `seal-runner-image.sh` runs it before publication. It checks the manifest's key set exactly, so an unexpected field cannot ride into a shared artifact, resolves the app's commit from the bench itself rather than believing the manifest, and compares the recorded sizes against the filesystem. That is deliberately not the recipe that wrote the manifest checking its own work: an image whose bench disagrees with its manifest would send every job down a fast path that tests code the image does not contain, which is a worse failure than having no bake at all.
 
 After sealing and publishing, verify a fresh clone by reading the manifest, running the tool cache `python3.14` and `node` by path, `yarn --version`, `psql --version`, `mariadb --version`, and `wkhtmltopdf --version`, confirming both tool cache entries belong to the runner user, and confirming `.runner` and `.credentials` are still absent.

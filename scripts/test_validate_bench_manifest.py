@@ -6,6 +6,7 @@ bench-shaped tree with a real git checkout, because the validator resolves the a
 itself and would pass a fake one for the wrong reason.
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -55,7 +56,12 @@ def build_bench(root, sizes=None, **overrides):
     head = subprocess.run(["git", "-C", str(app), "rev-parse", "HEAD"], check=True,
                           capture_output=True, text=True, env=env).stdout.strip()
 
+    archive = root.parent / "bench.tar.zst"
+    archive.write_bytes(b"a compressed bench")
+
     manifest = {
+        "archive": {"path": str(archive), "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                    "bytes": archive.stat().st_size},
         "bench_root": str(root),
         "frappe_commit": overrides.pop("frappe_commit", head),
         "frappe_ref": head,
@@ -152,6 +158,28 @@ class ValidateBenchManifestTest(unittest.TestCase):
         data["size_mib"]["assets"] = 0
         manifest.write_text(json.dumps(data))
         self.assertRejected(manifest, "not a positive size")
+
+    def test_rejects_an_archive_whose_digest_does_not_match(self):
+        manifest = build_bench(self.root)
+        data = json.loads(manifest.read_text())
+        data["archive"]["sha256"] = "0" * 64
+        manifest.write_text(json.dumps(data))
+        self.assertRejected(manifest, "but it hashes to")
+
+    def test_rejects_an_archive_that_is_not_there(self):
+        manifest = build_bench(self.root)
+        data = json.loads(manifest.read_text())
+        Path(data["archive"]["path"]).unlink()
+        self.assertRejected(manifest, "not a file")
+
+    def test_rejects_a_manifest_without_an_archive(self):
+        # The bake always records one; its absence means the image was not built by the
+        # recipe this validator understands, and a job would have nothing to restore from.
+        manifest = build_bench(self.root)
+        data = json.loads(manifest.read_text())
+        del data["archive"]
+        manifest.write_text(json.dumps(data))
+        self.assertRejected(manifest, "declares keys")
 
     def test_command_line_requires_a_manifest_argument(self):
         self.assertEqual(subprocess.run([sys.executable, str(VALIDATOR)],

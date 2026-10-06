@@ -9,6 +9,7 @@ down a fast path that tests code the image does not contain.
 The expected key set is exact, as in the container-image guard: an unexpected key is the
 only way an extra field could ride into a shared artifact.
 """
+import hashlib
 import json
 import os
 import pwd
@@ -36,7 +37,7 @@ def validate(manifest_path):
 
     # An exact key set, for the reason the container guard uses one: an unexpected key is
     # the only way an extra field could ride into a shared artifact.
-    expected = {'bench_root', 'frappe_commit', 'frappe_ref', 'frappe_repository',
+    expected = {'archive', 'bench_root', 'frappe_commit', 'frappe_ref', 'frappe_repository',
                 'node_version', 'python_version', 'size_mib'}
     if set(manifest) != expected:
         fail(f"declares keys {sorted(manifest)}, expected {sorted(expected)}.")
@@ -62,6 +63,30 @@ def validate(manifest_path):
     for key, value in sizes.items():
         if not isinstance(value, int) or value <= 0:
             fail(f"declares size_mib.{key}={value!r}, which is not a positive size.")
+
+    # The archive is what a job restores from when its own workspace has been cleared, so
+    # the copy this seal vouches for has to be the copy a job will read: the recorded
+    # digest is checked against the bytes on disk rather than trusted.
+    archive = manifest['archive']
+    if not isinstance(archive, dict) or set(archive) != {'path', 'sha256', 'bytes'}:
+        fail(f"declares archive={sorted(archive) if isinstance(archive, dict) else archive!r}, "
+             "expected path, sha256 and bytes.")
+    if not re.fullmatch(r'[0-9a-f]{64}', archive['sha256']):
+        fail(f"declares an archive digest {archive['sha256']!r}, which is not a sha256.")
+    if not isinstance(archive['bytes'], int) or archive['bytes'] <= 0:
+        fail(f"declares archive bytes={archive['bytes']!r}, which is not a size.")
+    archive_path = Path(archive['path'])
+    if not archive_path.is_file():
+        fail(f"names an archive {archive_path} that is not a file.")
+    if archive_path.stat().st_size != archive['bytes']:
+        fail(f"records the archive at {archive['bytes']} bytes, but it is "
+             f"{archive_path.stat().st_size}.")
+    digest = hashlib.sha256()
+    with archive_path.open('rb') as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+            digest.update(block)
+    if digest.hexdigest() != archive['sha256']:
+        fail(f"records the archive at {archive['sha256']}, but it hashes to {digest.hexdigest()}.")
 
     root = Path(manifest['bench_root'])
     if not root.is_dir():
@@ -106,7 +131,8 @@ def validate(manifest_path):
             fail(f"records {key} at {recorded} MiB, but {relative} measures {actual} MiB.")
 
     print(f"Bench manifest agrees with the image: {manifest['frappe_repository']} at "
-          f"{manifest['frappe_commit'][:12]}, {sum(sizes.values())} MiB recorded.")
+          f"{manifest['frappe_commit'][:12]}, {sum(sizes.values())} MiB recorded, "
+      f"archive {archive['bytes'] // (1024 * 1024)} MiB.")
 
 
 if __name__ == "__main__":

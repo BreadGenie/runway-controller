@@ -56,7 +56,15 @@ readonly frappe_ref=${frappe_ref:-${FRAPPE_REF:-4423d0a362a702a20f4eee68470ef146
 # else has to be rewritten before a job can use it. Building it exactly where the job
 # looks removes that whole class of problem, at the cost of the image belonging to one
 # repository.
-readonly bench_root=/home/runner/work/frappe/frappe
+#
+# The path is the runner's, not a guess. GitHub Actions sets GITHUB_WORKSPACE to
+# $RUNNER_WORKSPACE/<repository name>, and RUNNER_WORKSPACE defaults to the runner's own
+# _work directory. A first attempt used /home/runner/work instead, and every job failed
+# with the local action missing, because the bake had been built one directory away from
+# where the runner looks for it.
+readonly runner_workspace=${RUNNER_WORKSPACE:-/home/runner/actions-runner/_work}
+readonly bench_repository=${FRAPPE_BENCH_REPOSITORY:-frappe}
+readonly bench_root=$runner_workspace/$bench_repository/$bench_repository
 readonly bench_manifest=/etc/runway-frappe-bench.json
 readonly tool_cache=${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}
 readonly python_version=3.14.7
@@ -98,8 +106,8 @@ if [[ -e $bench_root && -n $(find "$bench_root" -mindepth 1 -maxdepth 1 -print -
 fi
 # The workspace tmpfs opt-in mounts over this directory and would hide the bake, so a
 # guest asked to do both would publish an image whose bench no job can see.
-mountpoint -q /home/runner/work && {
-  echo 'Refusing to bake under a mounted /home/runner/work; the bake would be hidden by it.' >&2
+mountpoint -q "$runner_workspace" && {
+  echo "Refusing to bake under a mounted $runner_workspace; the bake would be hidden by it." >&2
   exit 1
 }
 
@@ -113,7 +121,7 @@ done
 # virtual environment, the node modules, the built assets and the bench scaffolding.
 # The site's database is deliberately absent: a baked one carries whatever the builder
 # did to it, and only a database created by the job can be trusted to start clean.
-install -d -m 0755 -o runner -g runner "$bench_root" /home/runner/work/frappe
+install -d -m 0755 -o runner -g runner "$bench_root" "$runner_workspace/$bench_repository"
 
 # The build runs as the account the job runs as, because a bench the job cannot write
 # is a bench the job cannot use.
@@ -232,16 +240,32 @@ baked_commit=$(run_as_runner git -C "$bench_root/apps/frappe" rev-parse HEAD)
   exit 1
 }
 
+echo 'Archiving the bench outside the workspace'
+# A job's own checkout clears its workspace, so a bench that exists only there is gone by
+# the time the job looks for it. This is not a theory: a real job found the workspace
+# emptied while the manifest beside the image still claimed a bake. The archive lives
+# outside any workspace, so nothing a job does can reach it, and the setup action restores
+# from it when the bench is missing.
+readonly bench_archive=/opt/runway/bench.tar.zst
+install -d -m 0755 -o root -g root /opt/runway
+tar -C "$bench_root" --exclude=logs --exclude=*.log -cf - . | gzip -6 > "$bench_archive"
+chown root:root "$bench_archive"
+chmod 0644 "$bench_archive"
+archive_bytes=$(stat -c %s "$bench_archive")
+archive_sha256=$(sha256sum "$bench_archive" | cut -d" " -f1)
+printf 'Archived %s bytes of bench to %s\n' "$archive_bytes" "$bench_archive"
+
 echo 'Recording what this image carries'
 # Measured from the build that just ran, so the manifest describes the artifact rather
 # than the recipe's intentions. The sealer re-checks these against the filesystem before
 # anything is destroyed, because the guard deciding what enters a public image must not
 # be satisfied by the script that produced its contents.
 python3 - "$bench_manifest" "$frappe_repo" "$frappe_ref" "$commit" \
-  "$python_version" "$node_version" "$bench_root" <<'PYTHON'
+  "$python_version" "$node_version" "$bench_root" "$bench_archive" "$archive_sha256" "$archive_bytes" <<'PYTHON'
 import json, os, subprocess, sys
 
 path, repo, ref, commit, python_version, node_version, bench_root = sys.argv[1:8]
+archive_path, archive_sha256, archive_bytes = sys.argv[8:11]
 
 
 def size_mib(relative):
@@ -259,6 +283,11 @@ document = {
     'python_version': python_version,
     'node_version': node_version,
     'bench_root': bench_root,
+    'archive': {
+        'path': archive_path,
+        'sha256': archive_sha256,
+        'bytes': archive_bytes,
+    },
     'size_mib': {
         'app': size_mib('apps/frappe'),
         'env': size_mib('env'),
