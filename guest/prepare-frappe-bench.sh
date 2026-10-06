@@ -218,6 +218,15 @@ fi
 # A manifest describing an incomplete bench would let the sealer publish an image whose
 # fast path fails on the first job that takes it.
 missing=0
+# These five are bench's own requirement, taken from paths_in_bench in the tool that is
+# about to consume this directory. Checking only the paths this script uses let an archive
+# through that bench would not recognise.
+for required in apps sites config logs config/pids; do
+  if [[ ! -e $bench_root/$required ]]; then
+    echo "The bake is missing $required, which bench requires of a bench directory." >&2
+    missing=1
+  fi
+done
 for required in \
   "$bench_root/env/bin/python" \
   "$bench_root/apps/frappe/frappe/__init__.py" \
@@ -246,9 +255,13 @@ echo 'Archiving the bench outside the workspace'
 # emptied while the manifest beside the image still claimed a bake. The archive lives
 # outside any workspace, so nothing a job does can reach it, and the setup action restores
 # from it when the bench is missing.
-readonly bench_archive=/opt/runway/bench.tar.zst
+readonly bench_archive=/opt/runway/bench.tar.gz
 install -d -m 0755 -o root -g root /opt/runway
-tar -C "$bench_root" --exclude=logs --exclude=*.log -cf - . | gzip -6 > "$bench_archive"
+# Log files are left out; the directories they live in are not, because bench refuses to
+# run in a directory missing any of apps, sites, config, logs or config/pids. Excluding
+# logs produced an archive that restored into a directory bench would not recognise, and
+# every later command failed with "Command not being executed in bench directory".
+tar -C "$bench_root" --exclude=*.log -cf - . | gzip -6 > "$bench_archive"
 chown root:root "$bench_archive"
 chmod 0644 "$bench_archive"
 archive_bytes=$(stat -c %s "$bench_archive")
@@ -265,7 +278,11 @@ python3 - "$bench_manifest" "$frappe_repo" "$frappe_ref" "$commit" \
 import json, os, subprocess, sys
 
 path, repo, ref, commit, python_version, node_version, bench_root = sys.argv[1:8]
-archive_path, archive_sha256, archive_bytes = sys.argv[8:11]
+archive_path, archive_sha256 = sys.argv[8:10]
+# Typed here, not in the shell: an argument arrives as a string, and the sealer
+# requires a size, so a manifest written without this fails the seal it is about to
+# have to pass.
+archive_bytes = int(sys.argv[10])
 
 
 def size_mib(relative):
