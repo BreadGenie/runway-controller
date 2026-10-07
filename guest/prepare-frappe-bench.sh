@@ -121,16 +121,16 @@ mountpoint -q "$runner_workspace" && {
   echo "Refusing to bake under a mounted $runner_workspace; the bake would be hidden by it." >&2
   exit 1
 }
-# apt drops to the _apt account to verify a repository signature and writes its temporary
-# configuration through /tmp, so a /tmp that account cannot write makes every repository
-# report "not signed" and the build fails on an apt error that names nothing real. A guest
-# reached here with the wrong mode has been built wrong; correcting it here is a decision
-# about this guest, not a repair, so it is stated rather than done silently.
+# The base image ships /tmp as ubuntu at 775. The profile step repairs it before its own
+# apt, but a bake can be run on its own against a throwaway guest, and then nothing has
+# repaired it: apt drops to the _apt account to verify a signature and writes through
+# /tmp, so every repository reports "not signed" and the failure names nothing real.
+# Repaired here for the same reason as there, and reported because a guest that arrived
+# wrong is worth knowing about.
 if [[ $(stat -c %a /tmp) != 1777 || $(stat -c %U /tmp) != root ]]; then
-  echo "/tmp is $(stat -c '%U:%a' /tmp), not root:1777." >&2
-  echo 'apt verifies repository signatures as _apt and needs to write there. Fix it with:' >&2
-  echo '  chown root:root /tmp && chmod 1777 /tmp' >&2
-  exit 1
+  echo "Repairing /tmp, which is $(stat -c '%U:%a' /tmp) rather than root:1777." >&2
+  chown root:root /tmp
+  chmod 1777 /tmp
 fi
 
 readonly python_bin=$tool_cache/Python/$python_version/x64/bin/python3
@@ -144,6 +144,13 @@ done
 # The site's database is deliberately absent: a baked one carries whatever the builder
 # did to it, and only a database created by the job can be trusted to start clean.
 install -d -m 0755 -o runner -g runner "$bench_root" "$runner_workspace/$bench_repository"
+# The work folder itself has to belong to the runner too, and not only the bench below it.
+# The runner creates _tool inside it as the runner account, so a root-owned work folder
+# fails the job at startup with UnauthorizedAccessException on /home/runner/work/_tool,
+# before a single step runs and with nothing in the job log to explain it. Measured on the
+# image built from this recipe: the bench directories were runner-owned and the job still
+# could not start.
+install -d -m 0755 -o runner -g runner "$runner_workspace"
 
 # The build runs as the account the job runs as, because a bench the job cannot write
 # is a bench the job cannot use.
