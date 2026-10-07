@@ -8,8 +8,11 @@
 #
 # The dependency profile installs packages; this installs the application. Every job
 # otherwise pays to clone the framework, build a virtual environment, install the
-# Python and Node dependencies and build the assets, which on this benchmark is about
-# 85 seconds of a 160 second gap against a hosted runner.
+# Python and Node dependencies and build the assets. Measured over three disposable
+# guests on the published image, Environment Setup averaged 82 s with this bake against
+# 191 s for the same guest without it, so this is the work worth about 109 s of a job.
+# The in-guest A/B for the bake step alone was 113 s against 23 s. Both are recorded in
+# docs/frappe-performance.md; the test phase is untouched by any of it.
 #
 # The bench is produced by running the same bench commands the workflow runs, not by
 # assembling the directories they produce. A hand-built approximation would be a
@@ -58,11 +61,19 @@ readonly frappe_ref=${frappe_ref:-${FRAPPE_REF:-4423d0a362a702a20f4eee68470ef146
 # repository.
 #
 # The path is the runner's, not a guess. GitHub Actions sets GITHUB_WORKSPACE to
-# $RUNNER_WORKSPACE/<repository name>, and RUNNER_WORKSPACE defaults to the runner's own
-# _work directory. A first attempt used /home/runner/work instead, and every job failed
-# with the local action missing, because the bake had been built one directory away from
-# where the runner looks for it.
-readonly runner_workspace=${RUNNER_WORKSPACE:-/home/runner/actions-runner/_work}
+# $RUNNER_WORKSPACE/<repository name>, and Runway's controller asks for the absolute
+# work folder /home/runner/work (controller_engine.go, guestWorkFolder) so that cached
+# artifacts are restorable across runner types. That is the default here, and it has to
+# be: the alternative, the runner's own relative _work, builds the bench one directory
+# away from where a Runway job looks, and a bench is not relocatable. Both directions of
+# that mistake were measured on the published image. Built under actions-runner/_work
+# and restored into /home/runner/work, the archive extracts cleanly and its virtualenv
+# still cannot import frappe, because site-packages/frappe.pth names the build path.
+# So a job's fast path would have been reported usable and then failed at Create Site.
+#
+# RUNNER_WORKSPACE is honoured when set, so a build for a differently laid out runner
+# is still possible, but it is not how this image is produced.
+readonly runner_workspace=${RUNNER_WORKSPACE:-/home/runner/work}
 readonly bench_repository=${FRAPPE_BENCH_REPOSITORY:-frappe}
 readonly bench_root=$runner_workspace/$bench_repository/$bench_repository
 readonly bench_manifest=/etc/runway-frappe-bench.json
@@ -110,6 +121,17 @@ mountpoint -q "$runner_workspace" && {
   echo "Refusing to bake under a mounted $runner_workspace; the bake would be hidden by it." >&2
   exit 1
 }
+# apt drops to the _apt account to verify a repository signature and writes its temporary
+# configuration through /tmp, so a /tmp that account cannot write makes every repository
+# report "not signed" and the build fails on an apt error that names nothing real. A guest
+# reached here with the wrong mode has been built wrong; correcting it here is a decision
+# about this guest, not a repair, so it is stated rather than done silently.
+if [[ $(stat -c %a /tmp) != 1777 || $(stat -c %U /tmp) != root ]]; then
+  echo "/tmp is $(stat -c '%U:%a' /tmp), not root:1777." >&2
+  echo 'apt verifies repository signatures as _apt and needs to write there. Fix it with:' >&2
+  echo '  chown root:root /tmp && chmod 1777 /tmp' >&2
+  exit 1
+fi
 
 readonly python_bin=$tool_cache/Python/$python_version/x64/bin/python3
 readonly node_root=$tool_cache/node/$node_version/x64
@@ -258,15 +280,29 @@ echo 'Archiving the bench outside the workspace'
 readonly bench_archive=/opt/runway/bench.tar.gz
 install -d -m 0755 -o root -g root /opt/runway
 # Log files are left out; the directories they live in are not, because bench refuses to
-# run in a directory missing any of apps, sites, config, logs or config/pids. Excluding
-# logs produced an archive that restored into a directory bench would not recognise, and
-# every later command failed with "Command not being executed in bench directory".
-tar -C "$bench_root" --exclude=*.log -cf - . | gzip -6 > "$bench_archive"
+# run in a directory missing any of apps, sites, config, logs or config/pids. An archive
+# that restored into a directory bench would not recognise failed every later command with
+# "Command not being executed in bench directory". The pattern is quoted because an
+# unquoted *.log is subject to the caller's globbing, which would exclude whatever files
+# the build directory happened to contain. The check after this line is what guarantees
+# the directories survived.
+tar -C "$bench_root" --exclude='*.log' -cf - . | gzip -6 > "$bench_archive"
 chown root:root "$bench_archive"
 chmod 0644 "$bench_archive"
 archive_bytes=$(stat -c %s "$bench_archive")
 archive_sha256=$(sha256sum "$bench_archive" | cut -d" " -f1)
 printf 'Archived %s bytes of bench to %s\n' "$archive_bytes" "$bench_archive"
+
+# The archive is checked by a script of its own, because the check is about what the tar
+# wrote rather than about the directory it was written from, and the only way to test that
+# distinction is to call the check directly. It is resolved beside this one, the way the
+# sealer resolves its validator.
+readonly archive_checker=${BASH_SOURCE[0]%/*}/../scripts/check_bench_archive.sh
+[[ -f $archive_checker ]] || {
+  echo "check_bench_archive.sh is missing beside the bake at $archive_checker." >&2
+  exit 1
+}
+bash "$archive_checker" "$bench_archive"
 
 echo 'Recording what this image carries'
 # Measured from the build that just ran, so the manifest describes the artifact rather

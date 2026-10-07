@@ -50,12 +50,6 @@ def validate(manifest_path):
         if not isinstance(manifest[key], str) or not re.fullmatch(pattern, manifest[key]):
             fail(f"has {key}={manifest[key]!r}, which is not what this sealer accepts.")
 
-    # The baked source is what a job will test against, so it is resolved from the bench
-    # itself rather than from the manifest. A manifest that claims a commit the checkout
-    # does not carry would send every job to code that is not in the image.
-    # Git refuses to read a repository owned by another account, and sealing runs as root
-    # over a checkout the runner owns, so the query is made as the owner. Blanket
-    # safe.directory would silence that check everywhere rather than for this one read.
     sizes = manifest['size_mib']
     if not isinstance(sizes, dict) or set(sizes) != {'app', 'assets', 'env', 'node_modules'}:
         fail(f"declares size_mib={sorted(sizes) if isinstance(sizes, dict) else sizes!r}, "
@@ -95,7 +89,11 @@ def validate(manifest_path):
     app = root / 'apps' / 'frappe'
     try:
         if os.geteuid() == 0:
-            # runuser rejects a bare uid, so the owning account is named before being used.
+            # Git refuses to read a repository owned by another account, and sealing runs as
+            # root over a checkout the runner owns, so the query is made as the owner rather
+            # than with a blanket safe.directory, which would silence that check everywhere
+            # instead of for this one read. runuser rejects a bare uid, so the account is
+            # named first.
             owner = pwd.getpwuid(app.stat().st_uid).pw_name
             query = ['sudo', '-u', owner, '--', 'git', '-C', str(app), 'rev-parse', 'HEAD']
         else:
@@ -130,9 +128,12 @@ def validate(manifest_path):
         if abs(actual - recorded) > max(64, recorded // 4):
             fail(f"records {key} at {recorded} MiB, but {relative} measures {actual} MiB.")
 
+    # node_modules is measured inside apps/frappe, so summing the four records would count
+    # it twice and report a size the bench does not occupy.
+    total = sizes['app'] + sizes['env'] + sizes['assets']
     print(f"Bench manifest agrees with the image: {manifest['frappe_repository']} at "
-          f"{manifest['frappe_commit'][:12]}, {sum(sizes.values())} MiB recorded, "
-      f"archive {archive['bytes'] // (1024 * 1024)} MiB.")
+          f"{manifest['frappe_commit'][:12]}, {total} MiB recorded, "
+          f"archive {archive['bytes'] // (1024 * 1024)} MiB.")
 
 
 if __name__ == "__main__":

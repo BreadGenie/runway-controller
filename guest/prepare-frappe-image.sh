@@ -301,8 +301,9 @@ install_uv() {
 
 configure_docker_port_publishing() {
   # A published container port is translated by the kernel's own netfilter rules instead
-  # of a per-port userspace proxy process. Measured at 58.35s saved across three jobs,
-  # which is the largest single change in this image.
+  # of a per-port userspace proxy process. Measured at 58.35s saved across three jobs.
+  # The baked bench saves more than this, about 109 s of setup, and it is the reason the
+  # image exists; this one is simply a setting that costs nothing to carry.
   #
   # Existing keys are preserved: this adds one setting to whatever the daemon already
   # has rather than replacing its configuration.

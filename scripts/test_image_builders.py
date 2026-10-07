@@ -13,6 +13,7 @@ belongs in the test tree. Without that rule, a path added later would quietly be
 followed onto the real host by a test that believed it was isolated.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 GUEST = HERE.parent / 'guest'
 PREPARE = GUEST / 'prepare-frappe-container-images.sh'
 SEAL = HERE / 'seal-runner-image.sh'
+BAKE = GUEST / 'prepare-frappe-bench.sh'
 FINALIZE = HERE / 'finalize-runner-image.sh'
 
 BUILDER_FLAG = '--inside-unregistered-image-builder'
@@ -54,6 +56,17 @@ IMAGE_IDS = {reference: f'sha256:{index:064x}' for index, reference in enumerate
 # Absolute guest paths a builder may mention, longest first so a prefix never shadows
 # a longer path during substitution.
 GUEST_PATHS = (
+    # The work folder the controller asks a Runway JIT runner for, which is where the
+    # bake builds and where a job looks. It has to be owned here for the same reason
+    # actions-runner/_work is: the bake writes it, so a test that left it unrouted would
+    # write to the host running the suite.
+    '/home/runner/work',
+    '/opt/runway',
+    # The profile's toolchain. The bake refuses to start without these three, so a test
+    # that reaches a later guard has to provide them, and providing them unrouted would
+    # write to whatever python3 the machine running the tests happens to have.
+    '/opt/hostedtoolcache',
+    '/usr/local/bin',
     '/home/runner/actions-runner/_work',
     '/home/runner/actions-runner/_diag',
     '/home/runner/actions-runner/.credentials_rsaparams',
@@ -93,8 +106,13 @@ GUEST_PATHS = (
     '/tmp',
 )
 
-# Directories a builder is allowed to name without the harness owning them.
-READ_ONLY_PREFIXES = ('/home/runner/actions-runner/bin',)
+# Names a builder may use without the harness owning them. A repository URL is here for
+# the same reason as the runner's bin: it is a name the recipe reads out of a manifest and
+# hands to git, never a path on this machine, and the self-check cannot tell a URL from a
+# directory. `/..` is the relative hop the bake takes to reach a script it ships beside
+# itself; routing it would turn the hop into the private root and break the very lookup it
+# is meant to preserve.
+READ_ONLY_PREFIXES = ('/home/runner/actions-runner/bin', '/github.com', '/..')
 
 ABSOLUTE = re.compile(r'(?<![\w.~$-])/(?:[A-Za-z0-9_.+-]+/?)+')
 KNOWN_PREFIXES = tuple(GUEST_PATHS) + READ_ONLY_PREFIXES
@@ -621,9 +639,12 @@ sys.exit(0)
         self.assertFalse(leftover, f'{source.name} still names host paths: {leftover}')
         return routed
 
-    def run_script(self, source, arguments, *, euid=0, name='builder.sh'):
+    def run_script(self, source, arguments, *, euid=0, name='builder.sh', in_guest_dir=False):
+        # in_guest_dir writes the script to <tmp>/guest/<name>, so a script that resolves a
+        # helper at ../scripts/ finds one the harness placed at <tmp>/scripts/. Without it the
+        # bake's archive checker resolves outside the private tree.
         routed = self.route(source).replace('$EUID', str(euid))
-        path = Path(self.tmp / name)
+        path = Path(self.tmp / name) if not in_guest_dir else Path(self.tmp / 'guest' / name)
         path.write_text(routed)
         # The sealer resolves its validator relative to itself, so the harness places
         # it beside the routed script rather than leaving the sealer to find nothing.
@@ -760,6 +781,7 @@ class PrepareRecipeTests(Harness):
         self.assertIn('requires root', not_root.stderr)
 
 
+
 class SealTests(Harness):
     def seal(self, *extra, euid=0):
         return self.run_script(SEAL, [BUILDER_FLAG, *extra], euid=euid, name='seal.sh')
@@ -819,22 +841,104 @@ class SealTests(Harness):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn('does not claim one', result.stderr)
 
-    def test_an_invalid_bench_manifest_is_refused_on_both_paths(self):
+    def bench_size_mib(self, bench, key):
+        """The measured size of each tree the manifest records, in whole MiB.
+
+        The validator compares each record against `du -sm` with a tolerance, so a fixture has
+        to state what that measurement says rather than a guessed number; recording 1 MiB for
+        an empty tree tripped the check before the test reached the guard it names.
+
+        The same `du` the validator will use is the one this asks, by name, out of the
+        harness's own bin directory. Under test PATH that is the mock, which answers with the
+        builder's recorded figures; calling the system binary instead made the fixture and the
+        validator disagree about the same tree, which is a failure of the fixture and not
+        something the guard under test should be judged on.
+        """
+        relative = {'app': 'apps/frappe', 'assets': 'sites/assets', 'env': 'env',
+                    'node_modules': 'apps/frappe/node_modules'}[key]
+        du = shutil.which('du', path=self.bin)
+        return int(subprocess.run([du, '-sm', str(bench / relative)], capture_output=True,
+                                  text=True, check=True).stdout.split()[0])
+
+    def write_valid_bench_manifest(self, **changes):
+        """Write a manifest that satisfies every check, then apply `changes` to it.
+
+        The archive, the bench directory and its git checkout all have to exist, because
+        the validator checks them in that order and stops at the first failure. A fixture
+        that omits the archive stops at the key set, and a test asserting on a later check
+        then passes for the wrong reason: it never exercised the guard it names.
+        """
+        bench = Path(self.root + '/home/runner/work/frappe/frappe')
+        for directory in ('apps/frappe', 'sites/assets', 'config', 'logs', 'config/pids'):
+            (bench / directory).mkdir(parents=True, exist_ok=True)
+        (bench / 'env/bin').mkdir(parents=True, exist_ok=True)
+        (bench / 'env/bin/python').write_text('#!/bin/sh\n')
+        (bench / 'apps/frappe/frappe').mkdir(parents=True, exist_ok=True)
+        (bench / 'apps/frappe/frappe/__init__.py').write_text('')
+        (bench / 'apps/frappe/node_modules').mkdir(parents=True, exist_ok=True)
+        (bench / 'sites/assets/frappe').mkdir(parents=True, exist_ok=True)
+        (bench / 'sites/common_site_config.json').write_text('{}')
+        (bench / 'Procfile').write_text('web: bench serve\n')
+        app = bench / 'apps/frappe'
+        if not (app / '.git').exists():
+            subprocess.run(['git', 'init', '-q', str(app)], check=True)
+            subprocess.run(['git', '-C', str(app), 'add', '-A'], check=True,
+                           capture_output=True)
+            subprocess.run(
+                ['git', '-C', str(app), '-c', 'user.email=t@e', '-c', 'user.name=t',
+                 'commit', '-q', '-m', 'baked'],
+                check=True, capture_output=True)
+        head = subprocess.run(['git', '-C', str(app), 'rev-parse', 'HEAD'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        # The archive path is recorded as the absolute test path rather than
+        # /opt/runway: the validator opens whatever the manifest names, on the real
+        # filesystem, and /opt/runway is not a harness-owned path. A guest that wrote
+        # here during a test would be writing to the machine running the tests.
+        archive = Path(self.root + '/opt/runway/bench.tar.gz')
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(b'bench')
+        manifest = {
+            'archive': {'path': str(archive),
+                        'sha256': hashlib.sha256(b'bench').hexdigest(),
+                        'bytes': len(b'bench')},
+            'bench_root': str(bench),
+            'frappe_commit': head, 'frappe_ref': head,
+            'frappe_repository': 'https://github.com/example/frappe.git',
+            'node_version': '24.21.0', 'python_version': '3.14.7',
+            'size_mib': {key: self.bench_size_mib(bench, key) for key in
+                         ('app', 'assets', 'env', 'node_modules')},
+        }
+        manifest.update(changes)
+        self.touch('/etc/runway-frappe-bench.json', json.dumps(manifest))
+        return manifest
+
+    def test_a_valid_bench_manifest_is_accepted(self):
+        """The fixture the other tests spoil has to pass on its own."""
+        self.fresh_guest()
+        self.claim_bench()
+        self.write_valid_bench_manifest()
+        self.assertEqual(self.seal().returncode, 0)
+
+    def test_a_manifest_whose_bench_root_is_not_there_is_refused(self):
         for extra in ([], [PRESERVE_FLAG]):
             with self.subTest(preserve=bool(extra)):
                 self.setUp()
                 self.fresh_guest()
                 self.claim_bench()
-                # A claim of a bench that is not there: the validator rejects it.
-                self.touch('/etc/runway-frappe-bench.json', json.dumps({
-                    'bench_root': str(self.root + '/home/runner/work/frappe/frappe'),
-                    'frappe_commit': '4' * 40, 'frappe_ref': '4' * 40,
-                    'frappe_repository': 'https://github.com/example/frappe.git',
-                    'node_version': '24.21.0', 'python_version': '3.14.7',
-                    'size_mib': {'app': 1, 'assets': 1, 'env': 1, 'node_modules': 1}}))
+                self.write_valid_bench_manifest(
+                    bench_root=str(self.root + '/home/runner/work/frappe/absent'))
                 result = self.seal(*extra)
                 self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn('/etc/runway-frappe-bench.json', result.stderr)
+                self.assertIn('not a directory', result.stderr,
+                              f'the bench_root check never ran; stderr was {result.stderr}')
+
+    def test_a_manifest_whose_commit_is_not_the_baked_one_is_refused(self):
+        self.fresh_guest()
+        self.claim_bench()
+        self.write_valid_bench_manifest(frappe_commit='4' * 40)
+        result = self.seal()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('claims the app at', result.stderr)
 
     def test_preserve_requires_the_manifest(self):
         self.fresh_guest()
@@ -959,12 +1063,15 @@ class SealTests(Harness):
         stops = [call for call in self.calls('systemctl') if call.split(' ', 1)[1].startswith('stop')]
         ssh_stop = next((call for call in stops if 'ssh' in call), None)
         self.assertIsNotNone(ssh_stop, f'no ssh service was stopped; stops were {stops}')
-        # The stop is recorded before the deletion, and the deletion happens at all.
-        self.assertLess(self.calls('systemctl').index(ssh_stop),
-                        len(self.calls('find')), 'expected the key removal to follow')
-        self.assertTrue(self.calls('find'))
-        removes = [call for call in self.calls('find') if 'ssh_host_' in call]
-        self.assertTrue(removes, f'no ssh_host_ removal was recorded; finds were {self.calls("find")}')
+        # The stop has to precede the deletion, and only the unfiltered log records an
+        # order across two different tools: calls('systemctl') and calls('find') are each
+        # filtered to one tool, so an index into one and a length from the other compare
+        # two unrelated quantities. Positions in calls() are the file's own order.
+        everything = self.calls()
+        removes = [(index, call) for index, call in enumerate(everything) if 'ssh_host_' in call]
+        self.assertTrue(removes, f'no ssh_host_ removal was recorded; log was {everything}')
+        self.assertLess(everything.index(ssh_stop), removes[0][0],
+                        'the key removal has to follow the ssh stop')
 
     def test_builder_flag_is_required(self):
         self.fresh_guest()
@@ -1094,6 +1201,228 @@ class FinalizeSizeTests(Harness):
         result = self.run_script(FINALIZE, [str(self.export), '--size-gib', '7'], name='finalize.sh')
         self.assertNotIn('--size-gib must be', result.stderr)
         self.assertNotIn('exactly one exported filesystem', result.stderr)
+
+
+class BakeRecipeTests(Harness):
+    """The bake's refusals, and the one thing it asserts about its own output.
+
+    The bake is 300-odd lines of network, package and bench work that cannot run here, but
+    every guard in front of it is pure and runs against a stub. That matters most for the
+    archive check: the check reads the tar's own listing, so a test asserts against a
+    listing the harness produces rather than against the directory that produced it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        Path(self.root + '/etc').mkdir(parents=True, exist_ok=True)
+        Path(self.root + '/etc/os-release').write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+        self.bench = Path(self.root + '/home/runner/work/frappe/frappe')
+        self.runner = Path(self.root + '/home/runner/actions-runner')
+        (self.runner / 'bin').mkdir(parents=True)
+        (self.runner / 'bin' / 'Runner.Listener').write_text('')
+        (self.runner / 'bin' / 'Runner.Listener').chmod(0o755)
+        Path(self.root + '/etc/runway-runner-image.txt').write_text('OS=Ubuntu 24.04\n')
+
+    def tool_cache(self):
+        """The three toolchain entries the bake refuses to start without.
+
+        These are checked before anything the tests here assert on, so a fixture that
+        omits them reports a missing interpreter instead of the guard under test. They are
+        executable stubs rather than the real toolchain: nothing in these tests runs the
+        interpreter, and the bake gets as far as these only to learn they are present.
+        """
+        python = Path(self.root + '/opt/hostedtoolcache/Python/3.14.7/x64/bin/python3')
+        node = Path(self.root + '/opt/hostedtoolcache/node/24.21.0/x64/bin/node')
+        for stub in (python, node):
+            stub.parent.mkdir(parents=True, exist_ok=True)
+            stub.write_text('#!/bin/sh\nexit 0\n')
+            stub.chmod(0o755)
+        for tool in ('/usr/local/bin/yarn', '/usr/local/bin/uv'):
+            stub = Path(self.root + tool)
+            stub.parent.mkdir(parents=True, exist_ok=True)
+            stub.write_text('#!/bin/sh\nexit 0\n')
+            stub.chmod(0o755)
+
+    def run_bake(self, *extra, euid=0):
+        # The bake resolves its archive checker at ../scripts/, so the routed copy lives
+        # in guest/ and the checker is staged in scripts/ beside it, matching the layout
+        # the builder carries.
+        scripts = Path(self.tmp / 'scripts')
+        scripts.mkdir(parents=True, exist_ok=True)
+        (scripts / 'check_bench_archive.sh').write_text(
+            (HERE / 'check_bench_archive.sh').read_text())
+        return self.run_script(BAKE, [BUILDER_FLAG, *extra], euid=euid, name='bake.sh',
+                               in_guest_dir=True)
+
+    def full_bench(self):
+        """A bench tree with everything the bake's own checks look for."""
+        for directory in ('apps/frappe', 'sites/assets', 'config', 'logs', 'config/pids'):
+            (self.bench / directory).mkdir(parents=True, exist_ok=True)
+        (self.bench / 'env/bin').mkdir(parents=True, exist_ok=True)
+        (self.bench / 'env/bin/python').write_text('#!/bin/sh\n')
+        (self.bench / 'apps/frappe/frappe').mkdir(parents=True, exist_ok=True)
+        (self.bench / 'apps/frappe/frappe/__init__.py').write_text('')
+        (self.bench / 'apps/frappe/node_modules').mkdir(parents=True, exist_ok=True)
+        (self.bench / 'sites/assets/frappe').mkdir(parents=True, exist_ok=True)
+        (self.bench / 'sites/common_site_config.json').write_text('{}')
+        (self.bench / 'Procfile').write_text('web: bench serve\n')
+        (self.bench / 'logs/dev.log').write_text('noise\n')
+
+    # The refusals. Each is a case where carrying on would publish something unusable.
+
+    def test_the_flag_is_required(self):
+        result = self.run_script(BAKE, [], name='bake.sh', in_guest_dir=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Usage inside an unregistered builder guest', result.stderr)
+
+    def test_root_is_required(self):
+        result = self.run_bake(euid=1001)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('requires root', result.stderr)
+
+    def test_an_image_without_the_runner_profile_is_refused(self):
+        # The profile manifest and the runner binary are removed, because setUp provides
+        # them; leaving them in place made this test fail on the later tool-cache guard
+        # and assert about a check it never reached.
+        Path(self.root + '/etc/runway-runner-image.txt').unlink()
+        (self.runner / 'bin' / 'Runner.Listener').unlink()
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('extends that image', result.stderr)
+
+    def test_a_registered_runner_is_refused(self):
+        self.tool_cache()
+        self.touch('/home/runner/actions-runner/.runner', '{}\n')
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Refusing to bake into a registered runner', result.stderr)
+
+    def test_a_jit_bootstrap_marker_is_refused(self):
+        self.tool_cache()
+        self.touch('/var/lib/runway/bootstrap.json', '{}\n')
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('JIT bootstrap marker', result.stderr)
+
+    def test_a_second_bake_is_refused(self):
+        self.tool_cache()
+        self.touch('/etc/runway-frappe-bench.json', '{}\n')
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('already carries a baked bench', result.stderr)
+
+    def test_a_bench_root_with_no_manifest_is_refused(self):
+        # bench init finds apps it cannot account for and offers to roll back, which is a
+        # question a build script cannot answer.
+        self.tool_cache()
+        self.full_bench()
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no manifest to explain it', result.stderr)
+
+    def test_a_tmp_the_apt_account_cannot_write_is_refused(self):
+        """A /tmp that is not root:1777 makes every apt repository report "not signed".
+
+        The builder this branch used had /tmp owned by ubuntu at 775, so apt dropped to
+        _apt to verify a signature, could not write its temporary configuration, and
+        reported four unsigned repositories. Nothing in that message points at /tmp, and
+        the cost was a build that fails on an apt error naming no real fault. The guard is
+        here so the next builder stops with the cause rather than the symptom.
+        """
+        self.tool_cache()
+        # The stub answers only for /tmp and defers to the real stat otherwise, so a
+        # later stat of a real file still measures it. Answering for every path would
+        # make this test pass for reasons it does not mean.
+        self.mock_shell('stat', f'''
+case "$*" in
+  "%a /tmp") printf '775\\n' ;;
+  "%U /tmp") printf 'ubuntu\\n' ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+''')
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('not root:1777', result.stderr)
+        self.assertIn('apt verifies repository signatures as _apt', result.stderr)
+
+    def test_a_tmpfs_over_the_workspace_is_refused(self):
+        # The workspace tmpfs opt-in mounts over this directory and would hide the bake.
+        self.tool_cache()
+        self.mock_shell('mountpoint', 'exit 0\n')
+        result = self.run_bake()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('would be hidden by it', result.stderr)
+
+    # The bake's own output check, which is the guard added for the bug this branch fixed.
+
+    def test_the_bake_checks_the_archive_with_a_script(self):
+        """The archive check is a separate script, so it can be called on its own.
+
+        Driving it through the bake would mean running a 300-line network and package
+        build to reach one grep, and a test that needs a real bench to check an archive is
+        a test that stops being run. The bake's refusal to run without it is asserted
+        separately, because that is the half that can regress silently.
+        """
+        text = BAKE.read_text()
+        self.assertIn('check_bench_archive.sh', text)
+        self.assertTrue((HERE / 'check_bench_archive.sh').is_file())
+
+
+class ArchiveCheckTests(Harness):
+    """The archive check, called directly on archives the test builds.
+
+    The bake shells out to this, so it is a script rather than inline logic, and these
+    tests use the real `tar` rather than a stub: the check's whole subject is what tar
+    wrote, so asserting against a hand-written listing would test the stub.
+    """
+
+    def archive_of(self, exclude=()):
+        """A real gzip tar of a bench tree, optionally with paths left out."""
+        tree = Path(self.tmp / 'tree')
+        for directory in ('apps/frappe', 'sites/assets/frappe', 'config', 'logs',
+                          'config/pids'):
+            (tree / directory).mkdir(parents=True, exist_ok=True)
+        (tree / 'Procfile').write_text('web: bench serve\n')
+        (tree / 'logs/dev.log').write_text('noise\n')
+        packed = Path(self.tmp / 'bench.tar')
+        # The names become --exclude flags here rather than at each call site: a bare
+        # `apps` is a file operand to tar, not a pattern, and tar then reports a missing
+        # file rather than quietly packing everything.
+        flags = [f'--exclude={name}' for name in exclude]
+        subprocess.run(['tar', '-C', str(tree), *flags, '-cf', '-', '.'],
+                       stdout=packed.open('wb'), check=True)
+        subprocess.run(['gzip', '-f', str(packed)], check=True)
+        # gzip -f on bench.tar leaves bench.tar.gz, so the name is not a suffix swap.
+        return Path(str(packed) + '.gz')
+
+    def check(self, archive):
+        return subprocess.run(['bash', str(HERE / 'check_bench_archive.sh'), str(archive)],
+                              capture_output=True, text=True)
+
+    def test_a_complete_archive_is_accepted(self):
+        result = self.check(self.archive_of())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_each_directory_bench_requires_is_checked(self):
+        """One case per directory, because the guard is a list and a list rots quietly."""
+        for required in ('apps', 'sites', 'config', 'logs', 'config/pids'):
+            with self.subTest(missing=required):
+                self.setUp()
+                archive = self.archive_of(exclude=(required,))
+                result = self.check(archive)
+                self.assertEqual(result.returncode, 1, f'{required} was not checked')
+                self.assertIn(f'no {required}, which bench requires', result.stderr)
+
+    def test_a_missing_archive_is_refused(self):
+        result = self.check(Path(self.tmp / 'absent.tar.gz'))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('No archive to check', result.stderr)
+
+    def test_no_argument_is_a_usage_error(self):
+        result = subprocess.run(['bash', str(HERE / 'check_bench_archive.sh')],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Usage:', result.stderr)
 
 
 if __name__ == '__main__':
