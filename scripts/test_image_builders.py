@@ -1222,6 +1222,21 @@ class BakeRecipeTests(Harness):
         (self.runner / 'bin' / 'Runner.Listener').write_text('')
         (self.runner / 'bin' / 'Runner.Listener').chmod(0o755)
         Path(self.root + '/etc/runway-runner-image.txt').write_text('OS=Ubuntu 24.04\n')
+        # A real /tmp in the private tree, in the state the base image should ship. The bake
+        # stats both the mode and the owner before several of its refusals, so a missing or
+        # wrongly-owned /tmp stops the run before the guard under test is reached. The mode is
+        # set directly, since that needs no privilege. The owner is stubbed, which is also
+        # the only way to exercise a wrong one without running these tests as root.
+        private_tmp = Path(self.root) / 'tmp'
+        private_tmp.mkdir(parents=True, exist_ok=True)
+        private_tmp.chmod(0o1777)
+        self.mock_shell('stat', '''
+case "$2" in
+  %a|%a/*) printf '1777\\n' ;;
+  %U|%U/*) printf 'root\\n' ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+''')
 
     def tool_cache(self):
         """The three toolchain entries the bake refuses to start without.
@@ -1333,10 +1348,12 @@ class BakeRecipeTests(Harness):
         # The stub answers only for /tmp and defers to the real stat otherwise, so a
         # later stat of a real file still measures it. Answering for every path would
         # make this test pass for reasons it does not mean.
-        self.mock_shell('stat', f'''
-case "$*" in
-  "%a /tmp") printf '775\\n' ;;
-  "%U /tmp") printf 'ubuntu\\n' ;;
+        # Replaces the setUp stub with a /tmp the apt account cannot write. stat is called
+        # as `stat -c FORMAT path`, so the format is $2.
+        self.mock_shell('stat', '''
+case "$2" in
+  %a|%a/*) printf '775\\n' ;;
+  %U|%U/*) printf 'ubuntu\\n' ;;
   *) exec /usr/bin/stat "$@" ;;
 esac
 ''')
