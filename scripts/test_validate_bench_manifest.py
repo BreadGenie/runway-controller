@@ -66,6 +66,9 @@ def build_bench(root, sizes=None, **overrides):
         "frappe_commit": overrides.pop("frappe_commit", head),
         "frappe_ref": head,
         "frappe_repository": "https://github.com/example/frappe.git",
+        # Stated rather than defaulted, so a fixture cannot agree with itself about
+        # which repository it is standing in for.
+        "workspace_repository": "example/frappe",
         "node_version": "24.21.0",
         "python_version": "3.14.7",
         "size_mib": dict(sizes or SIZES),
@@ -82,6 +85,34 @@ class ValidateBenchManifestTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "bench"
         self.root.mkdir()
+
+    def test_the_declared_workspace_repository_is_required(self):
+        """A bench that does not say which repository it is for cannot be matched to a job."""
+        path = build_bench(self.root)
+        document = json.loads(path.read_text())
+        del document["workspace_repository"]
+        path.write_text(json.dumps(document, indent=2))
+        self.assertRejected(path, "declares keys")
+
+    def test_a_workspace_repository_must_be_owner_slash_name(self):
+        """Recorded as GitHub writes it, so a job's own value compares to it directly."""
+        for value in ("frappe", "https://github.com/frappe/frappe", ""):
+            with self.subTest(repository=value):
+                self.setUp()
+                manifest = build_bench(self.root)
+                document = json.loads(manifest.read_text())
+                document["workspace_repository"] = value
+                manifest.write_text(json.dumps(document, indent=2))
+                self.assertRejected(manifest, "workspace_repository")
+
+    def test_a_manifest_without_the_repository_is_refused(self):
+        """The key set is checked, so a missing declaration is caught before the value is."""
+        self.setUp()
+        manifest = build_bench(self.root)
+        document = json.loads(manifest.read_text())
+        del document["workspace_repository"]
+        manifest.write_text(json.dumps(document, indent=2))
+        self.assertRejected(manifest, "declares keys")
 
     def assertRejected(self, manifest_path, *fragments):
         # fail() reports to stderr and raises SystemExit, so the reason has to be read

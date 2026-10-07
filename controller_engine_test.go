@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,8 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		l.RequestID = fields.RequestID
 		l.AcquireState = "pending"
 		l.JobID = fields.JobID
+		l.Repository = fields.Repository
+		l.RequestLabels = strings.Join(fields.RequestLabels, "\n")
 	case "acquired":
 		l.AcquireState = "acquired"
 	default:
@@ -358,6 +361,32 @@ func TestControllerDeadlineDeletesVMEvenWhenGitHubIsUnavailable(t *testing.T) {
 	}
 	if s.deleteCalls != 1 || s.find(l.ID).Phase != "deleted" || !e.occupied() {
 		t.Fatal("deadline left VM alive or admitted work before GitHub cleanup")
+	}
+}
+
+func TestControllerAcquireCarriesRepositoryAndLabels(t *testing.T) {
+	// The job's own repository and labels travel with the acquisition, because that is
+	// the only point at which refusing a mismatched image is still free. A test that
+	// sends a bare request ID would pass while the pairing check starves, which is the
+	// shape of failure this exists to prevent.
+	s := newPilotStore()
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
+	msg := &scaleset.RunnerScaleSetMessage{MessageID: 4, JobAvailableMessages: []*scaleset.JobAvailable{
+		{JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 10, OwnerName: "BreadGenie", RepositoryName: "frappe",
+			RequestLabels: []string{"self-hosted", "runway-dogfood"},
+		}},
+	}}
+	if err := e.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	got := s.snapshot.Leases[0]
+	if got.Repository != "BreadGenie/frappe" {
+		t.Fatalf("repository not carried: %q", got.Repository)
+	}
+	if got.RequestLabels != "self-hosted\nrunway-dogfood" {
+		t.Fatalf("labels not carried: %q", got.RequestLabels)
 	}
 }
 

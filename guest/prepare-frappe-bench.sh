@@ -54,28 +54,36 @@ source /etc/os-release
 readonly frappe_repo=${FRAPPE_REPO:-https://github.com/BreadGenie/frappe.git}
 readonly frappe_ref=${frappe_ref:-${FRAPPE_REF:-4423d0a362a702a20f4eee68470ef146081726b0}}
 
-# The job's own workspace, not a template directory. The virtual environment's console
-# scripts, and the site configuration, carry absolute paths, so a bench built anywhere
-# else has to be rewritten before a job can use it. Building it exactly where the job
-# looks removes that whole class of problem, at the cost of the image belonging to one
-# repository.
+# The layout comes from the image record, not from a default baked into this script.
+# An image declares the repository its bench belongs to, and the directory that bench
+# lives in. That is what lets one image be checked against a job before the job pays
+# for it, and it removes the class of failure where the two disagree.
 #
-# The path is the runner's, not a guess. GitHub Actions sets GITHUB_WORKSPACE to
-# $RUNNER_WORKSPACE/<repository name>, and Runway's controller asks for the absolute
-# work folder /home/runner/work (controller_engine.go, guestWorkFolder) so that cached
-# artifacts are restorable across runner types. That is the default here, and it has to
-# be: the alternative, the runner's own relative _work, builds the bench one directory
-# away from where a Runway job looks, and a bench is not relocatable. Both directions of
-# that mistake were measured on the published image. Built under actions-runner/_work
-# and restored into /home/runner/work, the archive extracts cleanly and its virtualenv
-# still cannot import frappe, because site-packages/frappe.pth names the build path.
-# So a job's fast path would have been reported usable and then failed at Create Site.
+# A default is what produced an image that reported its bake as usable and then failed:
+# it was built under the runner's own relative _work and restored into the absolute
+# /home/runner/work, and site-packages/frappe.pth still named the build path, so the
+# virtualenv could not import its own application. Three green runs did not catch it
+# because the verification registered its runner the same way as the bug.
 #
-# RUNNER_WORKSPACE is honoured when set, so a build for a differently laid out runner
-# is still possible, but it is not how this image is produced.
+# The record is the authority, so it is required here and there is no fallback. A build
+# for a different repository is a deliberate act with an explicit override, because the
+# image it produces is only correct for that repository.
+readonly workspace_repository=${RUNWAY_WORKSPACE_REPOSITORY:?Runway image builds must declare the repository this bench is for}
+readonly declared_bench_root=${RUNWAY_BENCH_ROOT:?Runway image builds must declare where that bench lives}
+
+# The record is the authority on layout, but the two must also be consistent with each
+# other: a bench root that is not the workspace folder plus the repository name would be
+# a path no job's GITHUB_WORKSPACE can ever equal, so the fast path could never be taken.
 readonly runner_workspace=${RUNNER_WORKSPACE:-/home/runner/work}
-readonly bench_repository=${FRAPPE_BENCH_REPOSITORY:-frappe}
-readonly bench_root=$runner_workspace/$bench_repository/$bench_repository
+readonly bench_repository=${workspace_repository##*/}
+readonly expected_bench_root=$runner_workspace/$bench_repository/$bench_repository
+if [[ $declared_bench_root != "$expected_bench_root" ]]; then
+  echo "The image declares its bench at $declared_bench_root, but a job for" >&2
+  echo "$workspace_repository would look in $expected_bench_root." >&2
+  echo 'A bench is not relocatable, so an image built for one cannot serve the other.' >&2
+  exit 1
+fi
+readonly bench_root=$declared_bench_root
 readonly bench_manifest=/etc/runway-frappe-bench.json
 readonly tool_cache=${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}
 readonly python_version=3.14.7
@@ -317,11 +325,16 @@ echo 'Recording what this image carries'
 # anything is destroyed, because the guard deciding what enters a public image must not
 # be satisfied by the script that produced its contents.
 python3 - "$bench_manifest" "$frappe_repo" "$frappe_ref" "$commit" \
-  "$python_version" "$node_version" "$bench_root" "$bench_archive" "$archive_sha256" "$archive_bytes" <<'PYTHON'
+  "$python_version" "$node_version" "$bench_root" "$bench_archive" "$archive_sha256" "$archive_bytes" \
+  "$workspace_repository" <<'PYTHON'
 import json, os, subprocess, sys
 
 path, repo, ref, commit, python_version, node_version, bench_root = sys.argv[1:8]
 archive_path, archive_sha256 = sys.argv[8:10]
+# The repository this bench belongs to. It is recorded so a job can refuse the fast
+# path when the image it landed on was baked for a different one, which is a far
+# better failure than the virtualenv being unable to import its own application.
+workspace_repository = sys.argv[11]
 # Typed here, not in the shell: an argument arrives as a string, and the sealer
 # requires a size, so a manifest written without this fails the seal it is about to
 # have to pass.
@@ -338,6 +351,7 @@ def size_mib(relative):
 
 document = {
     'frappe_repository': repo,
+    'workspace_repository': workspace_repository,
     'frappe_ref': ref,
     'frappe_commit': commit,
     'python_version': python_version,

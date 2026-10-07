@@ -155,7 +155,11 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 			if job.RunnerRequestID <= 0 {
 				return errors.New("available job omitted a positive request ID; not acknowledged")
 			}
-			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID})
+			// The job's own repository and labels travel with the acquisition, because that is
+			// the only point at which refusing is still free. A pool whose image is baked for
+			// another repository cannot serve this job, and learning that after the VM boots
+			// costs a boot and a failing job rather than a message.
+			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID, Repository: job.OwnerName + "/" + job.RepositoryName, RequestLabels: job.RequestLabels})
 			if err != nil {
 				return err
 			}
