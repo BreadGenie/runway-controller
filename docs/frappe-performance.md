@@ -1452,8 +1452,8 @@ and unfixable by GitHub, this is a cost decision rather than an engineering one.
 
 ## Final measurement: three disposable guests
 
-The image built after `34742cb` is Atlas image `986bb2230fa750c8`, a 10 GiB artifact with raw
-SHA256 `d8e7a737a9fcb181a243164bfe5b9391749cadb222f5d4d3315af7d7a50fbbe2`. Each run below is a
+The image built after `a4f9e14` is Atlas image `7587164c9c29aff7`, a 10 GiB artifact with raw
+SHA256 `49df63035149be10fe051217a94185c6cb1a1505fc9dca1d46420a054d8accd1`. Each run below is a
 **fresh** VM booted from that image, because a self-hosted runner that is reused between jobs keeps
 the previous job's site, database and test artefacts. That reuse is a property of a long-lived
 runner, not of the image: the second job on one reused guest reported `Tests: 708, Failing: 3,
@@ -1462,31 +1462,38 @@ one job on one new VM at the pool's shape, 3 vCPU / 6144 MiB / 14336 MiB.
 
 | Run | Guest | Environment Setup | Run Tests | Job | Result |
 | --- | --- | ---: | ---: | ---: | --- |
-| [37560797473](https://github.com/BreadGenie/frappe/actions/runs/37560797473) | vm-0000084 | 76 s | 481 s | 591 s | 708 passed |
-| [37563703905](https://github.com/BreadGenie/frappe/actions/runs/37563703905) | vm-0000085 | 87 s | 478 s | 636 s | 708 passed |
-| [37565097893](https://github.com/BreadGenie/frappe/actions/runs/37565097893) | vm-0000086 | 83 s | 480 s | 637 s | 708 passed |
-| **mean** | | **82 s** | **480 s** | **621 s** | 3/3 green, 0 failing, 0 errors |
+| [37600073128](https://github.com/BreadGenie/frappe/actions/runs/37600073128) | vm-0000098 | 89 s | 492 s | 650 s | 708 passed |
+| [37601874046](https://github.com/BreadGenie/frappe/actions/runs/37601874046) | vm-0000099 | 92 s | 484 s | 643 s | 708 passed |
+| [37603753006](https://github.com/BreadGenie/frappe/actions/runs/37603753006) | vm-0000100 | 88 s | 485 s | 631 s | 708 passed |
+| **mean** | | **90 s** | **487 s** | **641 s** | 3/3 green, 0 failing, 0 errors |
 
-The setup phase is what the bake changes, and it is the clearest result here: **82 s mean against
-191 s for the same 3 vCPU guest without the bake**, a saving of about 109 s. Against the GitHub-hosted
-reference in the same-day baseline, which took 93 s, the baked guest is now slightly *faster* at
-setup than a hosted runner, because the hosted runner has nothing preinstalled and this one carries
-the bench, its dependencies and its built assets.
+These three replace the earlier trio on `986bb2230fa750c8`, which is withdrawn: it baked its bench
+at the runner's own `_work` rather than the `/home/runner/work` a Runway JIT runner is registered
+with, so its bench could not have been imported by a production job at all. Its numbers were real
+for a layout no deployment uses. The `bench_root` guard in the setup action now catches that
+mismatch before the fast path is chosen, which is how the next image of this kind gets caught.
 
-The test phase did not move: 480 s mean here, against 484 s and 492 s in the two earlier Runway runs
+The setup phase is what the bake changes, and it is the clearest result here: **90 s mean against
+191 s for the same 3 vCPU guest without the bake**, a saving of about 100 s. Against the GitHub-hosted
+reference in the same-day baseline, which took 93 s, the baked guest is now level with a hosted
+runner on setup, because the hosted runner has nothing preinstalled and this one carries the bench,
+its dependencies and its built assets. The gap to 82 s on the withdrawn image was that image
+restoring into the wrong directory and failing sooner, not a better image.
+
+The test phase did not move: 487 s mean here, against 484 s and 492 s in the two earlier Runway runs
 recorded above. It is CPU-bound at 3 vCPU while GitHub reports 4, and the bake does not touch it.
 This is the same conclusion the earlier baked-image trial reached, now with three samples instead of
 one.
 
-The job total is 621 s mean against roughly 700 s to 762 s for the earlier Runway runs, and still
+The job total is 641 s mean against roughly 700 s to 762 s for the earlier Runway runs, and still
 behind the 345 s to 512 s range of the hosted reference. The honest reading is that the bake buys
-about 110 s of setup and does not close the test-phase gap, so a Frappe job on this pool is faster
+about 100 s of setup and does not close the test-phase gap, so a Frappe job on this pool is faster
 than it was and slower than GitHub's own runner.
 
 One number from earlier in this work should not be compared with the table: a 29 s setup came from a
 guest whose workspace had already been restored, so it measured the fast path's second visit rather
-than a cold guest. The 82 s mean is the number a new VM actually produces, and it includes about
-19 s to extract `/opt/runway/bench.tar.gz`.
+than a cold guest. The 90 s mean is the number a new VM actually produces, and it includes about
+26 s to extract `/opt/runway/bench.tar.gz`.
 
 Disk headroom was the difference between this table and the earlier failed attempts. At 10240 MiB a
 guest finished a job with about 1.4 GiB free and Redis began refusing writes; at 14336 MiB the same

@@ -1233,8 +1233,9 @@ class BakeRecipeTests(Harness):
         # A real /tmp in the private tree, in the state the base image should ship. The bake
         # stats both the mode and the owner before several of its refusals, so a missing or
         # wrongly-owned /tmp stops the run before the guard under test is reached. The mode is
-        # set directly, since that needs no privilege. The owner is stubbed, which is also
-        # the only way to exercise a wrong one without running these tests as root.
+        # set directly; the owner cannot be, because these tests run as whatever user invoked
+        # them and a test must not require root to chown. stat is stubbed to report the owner
+        # instead, which is also the only way to exercise a wrong one.
         private_tmp = Path(self.root) / 'tmp'
         private_tmp.mkdir(parents=True, exist_ok=True)
         private_tmp.chmod(0o1777)
@@ -1293,13 +1294,74 @@ esac
 
     # The refusals. Each is a case where carrying on would publish something unusable.
 
+    def test_the_bake_leaves_the_work_folder_owned_by_the_runner(self):
+        """The runner creates _tool inside the work folder, so it must own the folder.
+
+        The runner runs as the runner account and creates _tool directly under the work
+        folder it was registered with. A root-owned /home/runner/work fails the job at
+        startup with UnauthorizedAccessException before any step runs, which is what a
+        build that creates only the bench directories produces: the bench was correct and
+        runner-owned, and the job still could not start.
+        """
+        text = BAKE.read_text()
+        self.assertIn('install -d -m 0755 -o runner -g runner "$runner_workspace"', text)
+        # It has to be created with a trailing slash-free path, or it names the bench
+        # directory instead and the ownership is applied where it already was.
+        self.assertNotIn('-o runner -g runner "$runner_workspace/"', text)
+
+    def test_the_bake_needs_a_tmp_the_apt_account_can_write(self):
+        """The bake refuses rather than repairing /tmp, and says why.
+
+        The profile step repairs it first, because every builder from this base image
+        needs it and the apt message names nothing real. The bake's own guard is kept as a
+        check rather than a fix: a builder whose /tmp is wrong at that point has been built
+        wrongly, and silently correcting it would hide that.
+        """
+        # Both steps repair it, because the bake can run alone against a throwaway guest
+        # and nothing else will have. It has to be reported, so a guest that arrived wrong
+        # is visible rather than silently corrected.
+        guard = BAKE.read_text().split('if [[ $(stat -c %a /tmp)')[1].split('\nfi')[0]
+        self.assertIn('chmod 1777 /tmp', guard)
+        self.assertIn('Repairing /tmp', guard)
+        profile = (GUEST / 'prepare-frappe-image.sh').read_text()
+        self.assertIn('chmod 1777 /tmp', profile)
+
+    def test_the_profile_repairs_tmp_before_the_first_apt(self):
+        """The repair is in the profile, before apt, because the base image is wrong.
+
+        Two builds failed on four "repository is not signed" errors that name only apt. The
+        fix belongs where every builder passes, which is the profile step, and before its
+        first apt call rather than after a failure.
+        """
+        text = (GUEST / 'prepare-frappe-image.sh').read_text()
+        repair = text.index('chmod 1777 /tmp')
+        first_apt = text.index('apt-get update')
+        self.assertLess(repair, first_apt,
+                        'the repair has to happen before apt can fail on it')
+
+    def test_the_profile_does_not_build_under_an_upgrade(self):
+        """unattended-upgrades holds the dpkg lock on every boot, so the first apt fails.
+
+        It also mutates the image while this recipe builds it, which would make two builds
+        of one base image differ. It is stopped and masked before the first apt, and the
+        wait for the running process is there because stopping the unit does not stop a
+        process it already started.
+        """
+        text = (GUEST / 'prepare-frappe-image.sh').read_text()
+        stop = text.index('systemctl stop unattended-upgrades.service')
+        first_apt = text.index('apt-get update')
+        self.assertLess(stop, first_apt, 'the dpkg lock has to be released before apt')
+        self.assertIn('systemctl mask unattended-upgrades.service', text)
+        self.assertLess(text.index('while pgrep -x unattended-upgr'), first_apt,
+                        'stopping the unit does not stop the process it already started')
+
     def test_the_tests_ignore_a_runner_that_exports_its_own_paths(self):
         """A real CI runner exports these; a test that inherits them tests the host.
 
         RUNNER_TOOL_CACHE in particular: the bake prefers it to its own default, so an
         inherited value pointed the toolchain guard at the runner's real tool cache and it
-        fired before the guard a test was asserting. That is the whole of the second CI
-        failure on this branch, and it is invisible locally because nothing here sets it.
+        fired before the guard a test was asserting. That is the whole of the CI failure on
+        this branch, and it is invisible locally because nothing here sets the variable.
         """
         for name, value in (('RUNNER_TOOL_CACHE', '/opt/hostedtoolcache'),
                             ('RUNNER_WORKSPACE', '/home/runner/work/_work'),
@@ -1366,32 +1428,42 @@ esac
         self.assertEqual(result.returncode, 1)
         self.assertIn('no manifest to explain it', result.stderr)
 
-    def test_a_tmp_the_apt_account_cannot_write_is_refused(self):
+    def test_a_tmp_the_apt_account_cannot_write_is_repaired_and_reported(self):
         """A /tmp that is not root:1777 makes every apt repository report "not signed".
 
         The builder this branch used had /tmp owned by ubuntu at 775, so apt dropped to
         _apt to verify a signature, could not write its temporary configuration, and
         reported four unsigned repositories. Nothing in that message points at /tmp, and
-        the cost was a build that fails on an apt error naming no real fault. The guard is
-        here so the next builder stops with the cause rather than the symptom.
+        the cost was two builds failing on an apt error naming no real fault.
+
+        It is repaired rather than refused, because the bake can run on its own against a
+        throwaway guest where the profile step never ran, and a refusal there would mean
+        the bake could only ever run on an image the profile had already fixed. Reported as
+        well as repaired, so a guest that arrived wrong is visible.
         """
         self.tool_cache()
         # The stub answers only for /tmp and defers to the real stat otherwise, so a
         # later stat of a real file still measures it. Answering for every path would
         # make this test pass for reasons it does not mean.
-        # Replaces the setUp stub with a /tmp the apt account cannot write. stat is called
-        # as `stat -c FORMAT path`, so the format is $2.
+        # The stub answers for the mode and the owner and defers to the real stat otherwise.
+        # The private root has a real /tmp from setUp, so nothing here depends on a path
+        # being absent.
+        # Replaces the setUp stub: a /tmp the apt account cannot write. stat is called as
+        # `stat -c FORMAT path`, so the format is $2.
         self.mock_shell('stat', '''
 case "$2" in
   %a|%a/*) printf '775\\n' ;;
   %U|%U/*) printf 'ubuntu\\n' ;;
+  %U:%a|%U:%a/*) printf 'ubuntu:775\\n' ;;
   *) exec /usr/bin/stat "$@" ;;
 esac
 ''')
         result = self.run_bake()
-        self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn('not root:1777', result.stderr)
-        self.assertIn('apt verifies repository signatures as _apt', result.stderr)
+        # The repair happens; the run then stops for its own reasons, which this test does
+        # not claim to cover. What it claims is that a wrong /tmp is reported rather than
+        # silently corrected, naming both what it found and what it wanted.
+        self.assertIn('Repairing /tmp', result.stderr)
+        self.assertIn('ubuntu:775 rather than root:1777', result.stderr)
 
     def test_a_tmpfs_over_the_workspace_is_refused(self):
         # The workspace tmpfs opt-in mounts over this directory and would hide the bake.

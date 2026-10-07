@@ -104,6 +104,26 @@ staging=$(mktemp -d /var/tmp/runway-frappe.XXXXXX)
 chmod 0700 "$staging"
 trap 'rm -rf -- "$staging"' EXIT
 
+# apt drops to the _apt account to verify a repository signature and writes its temporary
+# configuration through /tmp. This base image ships /tmp owned by ubuntu at 775, so that
+# account cannot write there and every repository reports "not signed" -- four errors that
+# name no real fault, and the build stops on the first of them. The mode is corrected here,
+# before the first apt, rather than left to whoever reads that log: this is a defect in the
+# base image, and every builder from this base hits it. Recorded because it cost two builds.
+chown root:root /tmp
+chmod 1777 /tmp
+
+# unattended-upgrades runs on every boot and holds the dpkg frontend lock, so the first
+# apt here either fails outright with "Could not get lock /var/lib/dpkg/lock-frontend" or
+# waits on a job that is applying patches to the image this recipe is building. It is
+# stopped rather than waited for: the base image is a sealed, fixed artifact, and letting
+# a background upgrade mutate it during a build would make two builds of the same base
+# differ. Nothing this recipe installs needs it, and a job never sees a sealed image's
+# upgrades.
+systemctl stop unattended-upgrades.service 2>/dev/null || true
+systemctl mask unattended-upgrades.service 2>/dev/null || true
+while pgrep -x unattended-upgr >/dev/null 2>&1; do sleep 2; done
+
 # This workflow installs with `sudo apt -qq install`, which carries neither -y
 # nor DEBIAN_FRONTEND, so a non-interactive runner stops at "Do you want to
 # continue? [Y/n]" and aborts. Answer for every apt on this image, and keep
