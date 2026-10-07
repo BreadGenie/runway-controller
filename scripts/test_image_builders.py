@@ -654,6 +654,14 @@ sys.exit(0)
                 (self.tmp / sibling).write_text(source.read_text())
         environment = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}'}
         environment.pop('EUID', None)
+        # A builder's own env overrides are cleared, because a real CI runner sets them and
+        # these tests have to see the same environment every time. RUNNER_TOOL_CACHE is the
+        # one that matters here: the bake reads it in preference to its own default, so a
+        # runner exporting it made every test look at the host's real tool cache instead of
+        # the private tree, and the toolchain guard fired before the guard under test.
+        for name in ('RUNNER_TOOL_CACHE', 'RUNNER_WORKSPACE', 'FRAPPE_BENCH_REPOSITORY',
+                     'FRAPPE_BENCH_REF'):
+            environment.pop(name, None)
         return subprocess.run(['bash', str(path), *arguments], capture_output=True,
                               text=True, env=environment)
 
@@ -1346,6 +1354,29 @@ esac
         self.assertIn('systemctl mask unattended-upgrades.service', text)
         self.assertLess(text.index('while pgrep -x unattended-upgr'), first_apt,
                         'stopping the unit does not stop the process it already started')
+
+    def test_the_tests_ignore_a_runner_that_exports_its_own_paths(self):
+        """A real CI runner exports these; a test that inherits them tests the host.
+
+        RUNNER_TOOL_CACHE in particular: the bake prefers it to its own default, so an
+        inherited value pointed the toolchain guard at the runner's real tool cache and it
+        fired before the guard a test was asserting. That is the whole of the CI failure on
+        this branch, and it is invisible locally because nothing here sets the variable.
+        """
+        for name, value in (('RUNNER_TOOL_CACHE', '/opt/hostedtoolcache'),
+                            ('RUNNER_WORKSPACE', '/home/runner/work/_work'),
+                            ('FRAPPE_BENCH_REPOSITORY', 'someone-elses-repo')):
+            with self.subTest(variable=name):
+                self.setUp()
+                self.tool_cache()
+                self.full_bench()
+                os.environ[name] = value
+                try:
+                    result = self.run_bake()
+                finally:
+                    del os.environ[name]
+                self.assertIn('no manifest to explain it', result.stderr,
+                              f'{name} leaked into the test environment')
 
     def test_the_flag_is_required(self):
         result = self.run_script(BAKE, [], name='bake.sh', in_guest_dir=True)
