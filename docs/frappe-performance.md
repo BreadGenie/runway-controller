@@ -1449,3 +1449,45 @@ sell. It also means re-implementing the `ac` claim check on the token, because a
 not is a cross-branch cache poisoning hole, and it risks silently dropping to a single stream with
 a 5 s socket timeout if the hostname does not match. Given that the underlying cause is documented
 and unfixable by GitHub, this is a cost decision rather than an engineering one.
+
+## Final measurement: three disposable guests
+
+The image built after `34742cb` is Atlas image `986bb2230fa750c8`, a 10 GiB artifact with raw
+SHA256 `d8e7a737a9fcb181a243164bfe5b9391749cadb222f5d4d3315af7d7a50fbbe2`. Each run below is a
+**fresh** VM booted from that image, because a self-hosted runner that is reused between jobs keeps
+the previous job's site, database and test artefacts. That reuse is a property of a long-lived
+runner, not of the image: the second job on one reused guest reported `Tests: 708, Failing: 3,
+Errors: 23`, and the production controller does not reuse guests. Every number here is therefore
+one job on one new VM at the pool's shape, 3 vCPU / 6144 MiB / 14336 MiB.
+
+| Run | Guest | Environment Setup | Run Tests | Job | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| [37560797473](https://github.com/BreadGenie/frappe/actions/runs/37560797473) | vm-0000084 | 76 s | 481 s | 591 s | 708 passed |
+| [37563703905](https://github.com/BreadGenie/frappe/actions/runs/37563703905) | vm-0000085 | 87 s | 478 s | 636 s | 708 passed |
+| [37565097893](https://github.com/BreadGenie/frappe/actions/runs/37565097893) | vm-0000086 | 83 s | 480 s | 637 s | 708 passed |
+| **mean** | | **82 s** | **480 s** | **621 s** | 3/3 green, 0 failing, 0 errors |
+
+The setup phase is what the bake changes, and it is the clearest result here: **82 s mean against
+191 s for the same 3 vCPU guest without the bake**, a saving of about 109 s. Against the GitHub-hosted
+reference in the same-day baseline, which took 93 s, the baked guest is now slightly *faster* at
+setup than a hosted runner, because the hosted runner has nothing preinstalled and this one carries
+the bench, its dependencies and its built assets.
+
+The test phase did not move: 480 s mean here, against 484 s and 492 s in the two earlier Runway runs
+recorded above. It is CPU-bound at 3 vCPU while GitHub reports 4, and the bake does not touch it.
+This is the same conclusion the earlier baked-image trial reached, now with three samples instead of
+one.
+
+The job total is 621 s mean against roughly 700 s to 762 s for the earlier Runway runs, and still
+behind the 345 s to 512 s range of the hosted reference. The honest reading is that the bake buys
+about 110 s of setup and does not close the test-phase gap, so a Frappe job on this pool is faster
+than it was and slower than GitHub's own runner.
+
+One number from earlier in this work should not be compared with the table: a 29 s setup came from a
+guest whose workspace had already been restored, so it measured the fast path's second visit rather
+than a cold guest. The 82 s mean is the number a new VM actually produces, and it includes about
+19 s to extract `/opt/runway/bench.tar.gz`.
+
+Disk headroom was the difference between this table and the earlier failed attempts. At 10240 MiB a
+guest finished a job with about 1.4 GiB free and Redis began refusing writes; at 14336 MiB the same
+job finished with 5.5 GiB free. That is a capacity result, not a benchmark fluke.

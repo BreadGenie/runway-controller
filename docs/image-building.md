@@ -45,9 +45,9 @@ The workflow also resolves its toolchain through `RUNNER_TOOL_CACHE` before down
 
 Only the runner archive and those three tool archives are pinned. The MariaDB setup script, the PGDG key, and every apt package are fetched live at build time, are not checksum-verified by this recipe, and depend on the repositories as they are that day. Rebuilding is how an image picks up repository changes, so read `/etc/runway-runner-image.txt` from the published image to learn what a given build shipped. The `wkhtmltox` package is the third pinned archive: the script downloads it from the same official release, checks it against its digest, installs it, and deletes the download, because the workflow fetches its own copy at `/tmp/wkhtmltox.deb` and no job reads an archive from inside the image. Sealing empties `/tmp`, so a clone's first job takes the cache-miss branch and downloads it again; the installed package is what makes that reinstall a no-op.
 
-The builder needs room for the finished image plus this recipe's scratch, because the tool archives are downloaded and extracted before anything is measured: the build that produced the published profile image used a 10 GiB guest. The 4 GiB builder described above is enough for the runner-only image and not for this profile, because the tool cache is written and expanded inside the guest before the finalizer truncates anything. The script measures the root filesystem after cleaning the apt cache and after deleting its own private staging tree, so the measurement is the image's own content rather than this recipe's scratch, and it fails when that exceeds the budget, currently 8 GiB against a 10 GiB published size. That gate is only about what the finalizer can truncate; it is not a claim about the space a job needs, and it does not tell you how large the builder disk must be.
+The builder needs room for the finished image plus this recipe's scratch, because the tool archives are downloaded and extracted before anything is measured: the build that produced the published profile image used a 14 GiB guest. The 4 GiB builder described above is enough for the runner-only image and not for this profile, because the tool cache is written and expanded inside the guest before the finalizer truncates anything. The script measures the root filesystem after cleaning the apt cache and after deleting its own private staging tree, so the measurement is the image's own content rather than this recipe's scratch, and it fails when that exceeds the budget, currently 8 GiB against a 10 GiB published size. That gate is only about what the finalizer can truncate; it is not a claim about the space a job needs, and it does not tell you how large the builder disk must be.
 
-Size the pool separately from the artifact. The published size is a truncation target, not a capacity plan: a pool serving Frappe needs roughly 10 GiB per guest, and the guest transport grows the sealed filesystem onto that larger disk at boot. The manifest records the published filesystem size, the budget, the bytes this build used, and the free space that leaves, so the capacity of a given image is a recorded measurement rather than a promise, and an ENOSPC in a job is a capacity result rather than a benchmark fluke. The published size was raised from 4 GiB to 10 GiB when the bench bake landed: the profile alone fills about 4.4 GiB, so a 7.06 GiB artifact would have started a baked job with barely 1.3 GiB free, which is where site creation and the test database run.
+Size the pool separately from the artifact. The published size is a truncation target, not a capacity plan: a pool serving Frappe needs 14336 MiB per guest, and the guest transport grows the sealed filesystem onto that larger disk at boot. The manifest records the published filesystem size, the budget, the bytes this build used, and the free space that leaves, so the capacity of a given image is a recorded measurement rather than a promise, and an ENOSPC in a job is a capacity result rather than a benchmark fluke. The published size was raised from 4 GiB to 10 GiB when the bench bake landed: the profile alone fills about 4.4 GiB, so a 7.06 GiB artifact would have started a baked job with barely 1.3 GiB free, which is where site creation and the test database run. A guest disk of 10240 MiB then proved too small for a completed job, which finished with about 1.4 GiB free and a Redis that began refusing writes; at 14336 MiB the same job finished with 5.5 GiB free. Raise the guest disk before raising the published size: the artifact is truncated to a target either way, and only the disk is what a running job actually gets.
 
 An image published before this recipe stopped retaining the `wkhtmltox` archive still carries that 17 MB package under `/opt/runway`. Its raw filesystem SHA-256 is what identifies it, because the digest this recipe records was not in its manifest; the package inside it was confirmed separately, by extracting it from the published filesystem and matching the official release download. Build-specific measurements and runtime evidence belong with the pilot's recorded results, not in this recipe.
 
@@ -59,13 +59,28 @@ This recipe installs dependencies, and then the bench. `uv` is now baked rather 
 
 Two things about the bake are deliberate. The bench lives at the workspace path rather than a fixed directory, because a virtualenv carries absolute paths and a bench moved after the fact produces an interpreter that cannot import its own site-packages. And the app's remote is repointed at GitHub, because `bench init` leaves it pointing at the build-time staging directory, which the bake then deletes; a manifest check later refuses an image where any remote still names that path.
 
-The bake also leaves a compressed copy at `/opt/runway/bench.tar.zst`, outside any
-workspace, and records its digest and size in the manifest. That is not redundancy for its
-own sake: a job's own checkout clears its workspace, and a real job found the bench gone by
-the time it looked while the manifest beside the image still claimed one. Nothing a job
-does can reach the archive, so the setup action restores from it when the workspace has no
-bench, after checking the digest against the manifest. An archive that does not match is a
-different artifact, and restoring it would run code nobody vouched for.
+The bake also leaves a gzip-compressed copy at `/opt/runway/bench.tar.gz`, outside any
+workspace, and records its digest and size in the manifest as an integer number of bytes. That is not
+redundancy for its own sake: a job's own checkout clears its workspace, and a real job found the bench
+gone by the time it looked while the manifest beside the image still claimed one. Nothing a job does
+can reach the archive, so the setup action restores from it when the workspace has no bench, after
+checking the digest against the manifest. An archive that does not match is a different artifact, and
+restoring it would run code nobody vouched for.
+
+The archive has to contain five directories, not just the source: `apps`, `sites`, `config`, `logs` and
+`config/pids`. `bench` refuses to run in a directory missing any of them, and an archive built
+without `logs` restored cleanly, passed the manifest's own checks, and still produced a bench that
+every later command rejected with "Command not being executed in bench directory". A job then failed
+at Create Site and the image looked healthy until a test ran. The bake now verifies the archive
+against bench's own requirement rather than against the set of paths the bake happens to use, because
+that distinction is what let an unusable bench through. Confirm it on a fresh guest before publishing
+by listing those five paths out of the archive; the published image is the thing to check, not the
+builder it came from.
+
+The build also needs `/tmp` to be a real temporary directory. A guest whose `/tmp` was `ubuntu:ubuntu`
+at mode 775 made every `apt` repository report "not signed", because apt drops to `_apt` to verify and
+that account cannot write there. `1777 root:root` is the only correct answer and is worth setting
+before the first `apt` call.
 
 `scripts/validate_bench_manifest.py` decides whether a claimed bake is real, and `seal-runner-image.sh` runs it before publication. It checks the manifest's key set exactly, so an unexpected field cannot ride into a shared artifact, resolves the app's commit from the bench itself rather than believing the manifest, and compares the recorded sizes against the filesystem. That is deliberately not the recipe that wrote the manifest checking its own work: an image whose bench disagrees with its manifest would send every job down a fast path that tests code the image does not contain, which is a worse failure than having no bake at all.
 
