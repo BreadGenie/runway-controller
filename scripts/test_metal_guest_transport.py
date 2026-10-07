@@ -61,6 +61,7 @@ class TransportTests(unittest.TestCase):
                                          ('/etc/sudoers.d/runway-runner', root / 'sudoers/runway-runner'),
                                          ('/etc/sudoers.d', root / 'sudoers'),
                                          ('/etc/docker/daemon.json', root / 'docker/daemon.json'),
+                                         ('/etc/runway-frappe-bench.json', root / 'runway-frappe-bench.json'),
                                          ('/sys/devices/system/clocksource/clocksource0',
                                           root / 'clocksource')):
             program = program.replace(guest_path, str(private_path))
@@ -296,6 +297,41 @@ class TransportTests(unittest.TestCase):
               patch.object(transport.subprocess, 'run', side_effect=subprocess.TimeoutExpired('secret', 75))):
             self.assertEqual(transport.main(), 1)
             self.assertEqual(json.loads(output.getvalue()), {'state': 'unknown'})
+
+    def test_preparation_timings_survive_the_outer_hop(self):
+        # The guest measures and this process re-serialises its document, so a field that
+        # is not carried here is a measurement nobody receives. That is exactly what
+        # happened: the guest reported timings, and this hop dropped them, and the unit
+        # tests missed it because they run the guest program directly and never come
+        # through main(). So this test drives main() and reads what it prints.
+        for flag, expected in ((['--timings'], True), ([], False)):
+            with self.subTest(flag=flag):
+                with (patch.object(transport.sys, 'argv',
+                                   self.arguments('status') + flag),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value = subprocess.CompletedProcess(
+                        [], 0, '{"state":"installed","timings_ms":{"state":3}}')
+                    printed = io.StringIO()
+                    with patch.object(transport.sys, 'stdout', printed):
+                        self.assertEqual(transport.main(), 0)
+                document = json.loads(printed.getvalue())
+                self.assertEqual(document['state'], 'installed')
+                self.assertEqual('timings_ms' in document, expected)
+                if expected:
+                    self.assertEqual(document['timings_ms'], {'state': 3})
+
+    def test_a_guest_timing_nobody_asked_for_is_not_forwarded(self):
+        # A guest that reports timings unasked, which a future guest might, must not widen
+        # the status document for a caller that did not opt in.
+        with (patch.object(transport.sys, 'argv', self.arguments('status')),
+              patch.object(transport.subprocess, 'run') as run):
+            run.return_value = subprocess.CompletedProcess(
+                [], 0, '{"state":"installed","timings_ms":{"state":3}}')
+            printed = io.StringIO()
+            with patch.object(transport.sys, 'stdout', printed):
+                self.assertEqual(transport.main(), 0)
+        self.assertEqual(json.loads(printed.getvalue()), {'state': 'installed'})
 
     def test_outer_ssh_refuses_agent_forwarding_to_metal(self):
         with (patch.object(transport.sys, 'argv', self.arguments('status')),
@@ -1250,7 +1286,7 @@ class TransportTests(unittest.TestCase):
                                          size_mib * 1048576, options))
 
     def cache_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
-                    cache=None):
+                    cache=None, timings=None):
         """Prepare a fresh guest with the RAM cache opt-in and the guest's own answers."""
         program, sudoers, owned = self.guest_paths(directory)
         if cache is not None:
@@ -1258,7 +1294,7 @@ class TransportTests(unittest.TestCase):
             # parent is not the real home directory.
             program = program.replace(str(self.cache_path(directory)), str(cache))
         payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
-                   'cache_tmpfs_mib': mib}
+                   'cache_tmpfs_mib': mib, 'timings': timings}
         return (self.execute_guest(program, sudoers, payload, root_owned=owned,
                                    present=self.MOUNT_TOOLS if present is None else present,
                                    results=results, meminfo=meminfo)
@@ -1664,6 +1700,54 @@ class TransportTests(unittest.TestCase):
                 payload = json.loads(run.call_args.kwargs['input'])
                 self.assertEqual(payload['workspace_tmpfs_mib'], int(size))
 
+    def test_workspace_tmpfs_is_refused_when_the_image_carries_a_bench(self):
+        """A tmpfs over the workspace would cover the bench, and the job would not notice."""
+        # Enough memory for the request, and findmnt answers so the guest recognises it
+        # is preparing the mount rather than running it twice.
+        meminfo = 'MemAvailable:   %d kB\n' % (6144 * 1024)
+
+        def prepare(directory, mib):
+            answers = {self.workspace_findmnt(
+                directory): [self.enclosing(), self.workspace_mounted(directory)]}
+            return self.workspace_guest(
+                directory, results=answers, meminfo=meminfo,
+                payload={'action': 'prepare', 'runner_name': 'runway-lease-123',
+                         'workspace_tmpfs_mib': mib})
+
+        # No bake in this image: the opt-in means exactly what it always meant.
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, recorded, *_ = prepare(directory, 2048)
+            self.assertEqual(code, 0, output)
+            self.assertEqual(json.loads(output), {'state': 'installed'})
+
+        with tempfile.TemporaryDirectory() as directory:
+            # The bench is under this guest's workspace, so a tmpfs over it hides the bench.
+            Path(directory, 'runway-frappe-bench.json').write_text(
+                json.dumps({'bench_root': str(self.workspace_path(directory) / 'frappe/frappe')}))
+            code, output, recorded, *_ = prepare(directory, 2048)
+            self.assertEqual(code, 1, output)
+            self.assertEqual(json.loads(output), {'state': 'unknown'})
+            # Refused before anything was mounted: the refusal has to leave a guest the
+            # operator can still inspect. The claim is about mounts, because the guest
+            # runs other probes first and the findmnt answers this test supplies are its
+            # own stubs rather than observations.
+            self.assertEqual(self.mount_calls(recorded), [])
+
+        # Two manifests that do not put a bench under the workspace leave the opt-in
+        # exactly as it was: one names a bench elsewhere, and one cannot be read at all.
+        # Sealing refuses to publish an unreadable manifest, so treating it as no bake is
+        # the safer reading rather than covering the workspace on a claim nobody can check.
+        for case in ('elsewhere', 'unreadable'):
+            with self.subTest(manifest=case):
+                with tempfile.TemporaryDirectory() as directory:
+                    Path(directory, 'runway-frappe-bench.json').write_text(
+                        'not json' if case == 'unreadable'
+                        else json.dumps({'bench_root': '/opt/somewhere-else/frappe'}))
+                    code, output, recorded, *_ = prepare(directory, 2048)
+                    self.assertEqual(code, 0, output)
+                    self.assertEqual(json.loads(output), {'state': 'installed'})
+                    self.assertTrue(self.mount_calls(recorded))
+
     def test_the_cache_and_the_workspace_are_exclusive_on_the_command_line_and_in_the_guest(self):
         args = self.arguments('prepare') + ['--cache-tmpfs-mib', '2048',
                                             '--workspace-tmpfs-mib', '2048']
@@ -1954,6 +2038,59 @@ class TransportTests(unittest.TestCase):
                     for binary in self.MOUNT_TOOLS:
                         self.assertEqual(self.mount_calls(recorded, binary), [])
 
+
+    def timed_guest(self, directory, timings):
+        """Prepare a fresh guest with timings asked for or not, and the guest's answers."""
+        program, sudoers, owned = self.guest_paths(directory)
+        payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                   'prefer_tsc_clocksource': True, 'timings': timings}
+        return self.execute_guest(program, sudoers, payload, root_owned=owned)
+
+    def test_the_status_document_is_unchanged_unless_timings_are_asked_for(self):
+        # The controller parses this document, so an unasked-for field is a contract change
+        # rather than an observation, and every existing assertion here depends on it.
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, _ = self.timed_guest(directory, False)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {'state': 'installed'})
+
+    def test_timings_name_the_steps_that_ran(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _, _ = self.timed_guest(directory, True)
+
+        document = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertEqual(document['state'], 'installed')
+        # Step names are the ones the code uses, so a number is traceable to a line.
+        self.assertEqual(set(document['timings_ms']),
+                         {'state', 'prefer_tsc_clocksource'})
+        for step, milliseconds in document['timings_ms'].items():
+            self.assertIsInstance(milliseconds, int, step)
+            self.assertGreaterEqual(milliseconds, 0, step)
+
+    def test_a_refused_step_still_reports_what_it_managed_to_time(self):
+        # A failure is exactly when an operator wants the numbers, so the refusal path
+        # carries them too rather than only the success path.
+        with tempfile.TemporaryDirectory() as directory:
+            program, sudoers, owned = self.guest_paths(directory)
+            payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                       'prefer_tsc_clocksource': True, 'timings': True}
+            # The clocksource attributes are deliberately left out of `owned`, so the
+            # recorded owner is this test user rather than root and the opt-in refuses.
+            code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                                                    root_owned=())
+
+        self.assertEqual(code, 1)
+        document = json.loads(output)
+        self.assertEqual(document['state'], 'unknown')
+        self.assertIn('prefer_tsc_clocksource', document['timings_ms'])
+
+    def test_the_timings_flag_is_off_unless_the_operator_asks(self):
+        # The default has to be off, or every caller pays for measurement and every
+        # status document a controller has parsed gains a field.
+        self.assertNotIn('--timings', self.arguments('prepare'))
+        self.assertIn('--timings', self.arguments('prepare') + ['--timings'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -1130,6 +1130,12 @@ extraction and `yarn install` timings are consistent with that.
 
 #### Workspace tmpfs, which turned out to be much worse
 
+There is now a second, independent reason not to use this option. The bake described above puts
+the bench at `/home/runner/work/frappe/frappe`, which is where a job's workspace is, so a tmpfs
+over that directory would cover the bench and a job would find nothing there. Guest preparation
+refuses the combination, reading the bake's own manifest rather than a path written here twice, so
+the opt-in now fails loudly instead of producing a job that silently tests an empty workspace.
+
 `--workspace-tmpfs-mib` mounts a tmpfs over `/home/runner/work`, which covers the checkout, the
 action cache staging directory, `node_modules`, the Python environment and the built assets. One
 run at 2560 MiB, the most the guest's 2048 MiB reserve allows alongside the database's own 2 GiB,
@@ -1257,6 +1263,132 @@ own definition unless the original never resumes. The runner's registration file
 snapshot, so registration has to happen after resume, which leaves the roughly 10 s GitHub
 delivery tail. This is a substantial and security-sensitive build, not a flag.
 
+#### A wedged pool blocks the warm-start change, and the cause is in Central
+
+Recording this because it is now the blocker for the change above, and because the shape of it is
+worth knowing before anyone tries it.
+
+An idle pool was left with `scale_set_id` pointing at a deleted scale set, and setting it back is
+refused with "Drain every runner lease before changing pool identity or image". Every lease is
+already `phase: deleted` and every runner is gone from GitHub, so the message points at nothing.
+The count that produces it is `active_leases`, which treats a lease as active when `phase !=
+"deleted"`
+**or** `jit_state != "removed"`; exactly one lease is `phase: deleted` with `jit_state: ready`.
+
+The reconciler is what put it there. `mark_deleted` in `central/integrations/runway.py` sets the
+phase and `vm_state`, then clears the JIT state only when it was `none`:
+
+```python
+if lease.jit_state == "none": lease.jit_state = "removed"
+```
+
+A lease whose VM disappears *after* its JIT configuration was issued therefore keeps `jit_state:
+ready` forever. That state is unreachable by reconciliation, because `reconcile_lease` returns
+early once the phase is `deleted`, and it is not reachable by running a controller, because the
+same early return applies. The only transition that clears it is a `runner_removed` event, and
+that needs the controller's own fence.
+
+The consequence is not cosmetic. `scale_set_id` and `image_id` are both immutable pool fields, so
+a pool in this state cannot be repointed at a new image at all, which is exactly the operation the
+warm artifact requires. The trigger is ordinary: stop the controller between a lease being issued
+and its teardown, which is what an operator does every time they stop one deliberately.
+
+Two things follow. The recovery needs a Central-side answer, either clearing `jit_state` when the
+phase goes to `deleted` or having `active_leases` ignore a JIT state on a lease that is already
+deleted. And until one of those exists, the operational rule is to let the controller finish the
+lease it is holding rather than killing it, because the pool's identity cannot be changed again
+afterwards.
+
+This is recorded rather than fixed. The runner pool and lease code is uncommitted local work in
+the control plane's installed app, so changing its state machine belongs with whoever owns that
+work.
+
+#### What preparation actually costs, measured from inside the guest
+
+This section replaces an estimate with a measurement. `--timings` reports what each preparation
+step cost, and one job with the port opt-in set produced exactly one prepare:
+
+| step | cost |
+| --- | ---: |
+| `kernel_publish` | 5590 ms |
+| `state` | 465 ms |
+| `grant_runner_sudo` | 77 ms |
+| whole preparation | 6132 ms |
+
+The port proof is 91% of preparation. It restarts Docker and then starts a throwaway container
+from the guest's own store and waits for its loopback port to answer, which is the price of never
+reporting success for a setting the daemon ignored.
+
+That corrects an earlier estimate in this document, which put the opt-in at about 4 s of
+provision. That figure came from comparing two runs whose Metal start phases differed by 36 s, so
+it was measuring the wrong thing. The direct figure is 5.59 s, and the honest trade is now 5.59 s
+of dispatch for 58.35 s of test phase.
+
+It also says where the next saving is, if there is one. The proof exists only because the image
+does not already carry `"userland-proxy": false`; a fresh clone therefore always pays for a
+rewrite, a Docker restart and a container start. Baking the key into the image would leave
+preparation with only the verification, and the restart would disappear from the critical path
+entirely. That is the same argument as the warm artifact, in the guest rather than the host, and
+it needs an image rebuild rather than a flag.
+
+That rebuild has now been made. `guest/prepare-frappe-image.sh` writes the key into the daemon
+configuration, preserving every other key and validating the file with `dockerd --validate`
+before anything is pointed at it, and records the value it reads back in the image manifest. The
+guest preparation already had the path for a configuration that already carried the setting: it
+confirms the setting and stops, rather than rewriting an identical document and restarting Docker
+for nothing. What remains is the proof, which still starts a throwaway container on a loopback
+port and requires both that the port answers and that no `docker-proxy` process was left behind.
+The saving is the Docker restart, and it has not been measured on an image that carries the key
+yet.
+
+The same run recorded 190 `status` calls at 6 to 10 ms each, which is the controller's
+three-second reconcile ticker asking a question it almost always already knows the answer to. Each
+is cheap in the guest and more expensive in SSH, and nothing here suggests it is worth changing.
+
+
+#### The image retention fix, verified
+
+The 37 s start described above was `cache_image`, and it is fixed. Three runs after the host was
+told to retain the image:
+
+| Metal `start` phase | 1.37 s | 1.39 s | 1.37 s |
+| --- | ---: | ---: | ---: |
+| slow starts | 0 of 3 | | |
+
+Before, two of five consecutive starts had cost 37.12 s and 37.76 s against 1.40, 1.40 and 1.39 s
+for the rest. After, all three are 1.37 to 1.39 s with a spread of 0.02 s. The host's
+`image-policies.json` now lists the image with `cache_image` set, and the ZFS dataset is still
+present with a `@ready` snapshot beside it, where before it had been pruned within the hour.
+
+The causal step needed an eviction to measure rather than infer, so the image was destroyed from the
+host and one job dispatched against it. Two VMs started inside that single run:
+
+| Metal `start` phase | 28.50 s | 1.37 s |
+| --- | ---: | ---: |
+| image present or absent | absent, fetched | present |
+
+The first is the fetch, measured rather than inferred, and it lands where the earlier 37 s did. The
+host re-fetched and re-retained it, so `cache_image` survives a cold miss. That closes the caveat
+the three retained-image runs could not close on their own.
+
+And the guest got slower, which this change should not be able to cause. Over the same three runs:
+
+| measurement | kernel-published baseline | these three runs |
+| --- | ---: | ---: |
+| provision | 28.31 s | 29.41 s, sd 1.08 s |
+| Environment Setup | 168.50 s | 174.97 s |
+| Run Tests | 426.78 s | 438.32 s |
+| whole job | 639.3 s | 660 s |
+
+Provision is unchanged within its own spread, which is the phase this fix acts on. The test phase
+is 11.54 s slower and Environment Setup 6.47 s slower, so the job is about 21 s slower, and
+nothing here explains it. `cache_image` only affects whether the host fetches an artifact before
+the guest exists, so it cannot reach the guest's own execution, but a retained 9.7 GB image does
+compete with the host's page cache and this is the shape that would show it if it were real. It is
+recorded as an open question rather than a cost, because one afternoon of three runs cannot
+separate it from ordinary drift in a guest whose egress to GitHub varies by threefold.
+
+
 #### vCPU pinning does not exist, and this host is not the configuration people warn about
 
 Firecracker does not pin vCPU threads to cores. Its affinity is NUMA-node granularity, and the
@@ -1317,3 +1449,45 @@ sell. It also means re-implementing the `ac` claim check on the token, because a
 not is a cross-branch cache poisoning hole, and it risks silently dropping to a single stream with
 a 5 s socket timeout if the hostname does not match. Given that the underlying cause is documented
 and unfixable by GitHub, this is a cost decision rather than an engineering one.
+
+## Final measurement: three disposable guests
+
+The image built after `34742cb` is Atlas image `986bb2230fa750c8`, a 10 GiB artifact with raw
+SHA256 `d8e7a737a9fcb181a243164bfe5b9391749cadb222f5d4d3315af7d7a50fbbe2`. Each run below is a
+**fresh** VM booted from that image, because a self-hosted runner that is reused between jobs keeps
+the previous job's site, database and test artefacts. That reuse is a property of a long-lived
+runner, not of the image: the second job on one reused guest reported `Tests: 708, Failing: 3,
+Errors: 23`, and the production controller does not reuse guests. Every number here is therefore
+one job on one new VM at the pool's shape, 3 vCPU / 6144 MiB / 14336 MiB.
+
+| Run | Guest | Environment Setup | Run Tests | Job | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| [37560797473](https://github.com/BreadGenie/frappe/actions/runs/37560797473) | vm-0000084 | 76 s | 481 s | 591 s | 708 passed |
+| [37563703905](https://github.com/BreadGenie/frappe/actions/runs/37563703905) | vm-0000085 | 87 s | 478 s | 636 s | 708 passed |
+| [37565097893](https://github.com/BreadGenie/frappe/actions/runs/37565097893) | vm-0000086 | 83 s | 480 s | 637 s | 708 passed |
+| **mean** | | **82 s** | **480 s** | **621 s** | 3/3 green, 0 failing, 0 errors |
+
+The setup phase is what the bake changes, and it is the clearest result here: **82 s mean against
+191 s for the same 3 vCPU guest without the bake**, a saving of about 109 s. Against the GitHub-hosted
+reference in the same-day baseline, which took 93 s, the baked guest is now slightly *faster* at
+setup than a hosted runner, because the hosted runner has nothing preinstalled and this one carries
+the bench, its dependencies and its built assets.
+
+The test phase did not move: 480 s mean here, against 484 s and 492 s in the two earlier Runway runs
+recorded above. It is CPU-bound at 3 vCPU while GitHub reports 4, and the bake does not touch it.
+This is the same conclusion the earlier baked-image trial reached, now with three samples instead of
+one.
+
+The job total is 621 s mean against roughly 700 s to 762 s for the earlier Runway runs, and still
+behind the 345 s to 512 s range of the hosted reference. The honest reading is that the bake buys
+about 110 s of setup and does not close the test-phase gap, so a Frappe job on this pool is faster
+than it was and slower than GitHub's own runner.
+
+One number from earlier in this work should not be compared with the table: a 29 s setup came from a
+guest whose workspace had already been restored, so it measured the fast path's second visit rather
+than a cold guest. The 82 s mean is the number a new VM actually produces, and it includes about
+19 s to extract `/opt/runway/bench.tar.gz`.
+
+Disk headroom was the difference between this table and the earlier failed attempts. At 10240 MiB a
+guest finished a job with about 1.4 GiB free and Redis began refusing writes; at 14336 MiB the same
+job finished with 5.5 GiB free. That is a capacity result, not a benchmark fluke.

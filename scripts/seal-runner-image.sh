@@ -56,6 +56,9 @@ readonly docker_data_root=/var/lib/docker
 # benefits from actually live. Both directories are preserved, and a store split
 # across them is not a store this sealer can vouch for.
 readonly containerd_data_root=/var/lib/containerd
+# Where the bake records what it built. Read by validate_bench_manifest below, which
+# decides whether a claimed bench is really in this guest.
+readonly bench_manifest=/etc/runway-frappe-bench.json
 
 # The three service images the Frappe server-integration workflow declares. These
 # are repeated here on purpose rather than read out of the manifest: the manifest
@@ -218,6 +221,29 @@ assert_container_cache_manifest() {
   validate_manifest
 }
 
+# The bake records what it built. Publication must not take the recipe's word for it,
+# for the same reason the container guard above does not: an image whose bench quietly
+# disagrees with the workflow is worse than an image with no bench, because every job
+# would take the fast path and test code the image never contained. So the recorded
+# sizes are compared against the filesystem, rather than trusted as a description of it.
+validate_bench_manifest() {
+  if [[ ! -f $bench_manifest ]]; then
+    echo 'No bench manifest to validate.' >&2
+    echo 'Run guest/prepare-frappe-bench.sh in this builder, or do not claim a baked bench.' >&2
+    exit 1
+  fi
+  # The validator is a file of its own so it can be tested without a builder guest.
+  # It is resolved relative to this script rather than by absolute path, because the
+  # builder carries scripts/ alongside guest/ and the two travel together.
+  local scripts_dir=${BASH_SOURCE[0]%/*}
+  local validator=$scripts_dir/validate_bench_manifest.py
+  [[ -f $validator ]] || {
+    echo 'validate_bench_manifest.py is missing beside the sealer.' >&2
+    exit 1
+  }
+  python3 "$validator" "$bench_manifest" || exit 1
+}
+
 # Every pinned image must be present at exactly the reviewed digest, the workflow's
 # tag must resolve to that same content, and the store must hold those three images
 # and nothing else.
@@ -262,6 +288,18 @@ assert_exact_pinned_store() {
 # below: anything a job or the bake wrote there is not image content. On the
 # preserving path the removal happens only after the guard above has checked that
 # there was nothing there to begin with, so the guard sees the guest as it was.
+# A claimed bench is checked before anything is preserved or stopped, and on both seal
+# paths, because a Frappe image can carry a bench without carrying container images.
+# It runs here so a guest this seal cannot vouch for is refused while it is still
+# inspectable, rather than half-preserved on the way to finding out.
+if grep -qs '^FRAPPE_BENCH_BAKED=yes$' /etc/runway-runner-image.txt; then
+  validate_bench_manifest
+elif [[ -f $bench_manifest ]]; then
+  echo 'This guest carries a bench manifest but its image manifest does not claim one.' >&2
+  echo 'Publish it as a Frappe bake or remove the manifest; do not seal it as a plain profile.' >&2
+  exit 1
+fi
+
 if ((preserve_container_images)); then
   [[ -d $docker_data_root ]] || {
     echo "--preserve-container-images found no $docker_data_root in this guest." >&2
@@ -310,6 +348,13 @@ else
 fi
 
 systemctl stop atlas-metadata.service
+# sshd has to be stopped before the host keys go, not merely after. sshd regenerates a
+# missing host key when it starts, so deleting the files while it is still running leaves
+# a guest that grows a fresh identity minutes later: an image built this way sealed
+# cleanly and still exported a host key, and the finalizer refused it. Stopping the
+# service first is what makes the deletion the last word. The guest is disposable and is
+# destroyed after export, so nothing here is needed afterwards.
+systemctl stop ssh.service ssh.socket sshd.service 2>/dev/null || true
 rm -rf "$runner/_diag" "$runner/_work"
 apt-get clean
 rm -rf /var/lib/apt/lists/*
