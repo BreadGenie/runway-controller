@@ -187,6 +187,34 @@ func TestCentralRPCSendsFencingAndKeepsSecretsOutOfErrors(t *testing.T) {
 	}
 }
 
+// The labels reached Central only because Update builds a map by hand. Encoding the event
+// itself dropped them silently, which is what this asserts: a job's repository and labels
+// must survive any encoding of the event, not just this one call path.
+func TestLeaseEventEncodingCarriesRepositoryAndLabels(t *testing.T) {
+	event := leaseEvent{
+		Repository:    "BreadGenie/frappe",
+		RequestLabels: "self-hosted\nrunway-2vcpu-6gb",
+		RequestID:     42,
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["repository"] != "BreadGenie/frappe" {
+		t.Fatalf("repository lost in encoding: %s", encoded)
+	}
+	if got["request_labels"] != "self-hosted\nrunway-2vcpu-6gb" {
+		t.Fatalf("labels lost in encoding: %s", encoded)
+	}
+	if got["request_id"] != float64(42) {
+		t.Fatalf("request id lost in encoding: %s", encoded)
+	}
+}
+
 func TestControllerConfigRequiresHTTPSExceptLiteralLoopback(t *testing.T) {
 	cases := []struct {
 		name    string

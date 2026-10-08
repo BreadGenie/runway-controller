@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -159,7 +160,7 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 			// the only point at which refusing is still free. A pool whose image is baked for
 			// another repository cannot serve this job, and learning that after the VM boots
 			// costs a boot and a failing job rather than a message.
-			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID, Repository: job.OwnerName + "/" + job.RepositoryName, RequestLabels: job.RequestLabels})
+			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID, Repository: job.OwnerName + "/" + job.RepositoryName, RequestLabels: strings.Join(job.RequestLabels, "\n")})
 			if err != nil {
 				return err
 			}

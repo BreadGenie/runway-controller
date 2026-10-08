@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -78,7 +77,7 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		l.AcquireState = "pending"
 		l.JobID = fields.JobID
 		l.Repository = fields.Repository
-		l.RequestLabels = strings.Join(fields.RequestLabels, "\n")
+		l.RequestLabels = fields.RequestLabels
 	case "acquired":
 		l.AcquireState = "acquired"
 	default:

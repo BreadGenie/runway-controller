@@ -69,9 +69,10 @@ type leaseEvent struct {
 	Result        string `json:"result,omitempty"`
 	Error         string `json:"error,omitempty"`
 	Repository    string `json:"repository,omitempty"`
-	// RequestLabels arrives as one label per line, which is how the lease stores it.
-	// Joined at the call site rather than here, so the struct keeps the job's own shape.
-	RequestLabels []string `json:"-"`
+	// RequestLabels travels as one label per line, which is how the lease stores it. It is
+	// a string rather than a slice so that encoding this struct carries the labels: a
+	// `json:"-"` slice looked correct and meant any encoding of an event silently lost them.
+	RequestLabels string `json:"request_labels,omitempty"`
 }
 
 // Central is the sole authority for ownership, capacity, lease state and VMs.
@@ -231,7 +232,7 @@ func (c *centralRPC) Reserve(ctx context.Context, id string) (pilotLease, error)
 }
 func (c *centralRPC) Update(ctx context.Context, id, event string, fields leaseEvent) (pilotLease, error) {
 	var result pilotLease
-	values := map[string]any{"lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": strings.Join(fields.RequestLabels, "\n")}
+	values := map[string]any{"lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": fields.RequestLabels}
 	err := c.call(ctx, "update_lease", values, &result)
 	return result, err
 }
