@@ -47,8 +47,8 @@ properties of the image record, not conventions inside a build script.
   adopter takes.
 - The pairing is checked when a runner is selected, so a mismatch is a refusal with a reason, not a
   job that fails at site creation.
-- Labels carry shape. A label written in `runs-on` resolves to a machine specification, so a
-  repository selects capacity the way it selects an operating system today.
+- A scale set's name is the label a repository writes, so naming it after the machine is how a
+  repository selects capacity by changing one line.
 
 A team that adopts Runway changes one line in their workflow and nothing else.
 
@@ -66,16 +66,16 @@ A team that adopts Runway changes one line in their workflow and nothing else.
    not billed for a VM that was never going to work.
 6. As a repository owner, I want `runs-on` to state the machine shape I want, so that changing my
    CI capacity is a pull request like any other.
-7. As a repository owner, I want a small set of named shapes, so that I am not inventing a
-   specification per job and guessing which one exists.
+7. As a repository owner, I want to pick from the shapes that actually exist, so that I am not
+   inventing a specification per job and guessing which one is built.
 8. As a repository owner, I want my existing self-hosted label to keep working during a migration,
    so that a workflow edit does not silently stop matching any runner.
 9. As a repository owner, I want an unmatched label to fail loudly, so that a typo does not queue
    forever.
 10. As an operator, I want a pool's image to declare what it is for, so that I can tell from the pool
     record whether it is safe to point at a given repository.
-11. As an operator, I want a label-to-shape table I can read and edit, so that adding capacity does
-    not require a code change.
+11. As an operator, I want adding capacity to be creating a pool, not editing a table, so that a
+    published label can never disagree with what can be built.
 12. As an operator, I want the shape a job actually got recorded, so that I can explain a slow job and
     attribute its cost.
 13. As an operator, I want a bake to refuse a repository it was not declared for, so that a
@@ -125,20 +125,43 @@ A team that adopts Runway changes one line in their workflow and nothing else.
 - **The job-time layout guard stays.** The existing bench-root comparison in the setup action remains
   as a cheap second line. It is redundant with the selection check and is kept because a guest can
   outlive the record that selected it.
-- **Labels carry shape.** A label of the form `runway-<cpus>-<memory>-<disk>` resolves to a machine
-  specification. The resolution is a pure function of the label over a readable, operator-editable
-  table, so adding capacity is a configuration change.
-- **A pool's shape fields remain the default.** When a job's label resolves to no explicit shape, the
-  pool's own shape is used. A pool created before this change therefore keeps booting the same
-  machine.
+- **The scale set's name is the label, and the name carries the shape.** A label written in `runs-on`
+  is of the form `runway-<vcpu>vcpu-<memory>gb`, such as `runway-4vcpu-8gb`. GitHub routes a job to a
+  scale set by matching one of that scale set's labels, and a scale set's name is one of them, so
+  naming the scale set after the machine is what lets `runs-on` reach that machine and nothing else.
+  The disk is absent because no label states one: it comes from the pool.
+- **The grammar is read, never configured.** Adding a shape is creating a pool and naming its scale
+  set after the machine. There is no label-to-shape table, so there is no way for a published label
+  to disagree with what can be built.
+- **A shape label is a guard, not a scheduler.** A scale set's runners are homogeneous, so a pool is
+  one machine class. A label either names exactly the machine that pool builds, or names no shape at
+  all and takes the pool's own. It cannot quietly ask for a different one, because a job written
+  against the wrong label would run on a machine it was never admitted to, which is the same silent
+  mismatch as a bench restored into the wrong workspace.
+- **A pool refuses a name that contradicts it.** A scale set named `runway-4vcpu-8gb` against a pool
+  building 1 vCPU and 2 GiB is refused when the pool saves, where it is one line to fix, rather than
+  at acquisition. The name must also be routable: `runway`-prefixed, lowercase. The runway CLI
+  enforces the same pattern, so an operator cannot create a name the pool will refuse.
+- **A name that states no shape still works.** `runway-dogfood` states nothing to check and keeps its
+  meaning, so a pool that predates shapes does not have to be renamed.
+- **A pool's shape fields remain the default.** When a job's label names no shape, the pool's own
+  shape is used. A pool created before this change therefore keeps booting the same machine.
 - **The resolved shape is recorded on the lease.** The specification a job was given is stored at
   lease creation, so reconciliation and cost attribution do not depend on a label that may have
   changed since.
 - **The scale-set message's request labels are the input.** The label written in `runs-on` arrives with
   the job message and is the only new signal the controller needs. No protocol change is required.
-- **An unresolvable label does not match.** A label that names a shape which does not exist, or that
-  does not parse, matches no pool rather than matching a default. A typo must not queue forever
-  against whatever happens to be running.
+- **A label that fails loudly, rather than falling back.** A label that claims a shape but names one
+  this pool does not serve, or that does not parse as a shape at all, is refused naming the cause. A
+  label is only exempt when it never claimed to be a shape: `self-hosted`, `runway-dogfood`, `linux`.
+  The alternative, silently taking the pool's shape, would run a job on a machine its own label did
+  not ask for and report success.
+- **A typo in `runs-on` queues at GitHub, not here.** A repository writing `runway-4vcup-8gb` when no
+  scale set carries that label matches no scale set, so GitHub queues the job and no refusal is ever
+  issued. That is GitHub's routing, not a gap in this rule, and the remedy is the pool check above:
+  the only way such a name reaches a pool is if an operator created it, and the pool then refuses it.
+- **A job that reaches a pool whose shape it did not ask for is refused.** This is the case a pool can
+  still see, because the label matched some other label on the scale set.
 - **A pool serves a repository or it does not.** A pool whose image is targeted at one repository is
   not offered jobs from another. This is a selection rule, not an admission rule, so a job for an
   unmatched repository is not queued at a pool that would refuse it.
@@ -191,13 +214,16 @@ first, because label resolution is additive and safe to defer, whereas the layou
 correctness bug that has already shipped once and will ship again the next time a repository adopts
 with a different name.
 
-Two things in this spec are deliberately not designed yet:
+The pool-holds-several-shapes question is settled, by what GitHub will actually route: one pool
+equals one shape, and a repository's label selects the pool. GitHub matches a job against a scale
+set's labels, and a scale set's name is one of them, so a single scale set cannot present several
+sizes and honour which one a job asked for. Naming the scale set after the machine makes the label
+and the pool the same object, which is why there is no table and no clamping.
 
-- Whether a pool holds several shapes and picks one per job, or one pool equals one shape and a
-  repository's label selects the pool. The second is simpler and matches how a scale set is
-  configured today; the first scales better. The label lookup is written so either can sit behind it.
-- How a repository discovers which labels exist. A hard-coded list in documentation is enough to
-  start; an API that reports shapes per team is the thing that makes it self-serve.
+How a repository discovers which labels exist is still open. The pool list is the answer today, and
+it is honest, because a label that no pool carries will not be built. It is not self-serve, though:
+a repository owner has to ask which shapes exist. An API that reports the shapes a team actually has
+runners for is the thing that makes this discoverable rather than published.
 
 The withdrawn measurement in the performance report is the reason the fast path is worth having, and
 also the reason it is worth being careful about: the three green runs that first looked convincing
