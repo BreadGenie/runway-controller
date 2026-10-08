@@ -38,13 +38,14 @@ def validate(manifest_path):
     # An exact key set, for the reason the container guard uses one: an unexpected key is
     # the only way an extra field could ride into a shared artifact.
     expected = {'archive', 'bench_root', 'frappe_commit', 'frappe_ref', 'frappe_repository',
-                'node_version', 'python_version', 'size_mib'}
+                'node_version', 'python_version', 'size_mib', 'workspace_repository'}
     if set(manifest) != expected:
         fail(f"declares keys {sorted(manifest)}, expected {sorted(expected)}.")
 
     for key, pattern in (('frappe_commit', r'[0-9a-f]{40}'),
                          ('frappe_ref', r'[0-9a-f]{40}'),
                          ('frappe_repository', r'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+'),
+                         ('workspace_repository', r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*'),
                          ('node_version', r'[0-9]+\.[0-9]+\.[0-9]+'),
                          ('python_version', r'[0-9]+\.[0-9]+\.[0-9]+')):
         if not isinstance(manifest[key], str) or not re.fullmatch(pattern, manifest[key]):

@@ -659,6 +659,10 @@ sys.exit(0)
         # one that matters here: the bake reads it in preference to its own default, so a
         # runner exporting it made every test look at the host's real tool cache instead of
         # the private tree, and the toolchain guard fired before the guard under test.
+        # The RUNWAY_ declarations are the exception: they are what an image record supplies
+        # to a build, so a test sets them deliberately and they must survive. Scrubbing them
+        # was the same class of mistake as inheriting a runner's, and it showed up as every
+        # bake test reporting a missing declaration.
         for name in ('RUNNER_TOOL_CACHE', 'RUNNER_WORKSPACE', 'FRAPPE_BENCH_REPOSITORY',
                      'FRAPPE_BENCH_REF'):
             environment.pop(name, None)
@@ -912,6 +916,9 @@ class SealTests(Harness):
             'bench_root': str(bench),
             'frappe_commit': head, 'frappe_ref': head,
             'frappe_repository': 'https://github.com/example/frappe.git',
+            # Stated, because the sealer checks the key set exactly and a fixture that
+            # omitted it would stop there instead of reaching the check it names.
+            'workspace_repository': 'example/frappe',
             'node_version': '24.21.0', 'python_version': '3.14.7',
             'size_mib': {key: self.bench_size_mib(bench, key) for key in
                          ('app', 'assets', 'env', 'node_modules')},
@@ -1211,6 +1218,12 @@ class FinalizeSizeTests(Harness):
         self.assertNotIn('exactly one exported filesystem', result.stderr)
 
 
+# Marks "whatever this harness routes the workspace to", which is the one declaration that
+# agrees with the workspace the script runs against. None and a real path are then the only
+# two other cases, which is exactly what the tests need to distinguish.
+_COHERENT_BENCH_ROOT = object()
+
+
 class BakeRecipeTests(Harness):
     """The bake's refusals, and the one thing it asserts about its own output.
 
@@ -1267,7 +1280,29 @@ esac
             stub.write_text('#!/bin/sh\nexit 0\n')
             stub.chmod(0o755)
 
-    def run_bake(self, *extra, euid=0):
+    # The image record's declaration, which the bake now requires. Stated here rather than
+    # defaulted inside the script, because a test that inherits the script's own default is
+    # how a fixture ends up agreeing with the code it is meant to check. The bench root is
+    # the routed form, because the harness rewrites guest paths in the script and the bake
+    # compares the declaration against the same rewritten workspace.
+    WORKSPACE_REPOSITORY = 'BreadGenie/frappe'
+    # The routed form of the same path. It is a property of the harness rather than a
+    # constant, because the harness rewrites guest paths in the script and the bake compares
+    # the declaration against that rewritten workspace. A hard-coded guest path here would
+    # not match what the bake sees.
+    @property
+    def bench_root(self):
+        return str(Path(self.root + '/home/runner/work/frappe/frappe'))
+
+    def run_bake(self, *extra, euid=0, workspace_repository=WORKSPACE_REPOSITORY,
+                 bench_root=_COHERENT_BENCH_ROOT):
+        """Run the bake with the declaration an image record would supply.
+
+        `None` for either argument means the record declared nothing, which is how the
+        tests cover a build given no declaration. The default bench root is the routed
+        workspace path: that is what a coherent declaration looks like, and every refusal
+        after the declaration is reached through it.
+        """
         # The bake resolves its archive checker at ../scripts/, so the routed copy lives
         # in guest/ and the checker is staged in scripts/ beside it, matching the layout
         # the builder carries.
@@ -1275,6 +1310,16 @@ esac
         scripts.mkdir(parents=True, exist_ok=True)
         (scripts / 'check_bench_archive.sh').write_text(
             (HERE / 'check_bench_archive.sh').read_text())
+        if bench_root == _COHERENT_BENCH_ROOT:
+            bench_root = self.bench_root
+        declared = {'RUNWAY_WORKSPACE_REPOSITORY': workspace_repository,
+                    'RUNWAY_BENCH_ROOT': bench_root}
+        for name, value in declared.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.addCleanup(lambda: [os.environ.pop(n, None) for n in declared])
         return self.run_script(BAKE, [BUILDER_FLAG, *extra], euid=euid, name='bake.sh',
                                in_guest_dir=True)
 
@@ -1377,6 +1422,39 @@ esac
                     del os.environ[name]
                 self.assertIn('no manifest to explain it', result.stderr,
                               f'{name} leaked into the test environment')
+
+    def test_a_bake_with_no_declared_repository_is_refused(self):
+        """An image that does not say which repository it is for cannot be matched to a job.
+
+        The alternative was a default inside the bake, and a default is what published an
+        image that reported its bake as usable and then failed: the bench was built one
+        directory away from where the job looked.
+        """
+        result = self.run_bake(workspace_repository=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must declare the repository', result.stderr)
+
+    def test_a_bake_with_no_declared_bench_root_is_refused(self):
+        result = self.run_bake(bench_root=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must declare where that bench lives', result.stderr)
+
+    def test_a_bench_root_that_is_not_the_jobs_workspace_is_refused(self):
+        """A path no job's GITHUB_WORKSPACE can equal means the fast path never runs.
+
+        The bench is built into the declared directory, the job restores into its own
+        workspace, and the difference is the class of bug this declaration exists to remove.
+        """
+        result = self.run_bake(bench_root='/somewhere/else/frappe/frappe')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('A bench is not relocatable', result.stderr)
+        self.assertIn('would look in', result.stderr)
+
+    def test_a_repository_name_with_a_path_in_it_is_refused(self):
+        """A repository is owner/name; a path there would resolve to the wrong bench."""
+        result = self.run_bake(workspace_repository='BreadGenie/frappe/extra')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('would look in', result.stderr)
 
     def test_the_flag_is_required(self):
         result = self.run_script(BAKE, [], name='bake.sh', in_guest_dir=True)

@@ -24,3 +24,21 @@ func TestPartialRunwayAppCredentialsDoNotFallbackToGH(t *testing.T) {
 		})
 	}
 }
+
+// The CLI must not create a scale set name that Central would then refuse on a pool, since
+// that would only be discovered at pool save. These are the same values the pool's own
+// validation refuses.
+func TestScaleSetNameMatchesWhatAPoolAccepts(t *testing.T) {
+	accepted := []string{"runway-dogfood", "runway-frappe", "runway-4vcpu-8gb", "runway-a"}
+	for _, name := range accepted {
+		if !scaleSetName.MatchString(name) {
+			t.Errorf("pool would accept %q, but the CLI refuses it", name)
+		}
+	}
+	refused := []string{"dogfood", "Runway-4vcpu-8gb", "runway_4vcpu_8gb", "runway-4VCPU-8GB", "runway", "", "runway-"}
+	for _, name := range refused {
+		if scaleSetName.MatchString(name) {
+			t.Errorf("the CLI would create %q, but a pool refuses it", name)
+		}
+	}
+}

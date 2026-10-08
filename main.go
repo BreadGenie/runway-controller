@@ -23,6 +23,10 @@ import (
 
 var repositoryURL = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 
+// scaleSetName matches what Central accepts as a Runner Pool scale set name, so a name the
+// CLI will create is a name the pool will accept.
+var scaleSetName = regexp.MustCompile(`^runway-[a-z0-9-]{1,56}$`)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -51,11 +55,11 @@ func run() error {
 	}
 	switch *action {
 	case "create", "lookup":
-		if !regexp.MustCompile(`^runway-[a-z0-9-]{1,56}$`).MatchString(*name) {
+		if !scaleSetName.MatchString(*name) {
 			return errors.New("--name must begin runway- and contain lowercase letters, numbers or hyphens (max 63 characters)")
 		}
 	case "jit":
-		if *id <= 0 || *out == "" || !regexp.MustCompile(`^runway-[a-z0-9-]{1,56}$`).MatchString(*name) {
+		if *id <= 0 || *out == "" || !scaleSetName.MatchString(*name) {
 			return errors.New("jit requires positive --id, new --out file, and runway-prefixed --name")
 		}
 	case "delete":
@@ -63,7 +67,7 @@ func run() error {
 			return errors.New("delete requires positive --id")
 		}
 	case "listen":
-		if *id <= 0 || *journal == "" || *timeout <= 0 || !regexp.MustCompile(`^runway-[a-z0-9-]{1,56}$`).MatchString(*name) {
+		if *id <= 0 || *journal == "" || *timeout <= 0 || !scaleSetName.MatchString(*name) {
 			return errors.New("listen requires --id, --journal, positive --timeout, and the exact runway-prefixed JIT runner --name")
 		}
 	default:
