@@ -389,6 +389,47 @@ func TestControllerAcquireCarriesRepositoryAndLabels(t *testing.T) {
 	}
 }
 
+// A lease is reserved on demand, before any job is available. The reconciler then provisions
+// it, and once its phase has left "reserved" the acquire branch can never run again, so the
+// job's repository and labels are never recorded and the pairing guard never sees them.
+func TestAProvisionedLeaseStillRecordsTheJobItIsGiven(t *testing.T) {
+	s := newPilotStore()
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
+
+	// Demand exists but no job has been offered yet: a lease is reserved.
+	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	// The reconciler provisions it, which moves the phase past reserved. Central accepts a
+	// reserved lease with no job recorded, so this is what really happens.
+	if _, err := s.EnsureVM(context.Background(), e.snapshot.Leases[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := s.EnsureVM(context.Background(), e.snapshot.Leases[0].ID)
+	e.remember(updated)
+	if e.snapshot.Leases[0].Phase != "vm_ready" {
+		t.Fatalf("test needs a provisioned lease, got %q", e.snapshot.Leases[0].Phase)
+	}
+
+	// The job arrives only now. Its repository and labels must still be recorded.
+	msg := &scaleset.RunnerScaleSetMessage{MessageID: 3, JobAvailableMessages: []*scaleset.JobAvailable{
+		{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 77, JobID: "j-late",
+			OwnerName: "BreadGenie", RepositoryName: "frappe",
+			RequestLabels: []string{"runway-2vcpu-6gb"}}},
+	}}
+	if err := e.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range e.snapshot.Leases {
+		if l.Repository != "" {
+			return
+		}
+	}
+	t.Fatal("a job offered to an already-provisioned lease recorded no repository, so the pairing guard is blind to it")
+}
+
 func TestControllerAcquireIntentSurvivesResponseLoss(t *testing.T) {
 	s := newPilotStore()
 	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})

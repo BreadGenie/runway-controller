@@ -151,7 +151,13 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 		if lease.AcquireState == "pending" {
 			return e.acquire(ctx, lease)
 		}
-		if lease.RequestID == 0 && lease.JobID == "" && lease.Phase == "reserved" && len(message.JobAvailableMessages) > 0 {
+		// A job can be offered to a lease that has already been provisioned. The reconciler
+		// reserves on demand, and Central lets a reserved lease be created without a job
+		// recorded, so by the time the job arrives the phase may be vm_ready or later. Keying
+		// this on "reserved" therefore meant the job's repository and labels were dropped, and
+		// with them the pairing check that is supposed to refuse a pool whose image cannot
+		// serve this repository. Any live lease with no job yet takes it.
+		if lease.RequestID == 0 && lease.JobID == "" && len(message.JobAvailableMessages) > 0 {
 			job := message.JobAvailableMessages[0]
 			if job.RunnerRequestID <= 0 {
 				return errors.New("available job omitted a positive request ID; not acknowledged")
