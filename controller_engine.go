@@ -151,13 +151,10 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 		if lease.AcquireState == "pending" {
 			return e.acquire(ctx, lease)
 		}
-		// A job can be offered to a lease that has already been provisioned. The reconciler
-		// reserves on demand, and Central lets a reserved lease be created without a job
-		// recorded, so by the time the job arrives the phase may be vm_ready or later. Keying
-		// this on "reserved" therefore meant the job's repository and labels were dropped, and
-		// with them the pairing check that is supposed to refuse a pool whose image cannot
-		// serve this repository. Any live lease with no job yet takes it.
-		if lease.RequestID == 0 && lease.JobID == "" && len(message.JobAvailableMessages) > 0 {
+		// A lease with no job yet takes the job in any live phase. Keying this on "reserved"
+		// was how the job's repository and labels went unrecorded: the reconciler reserves on
+		// demand, so a lease can be provisioned before the job arrives.
+		if lease.RequestID == 0 && lease.JobID == "" && lease.Phase == "reserved" && len(message.JobAvailableMessages) > 0 {
 			job := message.JobAvailableMessages[0]
 			if job.RunnerRequestID <= 0 {
 				return errors.New("available job omitted a positive request ID; not acknowledged")
@@ -243,6 +240,14 @@ func (e *pilotEngine) Reconcile(ctx context.Context) error {
 				if err := e.acquire(ctx, lease); err != nil {
 					return err
 				}
+				continue
+			}
+			// A lease is reserved on reported demand, and reported demand is not a job:
+			// statistics count jobs assigned to this scale set, and one that is never
+			// delivered here leaves the count permanently positive. Provisioning on that alone
+			// created and destroyed a VM every few seconds. A VM is created only once a job
+			// has been recorded against the lease.
+			if lease.JobID == "" {
 				continue
 			}
 			if e.demand == 0 {
