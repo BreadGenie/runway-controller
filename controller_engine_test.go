@@ -15,6 +15,9 @@ type memoryPilotStore struct {
 	reserveCalls, ensureCalls, deleteCalls int
 	rejectUpdates                          bool
 	loseCreateResponse                     bool
+	// contendEnsureVM refuses the first ensure_vm the way Central does under row-lock
+	// contention, so a test can see whether the engine retries or gives up.
+	contendEnsureVM bool
 }
 
 func newPilotStore() *memoryPilotStore {
@@ -87,6 +90,10 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 }
 func (s *memoryPilotStore) EnsureVM(_ context.Context, id string) (pilotLease, error) {
 	s.ensureCalls++
+	if s.contendEnsureVM {
+		s.contendEnsureVM = false
+		return pilotLease{}, errCentralContended
+	}
 	l := s.find(id)
 	l.VMID = "vm-0000001"
 	if s.loseCreateResponse {
@@ -386,6 +393,41 @@ func TestControllerAcquireCarriesRepositoryAndLabels(t *testing.T) {
 	}
 	if got.RequestLabels != "self-hosted\nrunway-dogfood" {
 		t.Fatalf("labels not carried: %q", got.RequestLabels)
+	}
+}
+
+// A Central HTTP 508 means another transaction held a row past the lock wait timeout. The
+// request was refused before it changed anything, so the lease is intact and waiting one tick
+// is the whole recovery. Returning the error instead killed the GitHub message session, which
+// unregistered the scale set and stalled every queued job behind it.
+func TestAContendedCentralLeaseIsRetriedNotDropped(t *testing.T) {
+	s := newPilotStore()
+	s.contendEnsureVM = true
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
+	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	// First reconcile hits the contention and must not surface it.
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("a contended Central call must be a delay, not a failure: %v", err)
+	}
+	// The lease is still there, still owned, and the next pass succeeds.
+	if len(e.snapshot.Leases) != 1 {
+		t.Fatal("contention discarded a durable lease")
+	}
+	if got := e.snapshot.Leases[0].Phase; got != "reserved" {
+		t.Fatalf("contention advanced the lease to %q", got)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("recovery pass failed: %v", err)
+	}
+	if s.ensureCalls != 2 {
+		t.Fatalf("expected a retry, got %d ensure_vm calls", s.ensureCalls)
+	}
+	if got := e.snapshot.Leases[0].Phase; got != "vm_ready" {
+		t.Fatalf("after the retry the lease is %q, want vm_ready", got)
 	}
 }
 

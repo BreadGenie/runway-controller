@@ -164,6 +164,11 @@ func newCentralRPC(cfg controllerConfig) (*centralRPC, error) {
 	return &centralRPC{baseURL: strings.TrimRight(cfg.CentralURL, "/"), host: cfg.CentralHost, authorization: "token " + credential, pool: cfg.Pool, owner: cfg.OwnerID, http: &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
+// errCentralContended reports a Central refusal caused by a concurrent transaction holding a
+// row lock past its wait timeout. Frappe surfaces this as HTTP 508, and its own message says
+// to retry later, so callers treat it as a delay rather than a failure.
+var errCentralContended = errors.New("Central returned HTTP 508; a concurrent transaction is blocking this one, retry later")
+
 func (c *centralRPC) call(ctx context.Context, method string, fields map[string]any, out any) error {
 	payload := map[string]any{"pool": c.pool, "owner_id": c.owner}
 	if method != "claim_pool" {
@@ -191,6 +196,14 @@ func (c *centralRPC) call(ctx context.Context, method string, fields map[string]
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		// 508 is Frappe's documented "a concurrent transaction is blocking this one, retry
+		// later": a row lock was held past the lock wait timeout. The request was refused
+		// before it changed anything, so the caller's durable lease is intact and retrying is
+		// the entire recovery. It must not be reported as a rejection, because a rejected
+		// mutation tears down the GitHub message session and unregisters the scale set.
+		if response.StatusCode == http.StatusLoopDetected {
+			return errCentralContended
+		}
 		return fmt.Errorf("Central %s rejected (HTTP %d)", method, response.StatusCode)
 	}
 	var envelope struct {

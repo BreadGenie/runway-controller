@@ -246,6 +246,14 @@ func (e *pilotEngine) Reconcile(ctx context.Context) error {
 				continue
 			}
 			updated, err := e.store.EnsureVM(ctx, lease.ID)
+			if errors.Is(err, errCentralContended) {
+				// Central refused because another transaction held a row it needed. Frappe
+				// documents 508 as "a concurrent transaction is blocking this one, retry
+				// later", and the lease is untouched, so waiting one tick is the whole
+				// recovery. Returning the error instead tore down the message session, which
+				// unregistered the scale set from GitHub and stalled every queued job.
+				continue
+			}
 			if err != nil {
 				return err
 			}
