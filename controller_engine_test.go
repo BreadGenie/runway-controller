@@ -198,49 +198,17 @@ func newPilotEngine(s *memoryPilotStore, g *fakePilotGitHub, t *fakeGuestTranspo
 	snap, _ := s.Renew(context.Background(), "")
 	return &pilotEngine{store: s, github: g, guest: t, snapshot: snap, now: time.Now, haveDemand: true, demand: 1}
 }
-
-// prepareVM reserves a lease, records the job it is for, and provisions it, which is the
-// order the controller now requires: a VM is created only once a job has been recorded, so
-// a helper that provisioned a job-less lease would no longer describe anything real.
-// offerJob records a job on the engine's lease, which must happen before a VM is created.
-// It writes through the store rather than the engine so these tests stay about provisioning;
-// the engine's own acquisition path is covered where it is the subject.
-func offerJob(t *testing.T, s *memoryPilotStore, e *pilotEngine) {
-	t.Helper()
-	if len(e.snapshot.Leases) == 0 {
-		t.Fatal("no lease to offer a job to")
-	}
-	id := e.snapshot.Leases[0].ID
-	if _, err := s.Update(context.Background(), id, "acquire_requested", leaseEvent{
-		RequestID: 4242, JobID: "65a0bf0e-2335-5536-afac-ce28104d3b47",
-		Repository: "BreadGenie/frappe", RequestLabels: "runway-2vcpu-6gb",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	l := s.find(id)
-	l.AcquireState = "acquired"
-	e.remember(*l)
-}
-
 func prepareVM(t *testing.T, s *memoryPilotStore) *pilotLease {
 	t.Helper()
-	reserved, err := s.Reserve(context.Background(), "test-lease")
+	l, err := s.Reserve(context.Background(), "test-lease")
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, err := s.Update(context.Background(), reserved.ID, "acquire_requested", leaseEvent{
-		RequestID: 4242, JobID: "65a0bf0e-2335-5536-afac-ce28104d3b47",
-		Repository: "BreadGenie/frappe", RequestLabels: "runway-2vcpu-6gb",
-	})
+	_, err = s.EnsureVM(context.Background(), l.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease := s.find(updated.ID)
-	lease.AcquireState = "acquired"
-	if _, err := s.EnsureVM(context.Background(), lease.ID); err != nil {
-		t.Fatal(err)
-	}
-	return s.find(lease.ID)
+	return s.find(l.ID)
 }
 
 func TestControllerResumesActiveGuestAndCleansCompletedJob(t *testing.T) {
@@ -255,7 +223,6 @@ func TestControllerResumesActiveGuestAndCleansCompletedJob(t *testing.T) {
 	if s.reserveCalls != 1 {
 		t.Fatal("statistics must admit only one lease")
 	}
-	offerJob(t, s, e)
 	for range 2 {
 		if err := e.Reconcile(ctx); err != nil {
 			t.Fatal(err)
@@ -350,14 +317,10 @@ func TestControllerUncertainVMCreateReusesDurableLease(t *testing.T) {
 	g := &fakePilotGitHub{store: s}
 	guest := &fakeGuestTransport{}
 	e := newPilotEngine(s, g, guest)
-	// Reserve, record the job, then reconcile: the create response is lost on this call.
-	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{
-		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1},
-	}); err != nil {
+	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	offerJob(t, s, e)
-	if err := e.Reconcile(context.Background()); err == nil {
+	if e.Reconcile(context.Background()) == nil {
 		t.Fatal("expected create response loss")
 	}
 	e = newPilotEngine(s, g, guest)
@@ -423,57 +386,6 @@ func TestControllerAcquireCarriesRepositoryAndLabels(t *testing.T) {
 	}
 	if got.RequestLabels != "self-hosted\nrunway-dogfood" {
 		t.Fatalf("labels not carried: %q", got.RequestLabels)
-	}
-}
-
-// The reconciler provisions a lease on demand, before any job has been offered, and Central
-// accepts that. But a lease that already has a job recorded is never provisioned again, and
-// a lease with no job must not be provisioned at all: provisioning on demand alone made the
-// controller create and destroy a VM per minute whenever statistics reported assigned jobs
-// that this scale set never received.
-func TestAProvisionedLeaseStillRecordsTheJobItIsGiven(t *testing.T) {
-	s := newPilotStore()
-	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
-	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
-
-	// Demand exists but no job has been offered: a lease is reserved.
-	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1,
-		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	// Reconcile the way the controller does between messages: demand is still reported, and
-	// the lease still has no job.
-	if err := e.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for _, l := range e.snapshot.Leases {
-		if l.VMID != "" {
-			t.Fatalf("a lease with no job was provisioned as %q; demand is not evidence of a job", l.VMID)
-		}
-	}
-}
-
-// A job offered while the lease is still reserved records who it is for, which is what the
-// pairing check needs.
-func TestAJobOnAReservedLeaseRecordsItsRepositoryAndLabels(t *testing.T) {
-	s := newPilotStore()
-	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
-	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
-	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1,
-		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	msg := &scaleset.RunnerScaleSetMessage{MessageID: 2, JobAvailableMessages: []*scaleset.JobAvailable{
-		{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 31, JobID: "j",
-			OwnerName: "BreadGenie", RepositoryName: "frappe",
-			RequestLabels: []string{"runway-2vcpu-6gb"}}},
-	}}
-	if err := e.Handle(context.Background(), msg); err != nil {
-		t.Fatal(err)
-	}
-	l := e.snapshot.Leases[0]
-	if l.Repository != "BreadGenie/frappe" || l.RequestLabels != "runway-2vcpu-6gb" {
-		t.Fatalf("job not recorded: repo=%q labels=%q", l.Repository, l.RequestLabels)
 	}
 }
 

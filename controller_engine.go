@@ -151,9 +151,6 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 		if lease.AcquireState == "pending" {
 			return e.acquire(ctx, lease)
 		}
-		// A lease with no job yet takes the job in any live phase. Keying this on "reserved"
-		// was how the job's repository and labels went unrecorded: the reconciler reserves on
-		// demand, so a lease can be provisioned before the job arrives.
 		if lease.RequestID == 0 && lease.JobID == "" && lease.Phase == "reserved" && len(message.JobAvailableMessages) > 0 {
 			job := message.JobAvailableMessages[0]
 			if job.RunnerRequestID <= 0 {
@@ -240,14 +237,6 @@ func (e *pilotEngine) Reconcile(ctx context.Context) error {
 				if err := e.acquire(ctx, lease); err != nil {
 					return err
 				}
-				continue
-			}
-			// A lease is reserved on reported demand, and reported demand is not a job:
-			// statistics count jobs assigned to this scale set, and one that is never
-			// delivered here leaves the count permanently positive. Provisioning on that alone
-			// created and destroyed a VM every few seconds. A VM is created only once a job
-			// has been recorded against the lease.
-			if lease.JobID == "" {
 				continue
 			}
 			if e.demand == 0 {
