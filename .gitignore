@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 *.log
+
+# Local markdown issue tracker; this repo is intended to go public
+.scratch/
