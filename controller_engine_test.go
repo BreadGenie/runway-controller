@@ -70,6 +70,16 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		l.Phase = "running"
 		l.JobID = fields.JobID
 		l.WorkflowRunID = fields.WorkflowRunID
+		l.RunnerID = fields.RunnerID
+		if fields.Repository != "" {
+			l.Repository = fields.Repository
+		}
+		if fields.RequestLabels != "" {
+			l.RequestLabels = fields.RequestLabels
+		}
+		if fields.RequestID != 0 {
+			l.RequestID = fields.RequestID
+		}
 	case "completed", "failed":
 		l.Phase = "deleting"
 		l.LastError = fields.Error
@@ -479,6 +489,45 @@ func TestAJobOfferedAfterProvisioningStillRecordsWhoItIsFor(t *testing.T) {
 	// carries, and what every live lease carried before this was fixed.
 	if l.AcquireState == "none" || l.AcquireState == "" {
 		t.Fatalf("acquisition intent not recorded, got %q", l.AcquireState)
+	}
+}
+
+// GitHub sends no JobAvailable offer to the listener in this design: it dispatches straight
+// to the runner registered from the VM, so the acquisition path never sees the job. The start
+// event is therefore the first place the job's identity reaches the controller, and unless it
+// is recorded there the pairing check has nothing to check and the shape is never resolved.
+func TestTheStartEventRecordsTheJobItWasSentFor(t *testing.T) {
+	s := newPilotStore()
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	l, err := s.Reserve(context.Background(), "started-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := s.find(l.ID)
+	e.remember(*runner)
+	msg := &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{
+		RunnerID: 9, RunnerName: runner.RunnerName,
+		JobMessageBase: scaleset.JobMessageBase{
+			JobID: "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e", WorkflowRunID: 4242,
+			RunnerRequestID: 77, OwnerName: "BreadGenie", RepositoryName: "frappe",
+			RequestLabels: []string{"runway-2vcpu-6gb"},
+		},
+	}}}
+	if err := e.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	got := s.find(l.ID)
+	if got.Repository != "BreadGenie/frappe" {
+		t.Fatalf("repository not recorded from the start event: %q", got.Repository)
+	}
+	if got.RequestLabels != "runway-2vcpu-6gb" {
+		t.Fatalf("labels not recorded from the start event: %q", got.RequestLabels)
+	}
+	if got.RequestID != 77 {
+		t.Fatalf("request ID not recorded from the start event: %d", got.RequestID)
+	}
+	if got.WorkflowRunID != "4242" {
+		t.Fatalf("workflow run not recorded: %q", got.WorkflowRunID)
 	}
 }
 

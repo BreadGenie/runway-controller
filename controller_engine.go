@@ -105,7 +105,21 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 				}
 				lease = updated
 			}
-			if _, err := e.update(ctx, lease, "started", leaseEvent{RunnerID: job.RunnerID, JobID: job.JobID, WorkflowRunID: strconv.FormatInt(job.WorkflowRunID, 10)}); err != nil {
+			// GitHub dispatches to the runner this design registered from the VM, so it sends no
+			// JobAvailable offer to the listener and the acquisition path never sees the job.
+			// The authoritative start event is the first place the job's own identity arrives,
+			// so that is where the repository, labels and request ID are recorded. Central
+			// needs them to refuse a pool whose image cannot serve this repository, and to
+			// resolve the shape a label asked for.
+			started := leaseEvent{
+				RunnerID:      job.RunnerID,
+				JobID:         job.JobID,
+				WorkflowRunID: strconv.FormatInt(job.WorkflowRunID, 10),
+				Repository:    job.OwnerName + "/" + job.RepositoryName,
+				RequestLabels: strings.Join(job.RequestLabels, "\n"),
+				RequestID:     job.RunnerRequestID,
+			}
+			if _, err := e.update(ctx, lease, "started", started); err != nil {
 				return err
 			}
 		}
