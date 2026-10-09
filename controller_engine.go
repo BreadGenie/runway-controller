@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -85,67 +83,8 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 		e.demand = min(1, max(0, message.Statistics.TotalAssignedJobs))
 		e.haveDemand = true
 	}
-	for _, job := range message.JobStartedMessages {
-		for _, lease := range e.snapshot.Leases {
-			if lease.RunnerName != job.RunnerName {
-				continue
-			}
-			if err := matchPilotJob(lease, job.RunnerID, job.JobID); err != nil {
-				return err
-			}
-			if lease.Phase == "deleted" || lease.Phase == "deleting" {
-				continue
-			}
-			if lease.Phase == "jit_ready" {
-				// The authoritative job-start event resolves an interrupted
-				// bootstrap acknowledgment without resending credentials.
-				updated, err := e.update(ctx, lease, "bootstrapped", leaseEvent{})
-				if err != nil {
-					return err
-				}
-				lease = updated
-			}
-			// GitHub dispatches to the runner this design registered from the VM, so it sends no
-			// JobAvailable offer to the listener and the acquisition path never sees the job.
-			// The authoritative start event is the first place the job's own identity arrives,
-			// so that is where the repository, labels and request ID are recorded. Central
-			// needs them to refuse a pool whose image cannot serve this repository, and to
-			// resolve the shape a label asked for.
-			started := leaseEvent{
-				RunnerID:      job.RunnerID,
-				JobID:         job.JobID,
-				WorkflowRunID: strconv.FormatInt(job.WorkflowRunID, 10),
-				Repository:    job.OwnerName + "/" + job.RepositoryName,
-				RequestLabels: strings.Join(job.RequestLabels, "\n"),
-				RequestID:     job.RunnerRequestID,
-			}
-			if _, err := e.update(ctx, lease, "started", started); err != nil {
-				return err
-			}
-		}
-	}
-	for _, job := range message.JobCompletedMessages {
-		for _, lease := range e.snapshot.Leases {
-			matchedName := lease.RunnerName == job.RunnerName
-			canceledBeforeAssignment := job.RunnerName == "" && job.Result == "canceled" && lease.JobID != "" && lease.JobID == job.JobID
-			if !matchedName && !canceledBeforeAssignment {
-				continue
-			}
-			if matchedName {
-				if err := matchPilotJob(lease, job.RunnerID, job.JobID); err != nil {
-					return err
-				}
-			}
-			diagnosticsError := ""
-			if lease.Phase != "deleted" && lease.Phase != "deleting" && lease.VMID != "" {
-				if err := e.collect(ctx, lease); err != nil {
-					diagnosticsError = "guest diagnostics unavailable; completion and cleanup continue"
-				}
-			}
-			if _, err := e.update(ctx, lease, "completed", leaseEvent{RunnerID: job.RunnerID, JobID: job.JobID, WorkflowRunID: strconv.FormatInt(job.WorkflowRunID, 10), Result: normalizeResult(job.Result), Error: diagnosticsError}); err != nil {
-				return err
-			}
-		}
+	if err := e.recordJobEvidence(ctx, message); err != nil {
+		return err
 	}
 	if !e.snapshot.Pool.Enabled {
 		return nil
@@ -155,72 +94,7 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 			return err
 		}
 	}
-	for _, lease := range e.snapshot.Leases {
-		if lease.Phase == "deleting" || lease.Phase == "deleted" {
-			continue
-		}
-		if !e.now().Before(lease.Deadline) {
-			continue
-		}
-		if lease.AcquireState == "pending" {
-			return e.acquire(ctx, lease)
-		}
-		// The job is recorded in any live phase. Requiring "reserved" assumed the job arrives
-		// while the lease is still waiting, but GitHub only offers a job once a runner exists
-		// to take it, and this design registers that runner from the VM it builds. So by the
-		// time the offer arrives the lease is already provisioning or later, the condition
-		// never held, and every lease recorded no repository, no labels and no request ID:
-		// the pairing check that is supposed to refuse a pool whose image cannot serve this
-		// repository never saw a job to check.
-		if lease.RequestID == 0 && lease.JobID == "" && len(message.JobAvailableMessages) > 0 {
-			job := message.JobAvailableMessages[0]
-			if job.RunnerRequestID <= 0 {
-				return errors.New("available job omitted a positive request ID; not acknowledged")
-			}
-			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID, Repository: job.OwnerName + "/" + job.RepositoryName, RequestLabels: strings.Join(job.RequestLabels, "\n")})
-			if err != nil {
-				return err
-			}
-			return e.acquire(ctx, reserved)
-		}
-	}
-	return nil
-}
-
-func matchPilotJob(lease pilotLease, runnerID int, jobID string) error {
-	if _, err := uuid.Parse(jobID); err != nil {
-		return errors.New("runner event requires stable job UUID")
-	}
-	if lease.RunnerID > 0 && runnerID != lease.RunnerID {
-		return errors.New("runner event ID conflicts with durable lease")
-	}
-	if lease.JobID != "" && jobID != lease.JobID {
-		return errors.New("runner event job UUID conflicts with durable lease")
-	}
-	return nil
-}
-
-func (e *pilotEngine) acquire(ctx context.Context, lease pilotLease) error {
-	ctx, cancel := context.WithDeadline(ctx, lease.Deadline)
-	defer cancel()
-	if e.acquirer == nil {
-		return errors.New("GitHub message session unavailable for acquisition")
-	}
-	ids, err := e.acquirer.AcquireJobs(ctx, []int64{lease.RequestID})
-	if err != nil {
-		return errors.New("GitHub acquisition outcome uncertain; reserved request retained")
-	}
-	for _, id := range ids {
-		if id == lease.RequestID {
-			if _, err := e.update(ctx, lease, "acquired", leaseEvent{}); err != nil {
-				return err
-			}
-			e.demand = 1
-			return nil
-		}
-	}
-	// Empty responses do not resolve an earlier uncertain request.
-	return nil
+	return e.acquireAvailableJob(ctx, message)
 }
 
 // Reconcile executes at most one provisioning step per lease; Central returns

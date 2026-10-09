@@ -103,6 +103,10 @@ A team that adopts Runway changes one line in their workflow and nothing else.
 24. As a team migrating away, I want to be told what my label resolved to, so that I can confirm I got
     the capacity I intended.
 
+## Current dispatch limitation
+
+The current controller provisions a VM and registers its runner from demand before it may receive a job's repository or labels. Direct dispatch can reveal that evidence only in the job-start event. Recording job evidence on Runner Lease does not fulfill the pre-VM pairing refusal described below; that requires a separate selection design. Waiting for job identity before provisioning deadlocks this dispatch flow.
+
 ## Implementation Decisions
 
 - **The image record owns workspace layout.** A Virtual Machine Image gains a workspace repository and

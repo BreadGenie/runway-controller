@@ -51,53 +51,84 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 	if s.rejectUpdates {
 		return pilotLease{}, errors.New("fence rejected")
 	}
-	l := s.find(id)
-	s.events = append(s.events, event)
+	// Keep this adapter strict; the contract tests also execute the actual
+	// Central patch so these assumptions cannot silently diverge again.
+	l := *s.find(id)
+	if fields.RequestID < 0 || (fields.RequestID > 0 && l.RequestID > 0 && fields.RequestID != l.RequestID) {
+		return pilotLease{}, errors.New("request identity changed")
+	}
+	for _, identity := range [][2]string{{l.JobID, fields.JobID}, {l.WorkflowRunID, fields.WorkflowRunID}, {l.Repository, fields.Repository}, {l.RequestLabels, fields.RequestLabels}} {
+		if identity[0] != "" && identity[1] != "" && identity[0] != identity[1] {
+			return pilotLease{}, errors.New("job identity changed")
+		}
+	}
+	if fields.RunnerID != 0 && l.RunnerID != 0 && fields.RunnerID != l.RunnerID {
+		return pilotLease{}, errors.New("runner identity changed")
+	}
 	switch event {
-	case "jit_requested":
-		if l.Phase != "vm_ready" {
-			return pilotLease{}, errors.New("invalid JIT phase")
+	case "acquire_requested":
+		if fields.RequestID <= 0 || l.Phase == "deleting" || l.Phase == "deleted" {
+			return pilotLease{}, errors.New("invalid acquisition intent")
 		}
-		l.Phase = "jit_pending"
-		l.JITState = "pending"
-	case "jit_ready":
-		l.Phase = "jit_ready"
-		l.JITState = "ready"
-		l.RunnerID = fields.RunnerID
-	case "bootstrapped":
-		l.Phase = "running"
-	case "started":
-		l.Phase = "running"
-		l.JobID = fields.JobID
-		l.WorkflowRunID = fields.WorkflowRunID
-		l.RunnerID = fields.RunnerID
-		if fields.Repository != "" {
-			l.Repository = fields.Repository
+		if l.AcquireState != "acquired" {
+			l.AcquireState = "pending"
 		}
-		if fields.RequestLabels != "" {
-			l.RequestLabels = fields.RequestLabels
+	case "acquired":
+		if l.RequestID <= 0 || (l.AcquireState != "pending" && l.AcquireState != "acquired") {
+			return pilotLease{}, errors.New("missing acquisition intent")
 		}
-		if fields.RequestID != 0 {
-			l.RequestID = fields.RequestID
-		}
-	case "completed", "failed":
-		l.Phase = "deleting"
-		l.LastError = fields.Error
+		l.AcquireState = "acquired"
 	case "runner_removed":
 		l.JITState = "removed"
-	case "acquire_requested":
-		l.RequestID = fields.RequestID
-		l.AcquireState = "pending"
-		l.JobID = fields.JobID
-		l.Repository = fields.Repository
-		l.RequestLabels = fields.RequestLabels
-	case "acquired":
-		l.AcquireState = "acquired"
+	case "completed", "failed":
+		if l.Phase != "deleted" {
+			l.Phase = "deleting"
+		}
 	default:
-		panic(event)
+		transitions := map[string][2]string{
+			"jit_requested": {"vm_ready", "jit_pending"},
+			"jit_ready":     {"jit_pending", "jit_ready"},
+			"bootstrapped":  {"jit_ready", "running"},
+			"started":       {"running", "running"},
+		}
+		phases, ok := transitions[event]
+		if !ok || (l.Phase != phases[0] && l.Phase != phases[1]) {
+			return pilotLease{}, errors.New("invalid lease transition")
+		}
+		l.Phase = phases[1]
+		if event == "jit_requested" {
+			l.JITState = "pending"
+		}
+		if event == "jit_ready" {
+			l.JITState = "ready"
+		}
 	}
-	return *l, nil
+	if fields.RunnerID != 0 {
+		l.RunnerID = fields.RunnerID
+	}
+	if fields.RequestID != 0 {
+		l.RequestID = fields.RequestID
+	}
+	if fields.JobID != "" {
+		l.JobID = fields.JobID
+	}
+	if fields.WorkflowRunID != "" {
+		l.WorkflowRunID = fields.WorkflowRunID
+	}
+	if fields.Repository != "" {
+		l.Repository = fields.Repository
+	}
+	if fields.RequestLabels != "" {
+		l.RequestLabels = fields.RequestLabels
+	}
+	if fields.Error != "" {
+		l.LastError = fields.Error
+	}
+	*s.find(id) = l
+	s.events = append(s.events, event)
+	return l, nil
 }
+
 func (s *memoryPilotStore) EnsureVM(_ context.Context, id string) (pilotLease, error) {
 	s.ensureCalls++
 	if s.contendEnsureVM {
@@ -381,10 +412,8 @@ func TestControllerDeadlineDeletesVMEvenWhenGitHubIsUnavailable(t *testing.T) {
 }
 
 func TestControllerAcquireCarriesRepositoryAndLabels(t *testing.T) {
-	// The job's own repository and labels travel with the acquisition, because that is
-	// the only point at which refusing a mismatched image is still free. A test that
-	// sends a bare request ID would pass while the pairing check starves, which is the
-	// shape of failure this exists to prevent.
+	// Offered job evidence must survive acquisition. Other jobs are dispatched
+	// directly and reveal their identity only after a runner exists.
 	s := newPilotStore()
 	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
 	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
@@ -492,42 +521,48 @@ func TestAJobOfferedAfterProvisioningStillRecordsWhoItIsFor(t *testing.T) {
 	}
 }
 
-// GitHub sends no JobAvailable offer to the listener in this design: it dispatches straight
-// to the runner registered from the VM, so the acquisition path never sees the job. The start
-// event is therefore the first place the job's identity reaches the controller, and unless it
-// is recorded there the pairing check has nothing to check and the shape is never resolved.
+// Direct dispatch can omit JobAvailable. Job identity must still be recorded
+// from a start event after runner registration, and remain stable on replay.
 func TestTheStartEventRecordsTheJobItWasSentFor(t *testing.T) {
 	s := newPilotStore()
-	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
-	l, err := s.Reserve(context.Background(), "started-lease")
-	if err != nil {
+	g := &fakePilotGitHub{store: s}
+	guest := &fakeGuestTransport{}
+	e := newPilotEngine(s, g, guest)
+	ctx := context.Background()
+	if err := e.Handle(ctx, &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	runner := s.find(l.ID)
-	e.remember(*runner)
+	for range 2 {
+		if err := e.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := s.snapshot.Leases[0]
+	if runner.Phase != "running" || runner.JobID != "" {
+		t.Fatal("runner must exist before direct job identity arrives")
+	}
 	msg := &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{
-		RunnerID: 9, RunnerName: runner.RunnerName,
+		RunnerID: runner.RunnerID, RunnerName: runner.RunnerName,
 		JobMessageBase: scaleset.JobMessageBase{
 			JobID: "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e", WorkflowRunID: 4242,
-			RunnerRequestID: 77, OwnerName: "BreadGenie", RepositoryName: "frappe",
+			RunnerRequestID: 0, OwnerName: "BreadGenie", RepositoryName: "frappe",
 			RequestLabels: []string{"runway-2vcpu-6gb"},
 		},
 	}}}
-	if err := e.Handle(context.Background(), msg); err != nil {
+	if err := e.Handle(ctx, msg); err != nil {
 		t.Fatal(err)
 	}
-	got := s.find(l.ID)
-	if got.Repository != "BreadGenie/frappe" {
-		t.Fatalf("repository not recorded from the start event: %q", got.Repository)
+	// Replay after restart must retain evidence without repeating registration.
+	e = newPilotEngine(s, g, guest)
+	if err := e.Handle(ctx, msg); err != nil {
+		t.Fatal(err)
 	}
-	if got.RequestLabels != "runway-2vcpu-6gb" {
-		t.Fatalf("labels not recorded from the start event: %q", got.RequestLabels)
+	got := s.find(runner.ID)
+	if got.Repository != "BreadGenie/frappe" || got.RequestLabels != "runway-2vcpu-6gb" || got.WorkflowRunID != "4242" || got.RequestID != 0 || got.JobID != msg.JobStartedMessages[0].JobID {
+		t.Fatalf("direct job evidence not retained: %+v", got)
 	}
-	if got.RequestID != 77 {
-		t.Fatalf("request ID not recorded from the start event: %d", got.RequestID)
-	}
-	if got.WorkflowRunID != "4242" {
-		t.Fatalf("workflow run not recorded: %q", got.WorkflowRunID)
+	if g.jitCalls != 1 || guest.bootstrapCalls != 1 {
+		t.Fatal("replay repeated runner registration")
 	}
 }
 

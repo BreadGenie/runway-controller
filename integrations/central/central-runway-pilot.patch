@@ -14,10 +14,10 @@ index ea1bd3c..3c324ec 100644
 +Each pool admits at most its configured concurrency, with an additional fixed pilot limit of four active or cleanup-pending leases per Team. A lease remains capacity-consuming until both the VM is absent and GitHub runner cleanup is reported. This is admission accounting, not billing enforcement.
 diff --git a/central/api/runway.py b/central/api/runway.py
 new file mode 100644
-index 0000000..28ccda5
+index 0000000..09909cc
 --- /dev/null
 +++ b/central/api/runway.py
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,51 @@
 +import frappe
 +
 +from central.infrastructure import runway
@@ -52,9 +52,12 @@ index 0000000..28ccda5
 +	result: str = "",
 +	error: str = "",
 +	request_id: int = 0,
++	repository: str = "",
++	request_labels: str = "",
 +) -> dict:
 +	return runway.update_lease(
-+		pool, owner_id, fence, lease_id, event, runner_id, job_id, workflow_run_id, result, error, request_id
++		pool, owner_id, fence, lease_id, event, runner_id, job_id, workflow_run_id,
++		result, error, request_id, repository, request_labels,
 +	)
 +
 +
@@ -139,10 +142,10 @@ index 0000000..f28ed7a
 +});
 diff --git a/central/infrastructure/doctype/runner_lease/runner_lease.json b/central/infrastructure/doctype/runner_lease/runner_lease.json
 new file mode 100644
-index 0000000..3146af3
+index 0000000..8589a47
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,234 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Lease",
@@ -174,7 +177,9 @@ index 0000000..3146af3
 +  "deleted_at",
 +  "last_error",
 +  "request_id",
-+  "acquire_state"
++  "acquire_state",
++  "repository",
++  "request_labels"
 + ],
 + "fields": [
 +  {
@@ -340,6 +345,18 @@ index 0000000..3146af3
 +   "label": "Acquire State",
 +   "read_only": 1,
 +   "options": "none\npending\nacquired"
++  },
++  {
++   "fieldname": "repository",
++   "label": "Repository",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "request_labels",
++   "label": "Request Labels",
++   "fieldtype": "Small Text",
++   "read_only": 1
 +  }
 + ],
 + "permissions": [
@@ -693,10 +710,10 @@ index 0000000..1497f64
 +};
 diff --git a/central/infrastructure/runway.py b/central/infrastructure/runway.py
 new file mode 100644
-index 0000000..5ba74dc
+index 0000000..3327522
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,283 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -781,6 +798,8 @@ index 0000000..5ba74dc
 +		"jit_state",
 +		"attempt_id",
 +		"acquire_state",
++		"repository",
++		"request_labels",
 +	)
 +	result = {field: lease.get(field) or (0 if field == "runner_id" else "") for field in fields}
 +	return {
@@ -912,10 +931,28 @@ index 0000000..5ba74dc
 +	result: str = "",
 +	error: str = "",
 +	request_id: int = 0,
++	repository: str = "",
++	request_labels: str = "",
 +) -> dict:
-+	_, lease = fenced_lease(pool, owner_id, fence, lease_id)
++	_pool, lease = fenced_lease(pool, owner_id, fence, lease_id)
++	# Missing evidence leaves earlier observations intact, including direct dispatch
++	# with request ID zero. A replay may add identity, but cannot replace it.
++	if not 0 <= int(request_id) < 2**63 or (
++		request_id and lease.request_id and int(lease.request_id) != int(request_id)
++	):
++		frappe.throw(_("Job request identity changed within a lease."))
++	identities = (
++		("runner_id", runner_id),
++		("job_id", job_id),
++		("workflow_run_id", workflow_run_id),
++		("repository", repository),
++		("request_labels", request_labels),
++	)
++	for field, value in identities:
++		if value and lease.get(field) and str(lease.get(field)) != str(value):
++			frappe.throw(_("Runner job identity changed within a lease."))
 +	if event == "acquire_requested":
-+		if not 0 < int(request_id) < 2**63 or (lease.request_id and int(lease.request_id) != int(request_id)):
++		if not request_id:
 +			frappe.throw(_("Job acquisition identity must remain a positive request ID."))
 +		if lease.phase in ("deleting", "deleted"):
 +			frappe.throw(_("A retiring runner cannot acquire work."))
@@ -949,11 +986,11 @@ index 0000000..5ba74dc
 +			lease.jit_state = "pending" if event == "jit_requested" else "ready"
 +		if event in ("started", "bootstrapped"):
 +			lease.started_at = lease.started_at or now_datetime()
-+	for field, value in (("runner_id", runner_id), ("job_id", job_id), ("workflow_run_id", workflow_run_id)):
++	for field, value in identities:
 +		if value:
-+			if lease.get(field) and str(lease.get(field)) != str(value):
-+				frappe.throw(_("Runner job identity changed within a lease."))
 +			lease.set(field, value)
++	if request_id:
++		lease.request_id = str(request_id)
 +	# The lease is a durable audit record. An event that carries no new error must keep the
 +	# recorded retirement reason or the failure to collect job diagnostics.
 +	if error:
@@ -1188,10 +1225,10 @@ index ae9cdee..0af37f5 100644
 +	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
 diff --git a/central/tests/test_runway.py b/central/tests/test_runway.py
 new file mode 100644
-index 0000000..e1adf18
+index 0000000..880e932
 --- /dev/null
 +++ b/central/tests/test_runway.py
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,440 @@
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
 +from types import SimpleNamespace
@@ -1270,6 +1307,47 @@ index 0000000..e1adf18
 +
 +	def reserve(self):
 +		return runway.reserve_lease(self.pool.name, self.owner, self.fence, str(uuid4()))
++
++	def test_direct_job_evidence_is_durable_through_the_controller_route(self):
++		from central.api.runway import update_lease
++
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], {"phase": "running", "runner_id": 42})
++		evidence = {
++			"runner_id": 42, "job_id": str(uuid4()), "workflow_run_id": "4242",
++			"repository": "example/ci", "request_labels": "self-hosted\nrunway-dogfood",
++		}
++		for _attempt in range(2):
++			result = update_lease(
++				self.pool.name, self.owner, self.fence, lease["id"], "started", **evidence
++			)
++			self.assertEqual(result["request_id"], 0)
++			for field, value in evidence.items():
++				self.assertEqual(result[field], value)
++		update_lease(self.pool.name, self.owner, self.fence, lease["id"], "completed", result="success")
++		document = frappe.get_doc("Runner Lease", lease["id"])
++		self.assertEqual(document.phase, "deleting")
++		for field, value in evidence.items():
++			self.assertEqual(document.get(field), value)
++
++	def test_conflicting_job_evidence_is_refused_before_writing(self):
++		lease = self.reserve()
++		values = {
++			"phase": "running", "runner_id": 42, "request_id": "77", "job_id": str(uuid4()),
++			"workflow_run_id": "4242", "repository": "example/ci", "request_labels": "runway-dogfood",
++		}
++		frappe.db.set_value("Runner Lease", lease["id"], dict(values))
++		for field, value in {
++			"runner_id": 99, "request_id": 88, "job_id": str(uuid4()), "workflow_run_id": "999",
++			"repository": "other/repo", "request_labels": "other-label",
++		}.items():
++			with self.subTest(field=field), self.assertRaises(frappe.ValidationError):
++				runway.update_lease(
++					self.pool.name, self.owner, self.fence, lease["id"], "started", **{field: value}
++				)
++			document = frappe.get_doc("Runner Lease", lease["id"])
++			for original_field, original_value in values.items():
++				self.assertEqual(document.get(original_field), original_value)
 +
 +	def test_duplicate_reservation_cannot_bypass_capacity(self):
 +		lease = self.reserve()
@@ -1606,10 +1684,10 @@ index f47455c..287a37b 100644
  - [IAM](IAM.md): Central identity and permission model.
 diff --git a/spec/RUNWAY.md b/spec/RUNWAY.md
 new file mode 100644
-index 0000000..3d405ad
+index 0000000..4d7234d
 --- /dev/null
 +++ b/spec/RUNWAY.md
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,47 @@
 +# Runway internal runner pilot
 +
 +## Purpose
@@ -1651,3 +1729,9 @@ index 0000000..3d405ad
 +## Validation
 +
 +`central.tests.test_runway` exercises real concurrent reservations, duplicate capacity, fencing, authorization denial, cross-team reads, lifecycle write denial, uncertain creation and discovery, expired VM deletion, independent GitHub cleanup, owned orphan cleanup, and preservation of cleanup intent during uncertain responses. Run it only on a separate test site.
++
++### Job evidence
++
++Runner Lease records repository and request labels from available, started and completed events. A direct assignment can have request ID zero and reveal job identity only after VM creation and runner registration. Missing evidence preserves earlier observations; conflicting nonempty runner, job, workflow, repository, labels or positive request IDs are refused. Started events require a running lease; the controller first resolves an interrupted bootstrap acknowledgment when needed.
++
++This recording contract does not establish repository/image compatibility before VM creation. The controller must continue provisioning from demand even when job identity has not arrived.
