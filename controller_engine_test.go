@@ -431,6 +431,57 @@ func TestAContendedCentralLeaseIsRetriedNotDropped(t *testing.T) {
 	}
 }
 
+// GitHub offers a job only once a runner exists to take it, and a runner is registered from
+// the VM the lease builds. So the offer arrives when the lease is already provisioning or
+// later, and keying the recording on "reserved" left every lease with no repository, no
+// labels and no request ID -- which is what the pairing check needs in order to refuse a
+// pool whose image cannot serve the job's repository.
+func TestAJobOfferedAfterProvisioningStillRecordsWhoItIsFor(t *testing.T) {
+	s := newPilotStore()
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	e.acquirer = &fakeSession{acquire: func(ids []int64) ([]int64, error) { return ids, nil }}
+
+	// Demand alone: a lease is reserved and provisioned, as the controller does.
+	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{MessageID: 1,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.snapshot.Leases[0].Phase; got != "vm_ready" {
+		t.Fatalf("test needs a provisioned lease, got %q", got)
+	}
+
+	// The job arrives now, and must still be recorded against the lease.
+	msg := &scaleset.RunnerScaleSetMessage{MessageID: 2, JobAvailableMessages: []*scaleset.JobAvailable{
+		{JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 512, JobID: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+			OwnerName: "BreadGenie", RepositoryName: "frappe",
+			RequestLabels: []string{"runway-2vcpu-6gb"},
+		}},
+	}}
+	if err := e.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	l := s.snapshot.Leases[0]
+	if l.Repository != "BreadGenie/frappe" {
+		t.Fatalf("repository not recorded on a provisioned lease: %q", l.Repository)
+	}
+	if l.RequestLabels != "runway-2vcpu-6gb" {
+		t.Fatalf("labels not recorded on a provisioned lease: %q", l.RequestLabels)
+	}
+	if l.RequestID != 512 {
+		t.Fatalf("request ID not recorded on a provisioned lease: %d", l.RequestID)
+	}
+	// The engine goes on to acquire against the recorded request ID, so the state moves past
+	// "pending". What matters is that it is not "none", which is what a lease with no job
+	// carries, and what every live lease carried before this was fixed.
+	if l.AcquireState == "none" || l.AcquireState == "" {
+		t.Fatalf("acquisition intent not recorded, got %q", l.AcquireState)
+	}
+}
+
 func TestControllerAcquireIntentSurvivesResponseLoss(t *testing.T) {
 	s := newPilotStore()
 	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})

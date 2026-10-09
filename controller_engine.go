@@ -151,15 +151,18 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 		if lease.AcquireState == "pending" {
 			return e.acquire(ctx, lease)
 		}
-		if lease.RequestID == 0 && lease.JobID == "" && lease.Phase == "reserved" && len(message.JobAvailableMessages) > 0 {
+		// The job is recorded in any live phase. Requiring "reserved" assumed the job arrives
+		// while the lease is still waiting, but GitHub only offers a job once a runner exists
+		// to take it, and this design registers that runner from the VM it builds. So by the
+		// time the offer arrives the lease is already provisioning or later, the condition
+		// never held, and every lease recorded no repository, no labels and no request ID:
+		// the pairing check that is supposed to refuse a pool whose image cannot serve this
+		// repository never saw a job to check.
+		if lease.RequestID == 0 && lease.JobID == "" && len(message.JobAvailableMessages) > 0 {
 			job := message.JobAvailableMessages[0]
 			if job.RunnerRequestID <= 0 {
 				return errors.New("available job omitted a positive request ID; not acknowledged")
 			}
-			// The job's own repository and labels travel with the acquisition, because that is
-			// the only point at which refusing is still free. A pool whose image is baked for
-			// another repository cannot serve this job, and learning that after the VM boots
-			// costs a boot and a failing job rather than a message.
 			reserved, err := e.update(ctx, lease, "acquire_requested", leaseEvent{RequestID: job.RunnerRequestID, JobID: job.JobID, Repository: job.OwnerName + "/" + job.RepositoryName, RequestLabels: strings.Join(job.RequestLabels, "\n")})
 			if err != nil {
 				return err
