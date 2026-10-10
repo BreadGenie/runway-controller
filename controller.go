@@ -7,82 +7,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/actions/scaleset"
-	"github.com/actions/scaleset/listener"
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-retryablehttp"
 )
-
-type pilotDelivery struct {
-	message *scaleset.RunnerScaleSetMessage
-	result  chan error
-}
-type pilotScaler struct{ deliveries chan pilotDelivery }
-
-func (s pilotScaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
-	delivery := pilotDelivery{message: message, result: make(chan error, 1)}
-	select {
-	case s.deliveries <- delivery:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case err := <-delivery.result:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// holdOwnership renews the fence on an interval until renewal fails or ctx ends.
-// A renewal failure is fail-closed, but it keeps the sanitized Central cause so
-// an operator can tell a fencing rejection from a blocked database transaction.
-func holdOwnership(ctx context.Context, renew func(context.Context) error, every time.Duration) error {
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			// A ready ticker and a cancelled context are both selectable, and the
-			// runtime picks between them at random. Renewing a cancelled context
-			// would report a shutdown as a lost fence, so check before renewing.
-			if ctx.Err() != nil {
-				return nil
-			}
-			if err := renew(ctx); err != nil {
-				// Cancellation can still race the renewal itself. Only a failure
-				// while the controller is alive loses the fence.
-				if ctx.Err() != nil {
-					return nil
-				}
-				return fmt.Errorf("Central ownership renewal failed; all side effects stopped: %w", err)
-			}
-		}
-	}
-}
-
-// sessionUnavailableError names the scale set a session failed for and wraps the
-// underlying error, so the health line says what failed instead of only that
-// something did.
-//
-// This call is the one place a controller can be stopped by something outside its
-// own control, and the causes are indistinguishable from the outside: a scale set
-// that does not exist, a token that cannot open a session, a network blip. One
-// generic line for all of them cost hours of diagnosis, because the health log
-// read "GitHub session unavailable" while the real fault was a pool still naming
-// a scale set that had been deleted, and nothing the controller printed could
-// tell those apart. Wrapping rather than formatting keeps the cause reachable
-// with errors.Is and errors.As.
-func sessionUnavailableError(scaleSetID int, pool string, cause error) error {
-	return fmt.Errorf("GitHub session unavailable for scale set %d (pool %s): %w; lease deadlines remain enforced by Central",
-		scaleSetID, pool, cause)
-}
 
 func runController(path string) error {
 	cfg, err := loadControllerConfig(path)
@@ -94,8 +25,6 @@ func runController(path string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	central, err := newCentralRPC(cfg)
 	if err != nil {
 		return err
@@ -116,119 +45,25 @@ func runController(path string) error {
 		return err
 	}
 	engine := &pilotEngine{store: central, github: github, guest: commandTransport{command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
-	var lastError atomic.Value
-	lastError.Store("")
-	var ownershipLost atomic.Bool
-	heartbeatErrors := make(chan error, 1)
-	go func() {
-		renew := func(ctx context.Context) error {
-			_, err := central.Renew(ctx, lastError.Load().(string))
-			return err
-		}
-		if err := holdOwnership(ctx, renew, 15*time.Second); err != nil {
-			ownershipLost.Store(true)
-			select {
-			case heartbeatErrors <- err:
-			default:
-			}
-			cancel()
-		}
-	}()
-	report := func(err error) {
-		message := ""
-		if err != nil {
-			message = err.Error()
-		}
-		if lastError.Load().(string) != message {
-			lastError.Store(message)
-			json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_health", "pool": cfg.Pool, "error": message})
-		}
-	}
 	json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_claimed", "pool": cfg.Pool, "owner_id": cfg.OwnerID, "fence": snapshot.Fence})
-	for ctx.Err() == nil {
-		sessionHTTP := retryablehttp.NewClient()
-		sessionHTTP.RetryMax = 0
-		session, err := github.MessageSessionClient(ctx, snapshot.Pool.ScaleSetID, "runway-pool-"+snapshot.Pool.ID, scaleset.WithRetryableHTTPClint(sessionHTTP), scaleset.WithTimeout(70*time.Second))
-		if err != nil {
-			report(sessionUnavailableError(snapshot.Pool.ScaleSetID, cfg.Pool, err))
-			if fresh, renewErr := central.Renew(ctx, lastError.Load().(string)); renewErr == nil {
-				engine.snapshot = fresh
-				_ = engine.Reconcile(ctx)
-			} else {
-				return renewErr
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
-		engine.acquirer = session
-		capacity := 0
-		if engine.snapshot.Pool.Enabled {
-			capacity = 1
-		}
-		poller, err := listener.New(session, listener.Config{ScaleSetID: snapshot.Pool.ScaleSetID, MaxRunners: capacity})
-		if err != nil {
-			return err
-		}
-		sessionCtx, endSession := context.WithCancel(ctx)
-		deliveries := make(chan pilotDelivery)
-		pollingDone := make(chan error, 1)
-		go func() { pollingDone <- poller.Run(sessionCtx, pilotScaler{deliveries: deliveries}) }()
-		json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_listening", "pool": cfg.Pool})
-		ticker := time.NewTicker(3 * time.Second)
-		reconnect := false
-		for !reconnect && ctx.Err() == nil {
-			select {
-			case <-ctx.Done():
-			case delivery := <-deliveries:
-				fresh, err := central.Renew(ctx, lastError.Load().(string))
-				if err == nil {
-					engine.snapshot = fresh
-					capacity := 0
-					if fresh.Pool.Enabled {
-						capacity = 1
-					}
-					poller.SetMaxRunners(capacity)
-					err = engine.Handle(ctx, delivery.message)
+	lifecycle := controllerLifecycle{
+		engine: engine,
+		open: func(ctx context.Context, pool pilotPool) (controllerSession, error) {
+			return openGitHubSession(ctx, github, pool)
+		},
+		log: func(event string, err error) {
+			fields := map[string]any{"event": event, "pool": cfg.Pool}
+			if event == "controller_health" {
+				fields["error"] = ""
+				if err != nil {
+					fields["error"] = err.Error()
 				}
-				report(err)
-				delivery.result <- err
-			case <-ticker.C:
-				fresh, err := central.Renew(ctx, lastError.Load().(string))
-				if err == nil {
-					engine.snapshot = fresh
-					capacity := 0
-					if fresh.Pool.Enabled {
-						capacity = 1
-					}
-					poller.SetMaxRunners(capacity)
-					err = engine.Reconcile(ctx)
-				}
-				report(err)
-			case err := <-pollingDone:
-				if ctx.Err() == nil {
-					report(errors.New("GitHub listener stopped; reconnecting without discarding durable leases"))
-				}
-				_ = err
-				reconnect = true
 			}
-		}
-		ticker.Stop()
-		endSession()
-		if !ownershipLost.Load() {
-			cleanupCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := session.Close(cleanupCtx); err != nil {
-				report(errors.New("GitHub session close unconfirmed"))
-			}
-			closeCancel()
-		}
+			json.NewEncoder(os.Stderr).Encode(fields)
+		},
 	}
-	select {
-	case err := <-heartbeatErrors:
+	if err := lifecycle.Run(ctx); err != nil {
 		return err
-	default:
 	}
 	fmt.Fprintln(os.Stderr, "controller stopped; Central retains leases and enforces their deadlines")
 	return nil

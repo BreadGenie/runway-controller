@@ -28,6 +28,8 @@ An admitted runner lease persists intent before work is acknowledged. Provisioni
 
 The live prototype's journal binds a directly assigned job to the expected runner name, runner ID, and job UUID. GitHub supplied a zero request ID and result `succeeded`; the receipt preserves the raw result and normalizes success. The durable controller also persists job-acquisition intent. Its restart and uncertain-outcome behavior has isolated tests; those tests are separate from live controller recovery evidence.
 
+The controller lifecycle module keeps one lease engine across GitHub message sessions. It owns connection retries, ownership renewal, capacity refresh, and shutdown. Message handling and reconciliation run serially; the SDK receives a successful delivery result only after handling succeeds. A disconnected listener retains its error cause and retries after a bounded delay. While GitHub cannot connect, lease reconciliation continues. Ownership heartbeat failure cancels polling and prevents session-close mutations; normal shutdown waits for polling and renewal to end before returning.
+
 ## Boundaries that matter
 
 Creation timeouts are uncertain outcomes. Persist an attempt identity before calling Atlas, reconcile by identity, and avoid blind creation retries. A tag helps locate resources but is not an atomic idempotency guarantee.

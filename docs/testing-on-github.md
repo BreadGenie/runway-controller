@@ -102,6 +102,24 @@ otherwise, which costs you a debugging cycle to work out. The `Runway Shape` wor
 
 ### 5. Read what happened
 
+For controller changes, also run the fork's **Server** workflow using its existing
+environment setup and test commands. A shape check proves runner selection; it
+does not exercise the Frappe test suite. Check that the matrix includes every
+shard: `TOTAL_BUILDS: 2` requires `index: [1, 2]`. Use `max-parallel: 1` when the
+host can fit only one guest. Keep coverage enabled and do not exclude failing tests.
+
+When the Server workflow exists on the default branch, dispatch it against the
+fork branch containing the runner label and full shard matrix:
+
+```sh
+gh workflow run server-tests.yml -R BreadGenie/frappe --ref YOUR_TEST_BRANCH \
+  -f runner=runway-2vcpu-6gb -f guest-caps=false
+```
+
+Wait for both integration jobs and coverage uploads, and report each shard's
+test count, failures and errors. The MariaDB Server workflow does not cover the
+separate UI or PostgreSQL workflows.
+
 The job log is the primary evidence. `gh run view <id> --log` and grep for the shape lines:
 
 ```sh
