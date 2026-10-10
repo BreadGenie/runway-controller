@@ -30,6 +30,15 @@ The live prototype's journal binds a directly assigned job to the expected runne
 
 The controller lifecycle module keeps one lease engine across GitHub message sessions. It owns connection retries, ownership renewal, capacity refresh, and shutdown. Message handling and reconciliation run serially; the SDK receives a successful delivery result only after handling succeeds. A disconnected listener retains its error cause and retries after a bounded delay. While GitHub cannot connect, lease reconciliation continues. Ownership heartbeat failure cancels polling and prevents session-close mutations; normal shutdown waits for polling and renewal to end before returning.
 
+The [guest agent](../guest/guest_agent.py) owns preparation, one-use bootstrap,
+status, diagnostics collection, and stop behind `execute(request)`. It returns
+an exit status and a public status document; its CLI reads the request from stdin.
+The SSH transport sends this standalone module unchanged and carries its response.
+Filesystem paths have fixed production defaults and an internal test adapter;
+requests cannot override them. Tests call the same entry point with private files
+and substituted system commands, without rewriting the program's source. Timing
+and Docker rollback state belong to one request.
+
 ## Boundaries that matter
 
 Creation timeouts are uncertain outcomes. Persist an attempt identity before calling Atlas, reconcile by identity, and avoid blind creation retries. A tag helps locate resources but is not an atomic idempotency guarantee.

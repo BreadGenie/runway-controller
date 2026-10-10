@@ -9,6 +9,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,12 @@ spec = importlib.util.spec_from_file_location(
 )
 transport = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transport)
+
+guest_spec = importlib.util.spec_from_file_location(
+    'guest_agent', Path(__file__).resolve().parents[1] / 'guest/guest_agent.py'
+)
+guest = importlib.util.module_from_spec(guest_spec)
+guest_spec.loader.exec_module(guest)
 
 RUNNING_REPORT = 'LoadState=loaded\nActiveState=active\nExecMainStartTimestampMonotonic=123\n'
 COMPLETED_REPORT = 'LoadState=loaded\nActiveState=inactive\nExecMainStartTimestampMonotonic=123\n'
@@ -54,34 +61,28 @@ class TransportTests(unittest.TestCase):
             os.chmod(root / 'clocksource' / attribute, 0o644)
         # The cache and workspace directories are deliberately left out: sealing empties
         # them, so a fresh guest arrives without either and preparation has to create one.
-        program = transport.GUEST_PROGRAM
-        for guest_path, private_path in (('/var/lib/runway/bootstrap.json', root / 'bootstrap.json'),
-                                         ('/home/runner/actions-runner', root / 'actions-runner'),
-                                         ('/home/runner/.cache', root / 'cache'),
-                                         ('/etc/sudoers.d/runway-runner', root / 'sudoers/runway-runner'),
-                                         ('/etc/sudoers.d', root / 'sudoers'),
-                                         ('/etc/docker/daemon.json', root / 'docker/daemon.json'),
-                                         ('/etc/runway-frappe-bench.json', root / 'runway-frappe-bench.json'),
-                                         ('/sys/devices/system/clocksource/clocksource0',
-                                          root / 'clocksource')):
-            program = program.replace(guest_path, str(private_path))
-        # The workspace is redirected here too, so no test can reach a real guest's
-        # directory even when it never enables that opt-in.
-        program = program.replace('/home/runner/work', str(root / 'work'))
+        paths = guest._Paths(
+            marker=root / 'bootstrap.json', runner=root / 'actions-runner',
+            cache=root / 'cache', workspace=root / 'work',
+            sudoers=root / 'sudoers/runway-runner',
+            daemon_config=root / 'docker/daemon.json',
+            manifest=root / 'runway-frappe-bench.json', clocksource=root / 'clocksource',
+            secret=root / 'runway.jit', wrapper=root / 'runway-guest-runner',
+        )
         # Every file this code may create is root-owned in the guest. The test user
         # cannot own them, so the recorded ownership stands in for that.
         # Both clocksource attributes are in `owned` because the guest program now
         # requires them to be root-owned sysfs, which an unprivileged test user cannot
         # create: fake_lstat rewrites their recorded ownership to root's.
-        return program, root / 'sudoers/runway-runner', [root / 'sudoers/runway-runner',
+        return paths, root / 'sudoers/runway-runner', [root / 'sudoers/runway-runner',
                                                         root / 'docker/daemon.json',
                                                         root / 'clocksource/current_clocksource',
                                                         root / 'clocksource/available_clocksource']
 
-    def execute_guest(self, program, sudoers, payload, *, present=('sudo', 'visudo'),
+    def execute_guest(self, paths, sudoers, payload, *, present=('sudo', 'visudo'),
                       results=None, plant=None, root_owned=(), meminfo=None,
                       published_answer=b'220 probe ready\r\n', proxy_listing=None):
-        """Run the embedded guest program locally: no SSH and no real guest binary."""
+        """Run the guest interface with private files and substituted system commands."""
         real_lstat = os.lstat
         real_open = builtins.open
         real_write = os.write
@@ -200,24 +201,69 @@ class TransportTests(unittest.TestCase):
             entry[4:6] = [0, 0]
             return os.stat_result(entry)
 
-        with (patch.object(transport.sys, 'stdin', io.StringIO(json.dumps(payload))),
-              patch.object(transport.sys, 'stdout', io.StringIO()) as output,
+        with (patch.object(transport.sys, 'stdout', io.StringIO()) as output,
               patch('shutil.which', side_effect=fake_which),
               patch('builtins.open', side_effect=fake_open),
               patch.object(transport.os, 'fchown', side_effect=fake_fchown),
               patch.object(transport.os, 'lstat', side_effect=fake_lstat),
               patch.object(transport.os, 'open', side_effect=fake_os_open),
               patch.object(transport.os, 'write', side_effect=fake_write),
-              # The guest program imports socket inside its own source, so it
-              # resolves the real module; patch that rather than an attribute of
-              # this one, which has no socket of its own.
+              # System calls are substituted while the guest uses private files.
               patch('socket.create_connection', side_effect=fake_create_connection),
               patch('time.monotonic', side_effect=fake_monotonic),
               patch('time.sleep', side_effect=lambda _seconds: None),
               patch.object(transport.subprocess, 'run', side_effect=fake_run)):
-            with self.assertRaises(SystemExit) as stopped:
-                exec(program, {})
-        return stopped.exception.code, output.getvalue(), recorded, ownership
+            code, document = guest.execute(payload, _paths=paths)
+            if document is not None:
+                print(json.dumps(document))
+        return code, output.getvalue(), recorded, ownership
+
+    def test_wire_program_is_the_guest_module_and_rejects_unknown_actions(self):
+        source = Path(guest.__file__).read_text()
+        self.assertEqual(transport.GUEST_PROGRAM, source)
+        for command in ([sys.executable, guest.__file__],
+                        [sys.executable, '-c', transport.GUEST_PROGRAM]):
+            with self.subTest(command=command[:2]):
+                result = subprocess.run(command, input=json.dumps({
+                    'action': 'unsupported', 'runner_name': 'runway-test',
+                    'jit': 'private-jit', '_paths': {'marker': '/tmp/ignored'},
+                }), text=True, capture_output=True)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stdout), {'state': 'unknown'})
+                self.assertNotIn('private-jit', result.stdout + result.stderr)
+
+    def test_requests_do_not_share_timing_or_status_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, sudoers, owned = self.guest_paths(directory)
+            first = self.execute_guest(paths, sudoers, {
+                'action': 'prepare', 'runner_name': 'runway-first', 'timings': True,
+            }, root_owned=owned)
+            second = self.execute_guest(paths, sudoers, {
+                'action': 'status', 'runner_name': 'runway-second',
+            }, root_owned=owned)
+            self.assertIn('timings_ms', json.loads(first[1]))
+            self.assertEqual(json.loads(second[1]), {'state': 'installed'})
+
+    def test_bootstrap_owns_one_use_material_and_refuses_a_second_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, sudoers, owned = self.guest_paths(directory)
+            payload = {'action': 'bootstrap', 'runner_name': 'runway-test',
+                       'jit': 'private-jit', 'wrapper': '#!/bin/sh\nexit 0\n'}
+            service = {SERVICE_REPORT: (0, RUNNING_REPORT)}
+            with patch('os.chown'):
+                code, output, calls, _ = self.execute_guest(
+                    paths, sudoers, payload, root_owned=owned, results=service)
+            self.assertEqual((code, json.loads(output)), (0, {'state': 'running'}))
+            self.assertEqual(paths.secret.read_text(), 'private-jit\n')
+            self.assertEqual(stat.S_IMODE(paths.secret.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(paths.marker.stat().st_mode), 0o600)
+            self.assertEqual(paths.wrapper.read_text(), payload['wrapper'])
+            self.assertEqual(len([c for c in calls if c[0] == 'systemd-run']), 1)
+            code, output, calls, _ = self.execute_guest(
+                paths, sudoers, payload, root_owned=owned, results=service)
+            self.assertEqual(code, 1)
+            self.assertFalse(any(c[0] == 'systemd-run' for c in calls))
+            self.assertNotIn('private-jit', output)
 
     def host_request(self, directory, action='prepare', port=5000):
         return {'action': action, 'vm_id': 'vm-123', 'key_file': '/keys/admin',
@@ -549,20 +595,18 @@ class TransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / 'bootstrap.json'
             marker.write_text(json.dumps({'runner_name': 'runway-lease-123'}))
-            program = transport.GUEST_PROGRAM.replace('/var/lib/runway/bootstrap.json', str(marker))
+            paths = guest._Paths(marker=marker)
             for report, expected in [
                 ('LoadState=not-found\nActiveState=inactive\nExecMainStartTimestampMonotonic=0\n', 'unknown'),
                 ('LoadState=loaded\nActiveState=inactive\nExecMainStartTimestampMonotonic=123\n', 'completed'),
                 ('LoadState=loaded\nActiveState=active\nExecMainStartTimestampMonotonic=123\n', 'running'),
             ]:
                 with (self.subTest(expected=expected),
-                      patch.object(transport.sys, 'stdin', io.StringIO(json.dumps({'action': 'status', 'runner_name': 'runway-lease-123'}))),
-                      patch.object(transport.sys, 'stdout', io.StringIO()) as output,
                       patch.object(transport.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, report))):
-                    with self.assertRaises(SystemExit) as stopped:
-                        exec(program, {})
-                    self.assertEqual(stopped.exception.code, 0)
-                    self.assertEqual(json.loads(output.getvalue())['state'], expected)
+                    code, document = guest.execute(
+                        {'action': 'status', 'runner_name': 'runway-lease-123'}, _paths=paths)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(document['state'], expected)
 
     def test_collect_writes_private_file_without_printing_job_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -601,11 +645,11 @@ class TransportTests(unittest.TestCase):
 
     def mirror_guest(self, directory, results=None):
         """Prepare a fresh guest with the mirror opt-in and the guest's own answers."""
-        program, sudoers, owned = self.guest_paths(directory)
+        paths, sudoers, owned = self.guest_paths(directory)
         payload = {'action': 'prepare', 'runner_name': 'runway-lease-123', 'mirror_port': 5000}
-        return (self.execute_guest(program, sudoers, payload, root_owned=owned,
+        return (self.execute_guest(paths, sudoers, payload, root_owned=owned,
                                    present=('dockerd', 'docker'), results=results)
-                + (program, sudoers, owned))
+                + (paths, sudoers, owned))
 
     @staticmethod
     def reported(value):
@@ -691,11 +735,11 @@ class TransportTests(unittest.TestCase):
         for report, expected in [(RUNNING_REPORT, 'running'), (COMPLETED_REPORT, 'completed')]:
             with self.subTest(expected=expected):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     (Path(directory) / 'bootstrap.json').write_text(
                         json.dumps({'runner_name': 'runway-lease-123'}))
                     code, output, recorded, ownership = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'mirror_port': 5000},
                         present=('dockerd', 'docker'), results={SERVICE_REPORT: (0, report)},
                         root_owned=owned)
@@ -712,7 +756,7 @@ class TransportTests(unittest.TestCase):
                                ('not-an-object', 1), ('foreign-key-type', 1)):
             with self.subTest(kind=kind):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     target = Path(directory) / 'planted'
                     body = {'registry-mirrors': 'not-a-list'}
                     config = Path(directory) / 'docker/daemon.json'
@@ -733,7 +777,7 @@ class TransportTests(unittest.TestCase):
                         self.place_daemon_config(directory, json.dumps(body))
                     planted = target.read_text() if kind == 'symlink' else config.read_text()
                     code, output, recorded, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'mirror_port': 5000},
                         present=('dockerd', 'docker'),
                         results={('/usr/bin/docker', 'info', '--format',
@@ -753,11 +797,11 @@ class TransportTests(unittest.TestCase):
         for absent in ('dockerd', 'docker'):
             with self.subTest(absent=absent):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     present = tuple(binary for binary in ('dockerd', 'docker')
                                     if binary != absent)
                     code, output, _, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'mirror_port': 5000},
                         present=present, root_owned=owned)
                     # The baked image must already carry Docker; nothing is installed.
@@ -803,7 +847,7 @@ class TransportTests(unittest.TestCase):
 
     def kernel_publish(self, directory, *, results=None, published_answer=b'220 ready\r\n',
                        proxy_listing="", owned=True, expect_code=0):
-        program, sudoers, listed = self.guest_paths(directory)
+        paths, sudoers, listed = self.guest_paths(directory)
         (Path(directory) / 'docker/daemon.json').write_text('{"log-level":"warn"}\n')
         # The kernel exposes a root-owned 0644 file and the guest program verifies
         # that rather than assuming it. write_text honours the umask, which would
@@ -814,7 +858,7 @@ class TransportTests(unittest.TestCase):
             ('docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'),
             (0, self.IMAGE_LIST))
         code, output, recorded, _ = self.execute_guest(
-            program, sudoers,
+            paths, sudoers,
             {'action': 'prepare', 'runner_name': 'runway-lease-123', 'kernel_publish': True},
             present=('sudo', 'visudo', 'dockerd', 'docker'),
             results=answers, published_answer=published_answer,
@@ -879,7 +923,7 @@ class TransportTests(unittest.TestCase):
     def test_kernel_publish_refuses_a_daemon_file_it_cannot_verify(self):
         for kind in ('symlink', 'world-writable'):
             with self.subTest(kind), tempfile.TemporaryDirectory() as directory:
-                program, sudoers, listed = self.guest_paths(directory)
+                paths, sudoers, listed = self.guest_paths(directory)
                 target = Path(directory) / 'canary'
                 target.write_text('planted')
                 daemon = Path(directory) / 'docker/daemon.json'
@@ -890,7 +934,7 @@ class TransportTests(unittest.TestCase):
                     daemon.write_text(self.DAEMON_JSON)
                     daemon.chmod(0o666)
                 code, output, _, _ = self.execute_guest(
-                    program, sudoers,
+                    paths, sudoers,
                     {'action': 'prepare', 'runner_name': 'runway-lease-123',
                      'kernel_publish': True},
                     present=('sudo', 'visudo', 'dockerd', 'docker'),
@@ -903,11 +947,11 @@ class TransportTests(unittest.TestCase):
 
     def test_kernel_publish_off_by_default_leaves_the_daemon_file_alone(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, _ = self.guest_paths(directory)
+            paths, sudoers, _ = self.guest_paths(directory)
             daemon = Path(directory) / 'docker/daemon.json'
             daemon.write_text(self.DAEMON_JSON)
             code, output, recorded, _ = self.execute_guest(
-                program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'})
+                paths, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'})
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output), {'state': 'installed'})
             self.assertEqual(daemon.read_text(), self.DAEMON_JSON)
@@ -946,14 +990,14 @@ class TransportTests(unittest.TestCase):
         for action in ('bootstrap', 'status', 'collect', 'stop'):
             with self.subTest(action=action):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     current = Path(directory) / 'clocksource/current_clocksource'
                     payload = {'action': action, 'runner_name': 'runway-lease-123',
                                'prefer_tsc_clocksource': True}
-                    self.execute_guest(program, sudoers, payload, root_owned=owned)
+                    self.execute_guest(paths, sudoers, payload, root_owned=owned)
                     self.assertEqual(current.read_text().strip(), 'kvm-clock')
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             # A recorded registration moves the guest out of `installed`, which is the
             # only state preparation reconfigures.
@@ -961,21 +1005,21 @@ class TransportTests(unittest.TestCase):
                 json.dumps({'runner_name': 'runway-lease-123'}))
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True}
-            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            code, output, _, _ = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(output), {'state': 'unknown'})
             self.assertEqual(current.read_text().strip(), 'kvm-clock')
 
     def test_tsc_opt_in_refuses_a_kernel_that_marks_its_own_tsc_unstable(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             # Selecting tsc on a kernel that has declared the TSC unstable would trade
             # clock accuracy for speed, which is the opposite of what this opt-in is for.
             (Path(directory) / 'clocksource/unstable').write_text('')
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True}
-            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            code, output, _, _ = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(output), {'state': 'unknown'})
             self.assertEqual(current.read_text().strip(), 'kvm-clock')
@@ -983,7 +1027,7 @@ class TransportTests(unittest.TestCase):
     def test_tsc_opt_in_refuses_an_attribute_others_could_have_written(self):
         for mode, label in ((0o664, 'group-writable'), (0o606, 'world-writable')):
             with self.subTest(label), tempfile.TemporaryDirectory() as directory:
-                program, sudoers, owned = self.guest_paths(directory)
+                paths, sudoers, owned = self.guest_paths(directory)
                 current = Path(directory) / 'clocksource/current_clocksource'
                 current.chmod(mode)
                 payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
@@ -992,7 +1036,7 @@ class TransportTests(unittest.TestCase):
                 # owner. A group- or world-writable attribute means somebody other than
                 # root could have selected a clocksource already, so this code did not
                 # verify what it was writing.
-                code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                code, output, _, _ = self.execute_guest(paths, sudoers, payload,
                                                          root_owned=owned)
                 self.assertEqual(code, 1, label)
                 self.assertEqual(json.loads(output), {'state': 'unknown'}, label)
@@ -1000,13 +1044,13 @@ class TransportTests(unittest.TestCase):
 
     def test_tsc_opt_in_refuses_an_attribute_another_account_owns(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             # Deliberately outside `owned`, so the recorded owner is this test user
             # rather than root. An attribute the job's own account could have written
             # is not one this code verified.
             code, output, _, _ = self.execute_guest(
-                program, sudoers,
+                paths, sudoers,
                 {'action': 'prepare', 'runner_name': 'runway-lease-123',
                  'prefer_tsc_clocksource': True},
                 root_owned=())
@@ -1016,11 +1060,11 @@ class TransportTests(unittest.TestCase):
 
     def test_tsc_opt_in_selects_the_clocksource_and_reads_it_back(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True}
-            code, output, recorded, _ = self.execute_guest(program, sudoers, payload,
+            code, output, recorded, _ = self.execute_guest(paths, sudoers, payload,
                                                            root_owned=owned)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output), {'state': 'installed'})
@@ -1034,7 +1078,7 @@ class TransportTests(unittest.TestCase):
             # attribute is made unwritable first: a second write would fail loudly
             # rather than pass unnoticed.
             os.chmod(current, 0o444)
-            repeated, _, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            repeated, _, _, _ = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             self.assertEqual(repeated, 0)
             self.assertEqual(current.read_text().strip(), 'tsc')
 
@@ -1043,12 +1087,12 @@ class TransportTests(unittest.TestCase):
         # decides whether the write is attempted at all, so a list another account
         # could have rewritten is not one this code verified.
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             trusted = [p for p in owned if 'available_clocksource' not in str(p)]
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True}
-            code, output, _, _ = self.execute_guest(program, sudoers, payload,
+            code, output, _, _ = self.execute_guest(paths, sudoers, payload,
                                                      root_owned=trusted)
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(output), {'state': 'unknown'})
@@ -1056,12 +1100,12 @@ class TransportTests(unittest.TestCase):
 
     def test_tsc_opt_in_refuses_a_kernel_that_does_not_offer_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             current = Path(directory) / 'clocksource/current_clocksource'
             (Path(directory) / 'clocksource/available_clocksource').write_text('kvm-clock hpet\n')
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True}
-            code, output, _, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            code, output, _, _ = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             # An image whose kernel cannot select tsc fails preparation instead of being
             # mutated, and reports the same generic state as every other refusal.
             self.assertEqual(code, 1)
@@ -1075,7 +1119,7 @@ class TransportTests(unittest.TestCase):
                 root / 'canary'), 'a symlink'),
         ):
             with self.subTest(label), tempfile.TemporaryDirectory() as directory:
-                program, sudoers, owned = self.guest_paths(directory)
+                paths, sudoers, owned = self.guest_paths(directory)
                 root = Path(directory)
                 # A canary inside this temporary tree, never a real system file: if the
                 # symlink guard were ever removed, a write-capable run would otherwise
@@ -1085,7 +1129,7 @@ class TransportTests(unittest.TestCase):
                 mutate(root)
                 payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                            'prefer_tsc_clocksource': True}
-                code, output, _, _ = self.execute_guest(program, sudoers, payload,
+                code, output, _, _ = self.execute_guest(paths, sudoers, payload,
                                                          root_owned=owned)
                 self.assertEqual(code, 1, label)
                 self.assertEqual(json.loads(output), {'state': 'unknown'}, label)
@@ -1095,9 +1139,9 @@ class TransportTests(unittest.TestCase):
 
     def test_prepare_without_opt_in_checks_only_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             code, output, recorded, ownership = self.execute_guest(
-                program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'})
+                paths, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'})
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output), {'state': 'installed'})
             self.assertEqual(list(sudoers.parent.iterdir()), [])
@@ -1110,9 +1154,9 @@ class TransportTests(unittest.TestCase):
 
     def test_opt_in_prepare_installs_a_restrictive_rule_and_verifies_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True}
-            code, output, recorded, ownership = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            code, output, recorded, ownership = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output), {'state': 'installed'})
             self.assertEqual(sudoers.read_text(), SUDOERS_RULE)
@@ -1132,7 +1176,7 @@ class TransportTests(unittest.TestCase):
                               if any(part in ('apt', 'apt-get', 'curl', 'wget') for part in argv)], [])
             # A controller that died before recording the phase prepares the same guest
             # again: the identical drop-in is re-validated, not rewritten or refused.
-            repeated, _, repeated_calls, _ = self.execute_guest(program, sudoers, payload, root_owned=owned)
+            repeated, _, repeated_calls, _ = self.execute_guest(paths, sudoers, payload, root_owned=owned)
             self.assertEqual(repeated, 0)
             self.assertEqual(sudoers.read_text(), SUDOERS_RULE)
             self.assertIn(validation, repeated_calls)
@@ -1142,7 +1186,7 @@ class TransportTests(unittest.TestCase):
                                ((), 'validation'), ((), 'passwordless')]:
             with self.subTest(absent=absent, broken=broken):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     results = {}
                     if broken == 'validation':
                         results[('/usr/bin/visudo', '-c', '-f', str(sudoers))] = (1, '')
@@ -1150,7 +1194,7 @@ class TransportTests(unittest.TestCase):
                         results[('runuser', '-u', 'runner', '--', '/usr/bin/sudo', '-n', 'true')] = (1, '')
                     present = tuple(binary for binary in ('sudo', 'visudo') if binary not in absent)
                     code, output, _, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True},
                         present=present, results=results, root_owned=owned)
                     # Preparation is refused, so no bootstrap follows it on this guest.
@@ -1161,9 +1205,9 @@ class TransportTests(unittest.TestCase):
         for action, expected in (('status', 0), ('collect', 0), ('stop', 0), ('bootstrap', 1)):
             with self.subTest(action=action):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     code, _, recorded, ownership = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': action, 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True},
                         root_owned=owned)
                     self.assertEqual(code, expected)
@@ -1177,7 +1221,7 @@ class TransportTests(unittest.TestCase):
                                              (None, 'dot-runner', 'unknown')]:
             with self.subTest(registered=registered, expected=expected):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     results = {SERVICE_REPORT: (0, report)} if report else {}
                     if registered == 'marker':
                         (Path(directory) / 'bootstrap.json').write_text(
@@ -1185,7 +1229,7 @@ class TransportTests(unittest.TestCase):
                     else:
                         (Path(directory) / 'actions-runner/.runner').write_text('{}')
                     code, output, recorded, ownership = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True},
                         results=results, root_owned=owned)
                     self.assertEqual(code, 1)
@@ -1199,20 +1243,20 @@ class TransportTests(unittest.TestCase):
                                     ('world-readable', 1), ('identical', 0)):
             with self.subTest(kind=kind):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     target = Path(directory, 'planted')
                     if kind == 'symlink':
                         target.write_text('root ALL=(ALL) NOPASSWD: ALL\n')
                         sudoers.symlink_to(target)
                         planted = target.read_text()
                     else:
-                        body = SUDOERS_RULE if kind in ('world-readable', 'identical') \
+                        body = SUDOERS_RULE if kind in ('world-readable', 'identical')\
                             else 'runner ALL=(ALL) PASSWD: ALL\n'
                         sudoers.write_text(body)
                         sudoers.chmod(0o644 if kind == 'world-readable' else 0o440)
                         planted = body
                     code, _, recorded, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True},
                         root_owned=owned)
                     self.assertEqual(code, expected_code)
@@ -1230,7 +1274,7 @@ class TransportTests(unittest.TestCase):
 
     def test_opt_in_create_refuses_a_drop_in_planted_after_the_check(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             target = Path(directory, 'planted')
             target.write_text('root ALL=(ALL) NOPASSWD: ALL\n')
             planted = []
@@ -1241,7 +1285,7 @@ class TransportTests(unittest.TestCase):
                     sudoers.symlink_to(target)
 
             code, output, recorded, _ = self.execute_guest(
-                program, sudoers,
+                paths, sudoers,
                 {'action': 'prepare', 'runner_name': 'runway-lease-123', 'allow_guest_sudo': True},
                 plant=plant, root_owned=owned)
             # O_EXCL|O_NOFOLLOW closes the window between the check and the create, so
@@ -1288,17 +1332,17 @@ class TransportTests(unittest.TestCase):
     def cache_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
                     cache=None, timings=None):
         """Prepare a fresh guest with the RAM cache opt-in and the guest's own answers."""
-        program, sudoers, owned = self.guest_paths(directory)
+        paths, sudoers, owned = self.guest_paths(directory)
         if cache is not None:
-            # Re-point this program at a differently shaped cache path, e.g. one whose
+            # Supply a differently shaped cache path, e.g. one whose
             # parent is not the real home directory.
-            program = program.replace(str(self.cache_path(directory)), str(cache))
+            paths = paths._replace(cache=Path(cache))
         payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                    'cache_tmpfs_mib': mib, 'timings': timings}
-        return (self.execute_guest(program, sudoers, payload, root_owned=owned,
+        return (self.execute_guest(paths, sudoers, payload, root_owned=owned,
                                    present=self.MOUNT_TOOLS if present is None else present,
                                    results=results, meminfo=meminfo)
-                + (program, sudoers, owned))
+                + (paths, sudoers, owned))
 
     @staticmethod
     def mount_calls(recorded, binary='mount'):
@@ -1341,9 +1385,9 @@ class TransportTests(unittest.TestCase):
 
     def test_prepare_without_the_cache_opt_in_touches_no_mount_at_all(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             code, output, recorded, ownership = self.execute_guest(
-                program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'},
+                paths, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123'},
                 root_owned=owned)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output), {'state': 'installed'})
@@ -1588,7 +1632,7 @@ class TransportTests(unittest.TestCase):
                                              (None, 'dot-runner', 'unknown')]:
             with self.subTest(registered=registered, expected=expected):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     results = {SERVICE_REPORT: (0, report)} if report else {}
                     if registered == 'marker':
                         (Path(directory) / 'bootstrap.json').write_text(
@@ -1596,7 +1640,7 @@ class TransportTests(unittest.TestCase):
                     else:
                         (Path(directory) / 'actions-runner/.runner').write_text('{}')
                     code, output, recorded, _ = self.execute_guest(
-                        program, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123',
+                        paths, sudoers, {'action': 'prepare', 'runner_name': 'runway-lease-123',
                                            'cache_tmpfs_mib': 2048},
                         present=self.MOUNT_TOOLS, results=results, root_owned=owned)
                     self.assertEqual(code, 1)
@@ -1610,9 +1654,9 @@ class TransportTests(unittest.TestCase):
         for action, expected in (('status', 0), ('collect', 0), ('stop', 0), ('bootstrap', 1)):
             with self.subTest(action=action):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     code, _, recorded, _ = self.execute_guest(
-                        program, sudoers, {'action': action, 'runner_name': 'runway-lease-123',
+                        paths, sudoers, {'action': action, 'runner_name': 'runway-lease-123',
                                            'cache_tmpfs_mib': 2048},
                         present=self.MOUNT_TOOLS, root_owned=owned)
                     self.assertEqual(code, expected)
@@ -1655,13 +1699,13 @@ class TransportTests(unittest.TestCase):
     def workspace_guest(self, directory, mib=2048, results=None, meminfo=None, present=None,
                         payload=None):
         """Prepare a fresh guest with the RAM workspace opt-in and the guest's answers."""
-        program, sudoers, owned = self.guest_paths(directory)
+        paths, sudoers, owned = self.guest_paths(directory)
         request = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                    'workspace_tmpfs_mib': mib} if payload is None else payload
-        return (self.execute_guest(program, sudoers, request, root_owned=owned,
+        return (self.execute_guest(paths, sudoers, request, root_owned=owned,
                                    present=self.MOUNT_TOOLS if present is None else present,
                                    results=results, meminfo=meminfo)
-                + (program, sudoers, owned))
+                + (paths, sudoers, owned))
 
     def test_workspace_opt_in_is_explicit_and_carried_in_the_payload(self):
         for flag, expected in (([], None), (['--workspace-tmpfs-mib', '2048'], 2048)):
@@ -1791,9 +1835,9 @@ class TransportTests(unittest.TestCase):
 
     def test_the_workspace_is_neither_probed_nor_mounted_without_the_opt_in(self):
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             code, output, recorded, ownership = self.execute_guest(
-                program, sudoers,
+                paths, sudoers,
                 {'action': 'prepare', 'runner_name': 'runway-lease-123', 'cache_tmpfs_mib': 2048},
                 present=self.MOUNT_TOOLS, root_owned=owned,
                 results={self.findmnt(directory): [self.enclosing(), self.mounted(directory)]})
@@ -2005,9 +2049,9 @@ class TransportTests(unittest.TestCase):
         for action, expected in (('status', 0), ('collect', 0), ('stop', 0), ('bootstrap', 1)):
             with self.subTest(action=action):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     code, _, recorded, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': action, 'runner_name': 'runway-lease-123',
                          'workspace_tmpfs_mib': 2048},
                         present=self.MOUNT_TOOLS, root_owned=owned)
@@ -2019,7 +2063,7 @@ class TransportTests(unittest.TestCase):
                                              (None, 'dot-runner', 'unknown')]:
             with self.subTest(registered=registered, expected=expected):
                 with tempfile.TemporaryDirectory() as directory:
-                    program, sudoers, owned = self.guest_paths(directory)
+                    paths, sudoers, owned = self.guest_paths(directory)
                     results = {SERVICE_REPORT: (0, report)} if report else {}
                     if registered == 'marker':
                         (Path(directory) / 'bootstrap.json').write_text(
@@ -2027,7 +2071,7 @@ class TransportTests(unittest.TestCase):
                     else:
                         (Path(directory) / 'actions-runner/.runner').write_text('{}')
                     code, output, recorded, _ = self.execute_guest(
-                        program, sudoers,
+                        paths, sudoers,
                         {'action': 'prepare', 'runner_name': 'runway-lease-123',
                          'workspace_tmpfs_mib': 2048},
                         present=self.MOUNT_TOOLS, results=results, root_owned=owned)
@@ -2041,10 +2085,10 @@ class TransportTests(unittest.TestCase):
 
     def timed_guest(self, directory, timings):
         """Prepare a fresh guest with timings asked for or not, and the guest's answers."""
-        program, sudoers, owned = self.guest_paths(directory)
+        paths, sudoers, owned = self.guest_paths(directory)
         payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                    'prefer_tsc_clocksource': True, 'timings': timings}
-        return self.execute_guest(program, sudoers, payload, root_owned=owned)
+        return self.execute_guest(paths, sudoers, payload, root_owned=owned)
 
     def test_the_status_document_is_unchanged_unless_timings_are_asked_for(self):
         # The controller parses this document, so an unasked-for field is a contract change
@@ -2073,12 +2117,12 @@ class TransportTests(unittest.TestCase):
         # A failure is exactly when an operator wants the numbers, so the refusal path
         # carries them too rather than only the success path.
         with tempfile.TemporaryDirectory() as directory:
-            program, sudoers, owned = self.guest_paths(directory)
+            paths, sudoers, owned = self.guest_paths(directory)
             payload = {'action': 'prepare', 'runner_name': 'runway-lease-123',
                        'prefer_tsc_clocksource': True, 'timings': True}
             # The clocksource attributes are deliberately left out of `owned`, so the
             # recorded owner is this test user rather than root and the opt-in refuses.
-            code, output, _, _ = self.execute_guest(program, sudoers, payload,
+            code, output, _, _ = self.execute_guest(paths, sudoers, payload,
                                                     root_owned=())
 
         self.assertEqual(code, 1)

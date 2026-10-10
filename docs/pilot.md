@@ -191,3 +191,10 @@ Nothing is pulled. The proof uses an image the baked runner image already carrie
 Any failure restores the exact prior text, restarts Docker, and fails preparation closed with the transport's generic `unknown` state, so no JIT configuration is requested and no bootstrap follows. A `daemon.json` that is a symlink, not a regular file, not root-owned, or group- or world-writable is refused rather than rewritten, exactly as the registry mirror opt-in treats it. A guest already carrying the key is confirmed by the same proof rather than rewritten, so a repeated preparation does not restart Docker for nothing. `bootstrap`, `status`, `collect` and `stop` never touch the file, and a guest that already carries a registration is never reconfigured. The setting is the disposable guest's own Docker daemon; it reaches no Metal host value, no network namespace and no credential, and it is applied before registration so no job observes a partial change.
 
 Two limits, stated rather than hidden. With no userspace proxy, a published port relies on the kernel's DNAT, which does not cover every network topology, and there is no userspace fallback for UDP. The proof above refuses a guest whose ports do not come up rather than passing it to a job. And the measurement behind this is an SMTP request/response against a throwaway container from the image's own store, not a measured MariaDB query, so the end-to-end effect on the 708-test phase is an estimate until a job is run with the flag. See [Frappe performance](frappe-performance.md).
+
+### Guest transport deployment
+
+Keep `scripts/metal-guest-transport.py`, `guest/guest_agent.py`, and
+`guest/guest-runner.sh` in their repository layout when installing the transport.
+The transport reads the guest agent and runner wrapper beside the scripts directory
+and delivers them over SSH; the guest agent needs only Python's standard library.
