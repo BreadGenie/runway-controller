@@ -9,8 +9,10 @@
 #   runway-standalone-guest ssh VM_ID [COMMAND...]   (root shell in the guest)
 #
 # prepare-image copies a Metal image's disk and kernel into the launcher's own
-# store. Metal prunes images and kernels it does not use, and newer Metal moves kernels to a
-# digest-named store, so launch never reads Metal's files.
+# store, then installs the pinned official Actions runner over the image's
+# runner: a Metal image may carry a patched Runner.Worker. Metal prunes images
+# and kernels it does not use, and newer Metal moves kernels to a digest-named
+# store, so launch never reads Metal's files.
 # launch clones the prepared runner image, starts runway-cache-host@VM_ID (the
 # guest's vsock 1026/1027 host side) and the VM, registers one ephemeral
 # scale-set JIT runner with the host GitHub credential, writes the root-only binding
@@ -28,8 +30,13 @@
 set -euo pipefail
 umask 077
 
-# Prepared from a stock Metal image: the guest runs the unmodified Actions runner.
+# Prepared by prepare-image: the guest runs the unmodified Actions runner.
 image=${RUNWAY_GUEST_IMAGE:-regional-cache-node-v2}
+# The official runner, pinned as in guest/install-guest-runner.sh. The Worker
+# digest is that release's bin/Runner.Worker.dll; a patched one never boots.
+runner_version=2.337.0
+runner_sha256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
+runner_worker_sha256=f460f611aa5597a4d5331a8b9e848d5a535ece0e6dab396699328502b8b49c41
 image_dataset=metal/runway-images
 image_root=/var/lib/runway-standalone-images
 metal_images=/var/lib/metal/images
@@ -64,21 +71,41 @@ prepare_image() {
 	local name=$1 from=$2
 	valid_image "$name"
 	[[ $from =~ ^sha256:[0-9a-f]{64}$ ]] || die "METAL_IMAGE must be a sha256: image reference"
-	local ds=$image_dataset/$name dir=$image_root/$name kernel digest
+	local ds=$image_dataset/$name dir=$image_root/$name kernel digest root runner owner
 	! zfs list -H "$ds" >/dev/null 2>&1 && [ ! -e "$dir" ] || die "image $name already exists"
 	digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_sha256"].lower())' "$metal_images/$from/manifest.json") || die "no manifest for $from"
 	# Older Metal keeps the kernel beside the manifest, newer Metal in kernels/.
 	kernel=$metal_images/$from/vmlinux
 	[ -f "$kernel" ] || kernel=/var/lib/metal/kernels/$digest
 	[ -f "$kernel" ] || die "kernel $digest not found"
-	trap 'echo "runway-standalone-guest: prepare of $name failed; removing it" >&2; mountpoint -q "$dir/root" && umount "$dir/root"; zfs destroy -r "$ds" 2>/dev/null; rm -rf "$dir"' EXIT
+	# Expand now: the EXIT trap runs after this function's locals are gone.
+	trap "echo 'runway-standalone-guest: prepare of $name failed; removing it' >&2; mountpoint -q '$dir/root' && umount '$dir/root'; zfs destroy -r '$ds' 2>/dev/null; rm -rf '$dir'" EXIT
 	install -d -m 0700 "$image_root" "$dir"
 	cp "$kernel" "$dir/vmlinux"
 	[ "$(sha256sum "$dir/vmlinux" | cut -c1-64)" = "$digest" ] || die "kernel digest mismatch"
 	# A full copy, not a clone: Metal may destroy its image while guests run.
 	zfs list -H "$image_dataset" >/dev/null 2>&1 || zfs create -o mountpoint=none "$image_dataset"
 	zfs send "metal/images/$from@ready" | zfs receive "$ds"
-	printf '%s\n' "$from" > "$dir/source"
+	curl -fsSL --proto '=https' --max-time 300 -o "$dir/runner.tar.gz" \
+		"https://github.com/actions/runner/releases/download/v$runner_version/actions-runner-linux-x64-$runner_version.tar.gz"
+	[ "$(sha256sum "$dir/runner.tar.gz" | cut -c1-64)" = "$runner_sha256" ] || die "runner archive digest mismatch"
+	udevadm settle
+	root=$dir/root runner=$dir/root/opt/runway/runner
+	mkdir "$root"
+	mount "/dev/zvol/$ds" "$root"
+	[ -d "$runner" ] || die "image has no /opt/runway/runner"
+	owner=$(stat -c %u:%g "$runner")
+	# Replace, not overlay: no file of a patched runner may survive.
+	rm -rf "$runner/bin" "$runner/externals" "$root/opt/runway/bin/job-gate" "$root/opt/runway/bin/cache-setup"
+	tar -xzf "$dir/runner.tar.gz" -C "$runner" --no-same-owner
+	chown -R "$owner" "$runner"
+	[ "$(sha256sum "$runner/bin/Runner.Worker.dll" | cut -c1-64)" = "$runner_worker_sha256" ] || die "Runner.Worker.dll is not the official $runner_version build"
+	umount "$root"
+	rmdir "$root"
+	rm "$dir/runner.tar.gz"
+	zfs destroy "$ds@ready"
+	zfs snapshot "$ds@ready"
+	printf '%s runner=%s\n' "$from" "$runner_version" > "$dir/source"
 	trap - EXIT
 	echo "{\"image\":\"$name\",\"from\":\"$from\",\"kernel_sha256\":\"$digest\"}"
 }

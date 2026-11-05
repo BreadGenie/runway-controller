@@ -25,7 +25,12 @@ Guests boot only from the launcher's own image store (`metal/runway-images/NAME`
 and `/var/lib/runway-standalone-images/NAME/vmlinux`). Metal prunes images and
 kernels it does not use, and newer Metal moves kernels out of the image
 directory, so `prepare-image` copies the disk and kernel once, accepting either
-Metal layout. Use a stock Metal runner image; the guest needs no runner patch:
+Metal layout. It then installs the official Actions runner (version and
+archive digest pinned in the launcher, as in `guest/install-guest-runner.sh`)
+over the image's runner, removes the retired `job-gate` and `cache-setup`
+helpers, and refuses the image unless `bin/Runner.Worker.dll` is the official
+build. A Metal image may carry a patched runner; the prepared guest never does.
+Preparing needs HTTPS access to the GitHub release download:
 
 ```sh
 runway-standalone-guest prepare-image regional-cache-node-v2 \
