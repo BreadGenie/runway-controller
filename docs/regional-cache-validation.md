@@ -1,21 +1,24 @@
 # Regional cache validation
 
-The [spec](../specs/runway-regional-cache.md) defines the standalone contract.
-Current review evidence belongs in
-`.scratch/runway-regional-cache/review-shrink-20261105/`.
+From the repo root:
 
-Required gates: Go build, vet and full tests; targeted cache race tests;
-pinned Node clients through the relay; offline runner/cache Python suites;
-initializer overlay tests. Real Garage smoke testing is opt-in.
+```sh
+gofmt -l .
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./cache/... .
+python3 integrations/actions-runner/test_cache_relay.py
+python3 integrations/actions-runner/test_regional_cache_setup.py
+python3 integrations/actions-cache/test_garage_storage.py
+RUNWAY_CACHE_CLIENT_TEST=1 go test -race ./cache/transport -run TestPinnedClientsThroughRelay
+RUNWAY_GARAGE_TEST=1 python3 integrations/actions-cache/test_garage_storage.py
+```
 
-Live proof must preserve the journal, demonstrate a warm hit, and run two
-scale-set-39 shards with confirmed jobs, grants and passing Integration.
-Record restore times and refuse forged run, sibling UUID, unbound guest and
-tag-as-branch requests. Tear down all test guests and runners afterwards.
-The hosted Migration failure due to MariaDB is unrelated to cache validation.
-
-The network probe found the base guest path was not the bottleneck: public download reached 198–213 MB/s, near the warm host.
-Probe scripts and raw measurements live in `.scratch/runway-regional-cache/net-bottleneck-20261104/`.
-
-Repeated matched performance qualification and a standalone Firecracker jailer
-remain follow-ups.
+The last two gates require local pinned client bundles and Garage respectively;
+see [client prerequisites](../integrations/actions-cache/README.md).
+Runner patch behavior changes require a rebuilt Runner.Worker and all 184 runner
+L0 tests. Live qualification must preserve the journal, demonstrate warm hits
+with two confirmed scale-set-39 jobs, and refuse forged runs, sibling UUIDs,
+unbound guests and tag-as-branch claims. Tear down test guests and runners.
+Repeated matched performance qualification and a standalone jailer remain open.

@@ -36,12 +36,3 @@ Python helpers alone cannot update the runner's exception handling or container
 routing. Use an unregistered build distribution; never copy runner credentials,
 workspaces or diagnostics into the image. The repository's initializer overlay
 preparation and image sealing scripts enforce that input boundary.
-
-## Validation
-
-Offline Python tests use real sockets for setup and relay behavior.
-The Go pinned-client test runs both upstream bundles through the relay and TLS
-transport, checks exact bytes, restore keys and multiple upload chunks, and
-rejects client connections outside the relay.
-Runner L0 coverage checks setup exceptions, cancellation, container routing and
-resolved action identity. Live proof requires two confirmed jobs and warm hits.

@@ -97,9 +97,8 @@ The health check covers the following:
 
 ## Storage time budgets
 
-Configured in `cache-data.json` under `storage_budget`. One finalize, download or reconcile gets
-`base_seconds + bytes / min_bytes_per_second`, capped at `max_seconds`. Restart recovery gets one
-shared deadline: `base_seconds + recovered bytes / min_bytes_per_second + 1 s per object`, capped at
-`recovery_max_seconds`. The defaults are 12 s, 16 MiB/s, 300 s and 900 s. At these values a 584 MB
-finalize gets about 47 s, where it previously had a fixed 12 s and measured 9.6 s. A stalled
-backend still fails at its scaled deadline.
+`cache-data.json` accepts optional `storage_budget`: `base_seconds` (12),
+`min_bytes_per_second` (16777216), `max_seconds` (300), and
+`recovery_max_seconds` (900). Operations get base plus bytes/rate, capped at max;
+startup shares base plus bytes/rate plus one second per object, capped at
+recovery max. Preserve existing config, journal and Garage directories.

@@ -2,7 +2,7 @@
 
 The standalone service stores dependency archives in Garage on blr-1.
 See the [spec](../../specs/runway-regional-cache.md) and
-[data service](data-service.md).
+[deployment](../../deploy/blr-garage/README.md).
 
 `pinned_clients.py` verifies offline upstream bundle hashes and runs Node clients.
 `test_relay_clients.py` exercises miss, save, exact and restore-key hits,

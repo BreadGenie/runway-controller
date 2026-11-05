@@ -1,70 +1,39 @@
 # Regional Actions cache
 
-Status: standalone development deployment on blr-1.
+Standalone deployment on blr-1 for actions/cache@0057852b (v4.3.0) and
+setup-node@24997072 (v6.5.0), cache protocol v1. Other traffic keeps its route.
+Only same-repository branch pushes and workflow_dispatch qualify; PRs, forks,
+tags, container jobs and unsupported revisions retain GitHub caching.
 
-## Scope
+The root launcher binds each ephemeral scale-set-39 runner to its Firecracker
+PID. cache-host authenticates the socket peer, then confirms the job UUID and
+request ID against the scale-set session and GitHub REST. Guest claims alone
+never authorize a grant. The per-VM vsock ports are:
 
-Serve dependency-cache archives near disposable Firecracker runners without
-workflow changes. Supported pinned clients are actions/cache@0057852b (v4.3.0)
-and actions/setup-node@24997072 (v6.5.0), using cache protocol v1.
-Artifacts, logs and other action traffic retain their existing routes.
-PRs, forks, tags and unsupported actions retain GitHub caching.
+- 1025: confirm within 35 seconds and release the bound job even on failure.
+- 1026: one setup per release; verify run, attempt, repository, branch, SHA and
+  host-held workflow ref before signing an Ed25519 repository/ref grant.
+- 1027: translate supported cache requests to cache-data over authenticated TLS.
 
-## Authority
+Setup failures disable regional caching without failing the job. Clock, key,
+CA or token failure must leave the gate available. Grants expire within the
+verified job deadline and 30 minutes; renewal rechecks the running job. Host
+time comes from adjtimex, with uncertainty checked before granting or serving.
+Signing keys and Garage credentials never enter the guest.
 
-The trusted root launcher registers an ephemeral runner in scale set 39 and
-writes a root-only binding of VM, Firecracker PID, repository and runner identity.
-cache-host checks the connecting socket peer against that PID.
-The guest supplies claims, never authority.
+cache-data stages uploads privately, journals intent before PUT and publication
+before success, and exposes only complete immutable archives. Downloads verify
+size and SHA256 before serving bytes. Read tickets last at most one minute and
+never outlive their grants. Quotas, physical staging and size-scaled operation
+and recovery budgets remain finite. Active operations pin entries without
+holding the index lock over storage I/O; hidden entries retry deletion with backoff.
 
-cache-assignments is an admission dependency because its scale-set session acquires jobs for the scale set.
-It records JobAssigned and JobStarted evidence in root-only files, pruned by age.
-At port 1025 the host confirms the job UUID and request ID against that session
-and REST, with a 35-second confirmation budget. The bound guest is released even
-if confirmation fails; regional setup then stays disabled.
-At port 1026 setup checks the confirmed job, exact run and attempt, branch, SHA,
-same-repository head and the host-held workflow ref suffix. Only branch pushes
-and manual dispatch qualify. One release permits one setup.
+The private journal uses flock, fsync and atomic replacement. Startup wipes
+staging and verifies indexed objects: missing/corrupt objects become misses;
+unreachable Garage refuses startup. Unknown objects are never adopted. Preserve
+the journal, storage identity and historical prototype/ object prefix on upgrade.
 
-The host signs short-lived grants and renews them in the background after a
-fresh running-job check. Stale session records require REST confirmation.
-Clock uncertainty comes exclusively from adjtimex: unsynchronized clocks disable
-setup. Clock, key, CA or token failure must never remove the 1025 listener.
-cacheJobAuthority is the small seam for a future Central source; that integration
-is outside this standalone implementation.
-
-## Data path
-
-cache-setup establishes the route once before steps. The runner patch isolates
-setup faults from job execution and skips container jobs. A bounded relay carries
-only supported cache requests to port 1027. cache-host injects the grant into a
-TLS connection to cache-data. Guests never receive signing or Garage keys.
-
-cache-data uses disk staging and a persistent single-node Garage on blr-1.
-Published entries are immutable. Uploads reserve quota and remain invisible
-until complete size and digest verification and durable publication.
-Downloads hash while copying to a private spool and verify before serving bytes.
-The journal retains the legacy prototype/ object prefix, storage identity,
-publication intents and hashed read tickets. Startup verifies indexed objects
-within a shared recovery budget. Missing or damaged objects become misses;
-unreachable storage refuses startup. Unknown objects are never adopted.
-
-Published uploads release their spool. In-use entries are refcounted; Garage I/O
-and streaming run outside the global lock. A bounded background sweep retries
-hidden-object cleanup with backoff. Disk custody uses flock and startup wiping.
-Storage deadlines and reservation lifetime scale with size; ticket expiry is
-checked before fetching. Cache loss never changes runner image contents.
-
-## Validation and operations
-
-Run the Go build, vet, unit and race gates, pinned clients through the relay,
-and offline Python suites after each stage. Exercise real Garage separately.
-Live validation requires two confirmed shards, grants, warm restores, passing
-Integration and refusals for forged runs, sibling UUIDs, unbound guests and
-tag-as-branch claims. Preserve the existing Garage journal across upgrades.
 See [deployment](../deploy/blr-garage/README.md),
-[launcher](../deploy/standalone-guest/README.md) and
+[launcher](../deploy/standalone-guest/README.md),
+[runner integration](../integrations/actions-runner/regional-cache.md) and
 [validation](../docs/regional-cache-validation.md).
-
-Repeated matched performance qualification remains outstanding.
-A Firecracker jailer for the standalone launcher is a follow-up.

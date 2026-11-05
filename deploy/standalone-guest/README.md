@@ -20,7 +20,6 @@ starts cache-host and Firecracker, registers a JIT runner and writes its binding
 Launch failures clean up partial resources. Teardown removes authority first,
 then the runner, VM, host service, network and clone. Reap removes stopped VMs,
 including those stopped by RuntimeMaxSec. Guest hours cannot exceed the host unit.
-A Firecracker jailer remains a follow-up.
 
 Guests boot only from the launcher's own image store (`metal/runway-images/NAME`
 and `/var/lib/runway-standalone-images/NAME/vmlinux`). Metal prunes images and
@@ -34,7 +33,4 @@ runway-standalone-guest prepare-image regional-cache-review-20261105 \
   /root/runway-review-20261105/runner
 ```
 
-That is the default image: the preserved runner base with the rebuilt
-Runner.Worker (184 focused L0 tests passed). Set RUNWAY_GUEST_IMAGE to select
-another prepared image. Worker hashes are in the review evidence directory
-named in the validation doc.
+Set RUNWAY_GUEST_IMAGE to select another prepared image.
