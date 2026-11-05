@@ -116,7 +116,8 @@ launch() {
 	[[ $hours =~ ^[1-9][0-9]*$ ]] && [ -n "$max_hours" ] && [ "$hours" -le "$max_hours" ] || die "RUNWAY_GUEST_HOURS must be 1-${max_hours:-?}"
 	[ ! -e "$work" ] && [ ! -e "$socket_dir" ] || die "$vm already exists"
 	ip link show "$host_if" >/dev/null 2>&1 && die "index $index in use"
-	trap 'echo "runway-standalone-guest: launch of $vm failed; tearing down" >&2; teardown "$vm" >&2 || true' EXIT
+	# Expand now: the EXIT trap runs after this function's locals are gone.
+	trap "echo 'runway-standalone-guest: launch of $vm failed; tearing down' >&2; teardown '$vm' >&2 || true" EXIT
 	install -d -m 0700 "$work_root" "$work" "$socket_dir" "$run_root/bindings"
 	echo "$index" > "$work/index"
 

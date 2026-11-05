@@ -13,6 +13,7 @@ func TestPartialRunwayAppCredentialsDoNotFallbackToGH(t *testing.T) {
 			for _, variable := range variables {
 				t.Setenv(variable, "")
 			}
+			t.Setenv("RUNWAY_GITHUB_TOKEN_FILE", "")
 			t.Setenv(supplied, "123")
 			// No gh executable is available: partial App config must fail as
 			// such, rather than unexpectedly using an operator's login.
@@ -22,6 +23,24 @@ func TestPartialRunwayAppCredentialsDoNotFallbackToGH(t *testing.T) {
 				t.Fatalf("unexpected partial App configuration result: %v", err)
 			}
 		})
+	}
+}
+
+func TestTokenFileCredentialIsExclusiveAndNeverFallsBackToGH(t *testing.T) {
+	for _, variable := range []string{"RUNWAY_GITHUB_APP_CLIENT_ID", "RUNWAY_GITHUB_APP_INSTALLATION_ID", "RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE"} {
+		t.Setenv(variable, "")
+	}
+	t.Setenv("PATH", "")
+	// A test cannot create the root-owned file; an unreadable one must fail as such.
+	t.Setenv("RUNWAY_GITHUB_TOKEN_FILE", t.TempDir()+"/missing")
+	client, err := authenticatedClient(context.Background(), "https://github.com/test/repo")
+	if client != nil || err == nil || !strings.Contains(err.Error(), "protected GitHub credential unavailable") {
+		t.Fatalf("token file was not the selected source: %v", err)
+	}
+	t.Setenv("RUNWAY_GITHUB_APP_CLIENT_ID", "123")
+	client, err = authenticatedClient(context.Background(), "https://github.com/test/repo")
+	if client != nil || err == nil || !strings.Contains(err.Error(), "select one GitHub credential source") {
+		t.Fatalf("token file combined with App configuration: %v", err)
 	}
 }
 
