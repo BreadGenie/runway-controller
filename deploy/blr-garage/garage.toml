@@ -1,0 +1,21 @@
+# Persistent single-node Garage for the standalone regional Actions cache on
+# blr-1. Garage is not the cache's source of truth: a lost object is a miss.
+metadata_dir = "/var/lib/runway-garage/meta"
+data_dir = "/var/lib/runway-garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+consistency_mode = "consistent"
+
+# RPC is single-node and loopback-only.
+rpc_bind_addr = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret_file = "/etc/runway-garage/rpc-secret"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "127.0.0.1:3900"
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+admin_token_file = "/etc/runway-garage/admin-token"
+metrics_token_file = "/etc/runway-garage/metrics-token"

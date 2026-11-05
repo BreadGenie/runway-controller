@@ -1,0 +1,6 @@
+# Official Garage v2.3.0 x86_64 musl release binary. install.sh refuses any
+# other digest. Matches /garage in dxflrs/garage:v2.3.0 (amd64), manifest
+# sha256:dac0c92add4f1a0b41035e94b41036a270ffbe88a37c7ac9c3f19e6dc5bdccf2.
+GARAGE_VERSION=v2.3.0
+GARAGE_URL=https://garagehq.deuxfleurs.fr/_releases/v2.3.0/x86_64-unknown-linux-musl/garage
+GARAGE_SHA256=f98d317942bb341151a2775162016bb50cf86b865d0108de03eb5db16e2120cd

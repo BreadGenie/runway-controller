@@ -1,0 +1,29 @@
+[Unit]
+Description=Runway standalone cache assignment observer (runner scale-set message session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/runway-cache/bin/runway --action cache-assignments --config /etc/runway-cache/assignments.json
+# One session per scale set; on failure systemd reopens it. It also acquires
+# the scale set's jobs, so guests receive no job while it is down.
+Restart=always
+RestartSec=5
+UMask=0077
+MemoryMax=256M
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/run/runway-cache/assignments
+ReadOnlyPaths=/etc/runway-cache
+InaccessiblePaths=-/etc/runway-cache/signing-key.pem -/etc/runway-cache/garage-key.json -/etc/runway-cache/cache-data.json -/etc/runway-cache/cache-data.json.previous -/etc/runway-cache/cache-data.json.pre-review -/etc/runway-cache/tls -/etc/runway-cache/host.json
+
+[Install]
+WantedBy=multi-user.target

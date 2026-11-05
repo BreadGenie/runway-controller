@@ -1,0 +1,315 @@
+#!/bin/bash
+# Trusted root launcher for standalone disposable Firecracker guests on blr-1.
+#
+#   runway-standalone-guest prepare-image NAME METAL_IMAGE [WORKER_DIR]
+#   runway-standalone-guest launch VM_ID INDEX [--no-runner]
+#   runway-standalone-guest teardown VM_ID
+#   runway-standalone-guest reap        (tear down guests whose VM has stopped)
+#   runway-standalone-guest status
+#   runway-standalone-guest ssh VM_ID [COMMAND...]   (root shell in the guest)
+#
+# prepare-image copies a Metal image's disk and kernel into the launcher's own
+# store, optionally replacing Runner.Worker.{dll,pdb} from WORKER_DIR. Metal
+# prunes images and kernels it does not use, and newer Metal moves kernels to a
+# digest-named store, so launch never reads Metal's files.
+# launch clones the prepared runner image, starts runway-cache-host@VM_ID (the
+# guest's vsock 1025/1026/1027 host side) and the VM, registers one ephemeral
+# scale-set JIT runner with the host GitHub credential, writes the root-only binding
+# (VM -> Firecracker PID, runner ID/name, repository) and starts the runner.
+# --no-runner stops before registration, leaving an unbound guest.
+# teardown removes the binding first, then the runner, VM, network and clone.
+# A launch that fails part-way tears down whatever it created.
+#
+# Environment: RUNWAY_REPOSITORY (owner/name), RUNWAY_RUNNER_LABEL (the runner
+# scale set name, which is the workflow's runs-on label), RUNWAY_SCALE_SET_ID; optional
+# RUNWAY_GUEST_IMAGE, RUNWAY_GUEST_HOURS (default 3, at most the cache-host
+# unit's RuntimeMaxSec), RUNWAY_GUEST_VCPUS (2),
+# RUNWAY_GUEST_MEMORY_MIB (5120). Only reads Metal's image store; never touches
+# metal.service or metald state.
+set -euo pipefail
+umask 077
+
+# The preserved runner base with this review's tested Runner.Worker.
+image=${RUNWAY_GUEST_IMAGE:-regional-cache-review-20261105}
+image_dataset=metal/runway-images
+image_root=/var/lib/runway-standalone-images
+metal_images=/var/lib/metal/images
+token_file=/etc/runway-cache/github-token
+ssh_key=/var/lib/fc-metal/keys/id_ed25519
+run_root=/run/runway-cache
+work_root=/var/lib/runway-standalone
+guest_files=/opt/runway-cache/guest
+hours=${RUNWAY_GUEST_HOURS:-3}
+
+die() { echo "runway-standalone-guest: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root"
+valid_vm() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "invalid VM id"; }
+valid_image() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || die "invalid image name"; }
+
+# GitHub REST call with the host credential. The token never appears in argv:
+# printf is a shell builtin and curl reads the header from a pipe.
+github() {
+	local method=$1 path=$2 body=${3:-}
+	local args=(-sS --proto '=https' --max-time 20 -X "$method" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -w '\n%{http_code}')
+	[ -n "$body" ] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
+	curl "${args[@]}" --config <(printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n' < "$token_file")") "https://api.github.com$path"
+}
+
+guest_ssh() {
+	local vm=$1; shift
+	ip netns exec "rsg-$vm" ssh -F /dev/null -i "$ssh_key" -o UserKnownHostsFile="$work_root/$vm/known_hosts" \
+		-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=5 root@172.16.0.2 "$@"
+}
+
+prepare_image() {
+	local name=$1 from=$2 worker=${3:-}
+	valid_image "$name"
+	[[ $from =~ ^sha256:[0-9a-f]{64}$ ]] || die "METAL_IMAGE must be a sha256: image reference"
+	local ds=$image_dataset/$name dir=$image_root/$name kernel digest root
+	! zfs list -H "$ds" >/dev/null 2>&1 && [ ! -e "$dir" ] || die "image $name already exists"
+	if [ -n "$worker" ]; then
+		[ -f "$worker/Runner.Worker.dll" ] && [ -f "$worker/Runner.Worker.pdb" ] || die "WORKER_DIR needs Runner.Worker.dll and .pdb"
+	fi
+	digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_sha256"].lower())' "$metal_images/$from/manifest.json") || die "no manifest for $from"
+	# Older Metal keeps the kernel beside the manifest, newer Metal in kernels/.
+	kernel=$metal_images/$from/vmlinux
+	[ -f "$kernel" ] || kernel=/var/lib/metal/kernels/$digest
+	[ -f "$kernel" ] || die "kernel $digest not found"
+	trap 'echo "runway-standalone-guest: prepare of $name failed; removing it" >&2; mountpoint -q "$dir/root" && umount "$dir/root"; zfs destroy -r "$ds" 2>/dev/null; rm -rf "$dir"' EXIT
+	install -d -m 0700 "$image_root" "$dir"
+	cp "$kernel" "$dir/vmlinux"
+	[ "$(sha256sum "$dir/vmlinux" | cut -c1-64)" = "$digest" ] || die "kernel digest mismatch"
+	# A full copy, not a clone: Metal may destroy its image while guests run.
+	zfs list -H "$image_dataset" >/dev/null 2>&1 || zfs create -o mountpoint=none "$image_dataset"
+	zfs send "metal/images/$from@ready" | zfs receive "$ds"
+	if [ -n "$worker" ]; then
+		udevadm settle
+		root=$dir/root
+		mkdir "$root"
+		mount "/dev/zvol/$ds" "$root"
+		install -m 0644 "$worker/Runner.Worker.dll" "$worker/Runner.Worker.pdb" "$root/opt/runway/runner/bin/"
+		umount "$root"
+		rmdir "$root"
+		zfs destroy "$ds@ready"
+		zfs snapshot "$ds@ready"
+	fi
+	printf '%s worker=%s\n' "$from" "${worker:+$(sha256sum "$worker/Runner.Worker.dll" | cut -c1-64)}" > "$dir/source"
+	trap - EXIT
+	echo "{\"image\":\"$name\",\"from\":\"$from\",\"kernel_sha256\":\"$digest\"}"
+}
+
+launch() {
+	local vm=$1 index=$2 runner=${3:-}
+	valid_vm "$vm"
+	valid_image "$image"
+	zfs list -H "$image_dataset/$image@ready" >/dev/null 2>&1 && [ -f "$image_root/$image/vmlinux" ] || die "image $image not prepared (see prepare-image)"
+	[[ $index =~ ^[1-9]$ ]] || die "INDEX must be 1-9 (selects the veth subnet)"
+	if [ "$runner" != --no-runner ]; then
+		: "${RUNWAY_REPOSITORY:?set RUNWAY_REPOSITORY}" "${RUNWAY_RUNNER_LABEL:?set RUNWAY_RUNNER_LABEL}" "${RUNWAY_SCALE_SET_ID:?set RUNWAY_SCALE_SET_ID}"
+		[ -s "$token_file" ] || die "missing $token_file"
+	fi
+	local work=$work_root/$vm socket_dir=$run_root/vms/$vm zv=metal/runway-sg-$vm ns=rsg-$vm
+	local host_if=rsg${index}h guest_if=rsg${index}g tap=rsg${index}tap
+	local base=$((index * 4)) root max_hours
+	# The binding (and so the guest) must not outlive its cache-host process.
+	max_hours=$(sed -n 's/^RuntimeMaxSec=\([0-9]*\)h$/\1/p' /etc/systemd/system/runway-cache-host@.service)
+	[[ $hours =~ ^[1-9][0-9]*$ ]] && [ -n "$max_hours" ] && [ "$hours" -le "$max_hours" ] || die "RUNWAY_GUEST_HOURS must be 1-${max_hours:-?}"
+	[ ! -e "$work" ] && [ ! -e "$socket_dir" ] || die "$vm already exists"
+	ip link show "$host_if" >/dev/null 2>&1 && die "index $index in use"
+	trap 'echo "runway-standalone-guest: launch of $vm failed; tearing down" >&2; teardown "$vm" >&2 || true' EXIT
+	install -d -m 0700 "$work_root" "$work" "$socket_dir" "$run_root/bindings"
+	echo "$index" > "$work/index"
+
+	zfs clone "$image_dataset/$image@ready" "$zv"
+	zfs set volsize=40G "$zv"
+	udevadm settle
+	e2fsck -fp "/dev/zvol/$zv" >/dev/null || [ $? -le 1 ]
+	resize2fs "/dev/zvol/$zv" >/dev/null 2>&1
+	root=$work/root
+	mkdir "$root"
+	mount "/dev/zvol/$zv" "$root"
+	mkdir -p "$root/root/.ssh"
+	cat "$ssh_key.pub" > "$root/root/.ssh/authorized_keys"
+	chmod 700 "$root/root/.ssh"; chmod 600 "$root/root/.ssh/authorized_keys"
+	ssh-keygen -q -t ed25519 -N '' -f "$work/ssh_host_ed25519_key"
+	cp "$work/ssh_host_ed25519_key" "$work/ssh_host_ed25519_key.pub" "$root/etc/ssh/"
+	printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nPermitRootLogin prohibit-password\n' > "$root/etc/ssh/sshd_config.d/00-standalone.conf"
+	{ printf '172.16.0.2 '; cat "$work/ssh_host_ed25519_key.pub"; } > "$work/known_hosts"
+	# No Atlas metadata or managed initializer: the launcher starts the runner.
+	for unit in atlas-metadata.service runway-initialize.service; do ln -sf /dev/null "$root/etc/systemd/system/$unit"; done
+	# This branch's guest cache helpers (install.sh stages them), not the image's.
+	install -m 0755 "$guest_files/cache-relay" "$guest_files/cache-setup" "$root/opt/runway/bin/"
+	install -m 0644 "$guest_files/runway-cache-relay.service" "$root/etc/systemd/system/"
+	ln -sf ../runway-cache-relay.service "$root/etc/systemd/system/multi-user.target.wants/runway-cache-relay.service"
+	chown 1001:1001 "$root/opt/runway/runner"
+	printf 'network: {config: disabled}\n' > "$root/etc/cloud/cloud.cfg.d/99-standalone.cfg"
+	rm -f "$root/etc/netplan/50-cloud-init.yaml"
+	cat > "$root/etc/netplan/99-standalone.yaml" <<'YAML'
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses: [172.16.0.2/24]
+      routes: [{to: default, via: 172.16.0.1}]
+      nameservers:
+        addresses: [1.1.1.1, 8.8.8.8]
+YAML
+	chmod 600 "$root/etc/netplan/99-standalone.yaml"
+	umount "$root"
+
+	ip netns add "$ns"
+	ip link add "$host_if" type veth peer name "$guest_if"
+	ip link set "$guest_if" netns "$ns"
+	ip addr add "10.254.200.$((base + 1))/30" dev "$host_if"
+	ip link set "$host_if" up
+	ip -n "$ns" addr add "10.254.200.$((base + 2))/30" dev "$guest_if"
+	ip -n "$ns" link set "$guest_if" mtu 1380 up
+	ip -n "$ns" link set lo up
+	ip netns exec "$ns" ip tuntap add "$tap" mode tap
+	ip -n "$ns" addr add 172.16.0.1/24 dev "$tap"
+	ip -n "$ns" link set "$tap" up
+	ip -n "$ns" route add default via "10.254.200.$((base + 1))"
+	ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
+	ip netns exec "$ns" iptables -t nat -A POSTROUTING -o "$guest_if" -j MASQUERADE
+	ip netns exec "$ns" iptables -t mangle -A FORWARD -o "$guest_if" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+	python3 -I - "$work" "$image_root/$image/vmlinux" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" <<'PY'
+import json, sys
+work, kernel, zv, tap, uds, vcpus, memory = sys.argv[1:]
+config = {
+    "boot-source": {"kernel_image_path": kernel,
+                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"},
+    "drives": [{"drive_id": "rootfs", "path_on_host": f"/dev/zvol/{zv}", "is_root_device": True, "is_read_only": False}],
+    "network-interfaces": [{"iface_id": "eth0", "host_dev_name": tap, "guest_mac": "06:00:ac:10:00:02"}],
+    "vsock": {"guest_cid": 3, "uds_path": uds},
+    "machine-config": {"vcpu_count": int(vcpus), "mem_size_mib": int(memory)},
+}
+open(f"{work}/firecracker.json", "w").write(json.dumps(config))
+PY
+	# The host side listens before the guest can connect.
+	systemctl start "runway-cache-host@$vm.service"
+	systemd-run --quiet --unit="runway-guest-$vm" --property=RuntimeMaxSec=$((hours * 3600)) \
+		--property=StandardOutput="file:$work/console.log" --property=StandardError="file:$work/console.log" \
+		ip netns exec "$ns" /usr/bin/firecracker --api-sock "$work/fc.sock" --config-file "$work/firecracker.json"
+	touch "$work/started" # reap considers only guests whose VM unit was started
+	for _ in $(seq 60); do guest_ssh "$vm" true 2>/dev/null && break; sleep 2; done
+	guest_ssh "$vm" true || die "guest SSH unavailable"
+	if [ "$runner" = --no-runner ]; then
+		trap - EXIT
+		echo "{\"vm_id\":\"$vm\",\"bound\":false}"
+		return
+	fi
+
+	# Register exactly one ephemeral JIT runner in the runner scale set whose
+	# message session runway-cache-assignments holds (host credential).
+	local name="$RUNWAY_RUNNER_LABEL-$vm" registered
+	registered=$(RUNWAY_GITHUB_TOKEN_FILE=$token_file /opt/runway-cache/bin/runway --action jit \
+		--url "https://github.com/$RUNWAY_REPOSITORY" --id "$RUNWAY_SCALE_SET_ID" --name "$name" --out "$work/jit") || die "JIT registration failed"
+	# runner.json lets the cleanup trap (and teardown) delete the registered runner.
+	printf '%s' "$registered" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+json.dump({"runner_id": d["runner_id"], "runner_name": d["runner_name"], "repository": sys.argv[2], "scale_set_id": d["scale_set_id"]}, open(sys.argv[1] + "/runner.json", "w"))
+' "$work" "$RUNWAY_REPOSITORY"
+
+	# Binding: only root writes it, in a root-only directory, atomically.
+	local pid
+	pid=$(systemctl show -p MainPID --value "runway-guest-$vm.service")
+	[ "$(readlink "/proc/$pid/exe")" = /usr/bin/firecracker ] || die "Firecracker PID not found"
+	python3 -I - "$work" "$vm" "$socket_dir/v.sock" "$pid" "$RUNWAY_REPOSITORY" "$hours" "$run_root/bindings" <<'PY'
+import datetime, json, os, sys
+work, vm, uds, pid, repository, hours, directory = sys.argv[1:]
+runner = json.load(open(work + "/runner.json"))
+expires = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0) + datetime.timedelta(hours=int(hours))
+binding = {"version": 1, "vm_id": vm, "vsock_uds": uds, "firecracker_pid": int(pid), "guest_cid": 3,
+           "runner_id": runner["runner_id"], "runner_name": runner["runner_name"], "repository": repository,
+           "expires_at": expires.isoformat().replace("+00:00", "Z")}
+path = os.path.join(directory, vm + ".json")
+fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(fd, json.dumps(binding, separators=(",", ":")).encode()); os.fsync(fd); os.close(fd)
+os.replace(path + ".tmp", path)
+print(json.dumps({k: binding[k] for k in ("vm_id", "firecracker_pid", "runner_id", "runner_name", "repository", "expires_at")}))
+PY
+
+	# Start the runner in the guest; the JIT config travels over SSH stdin.
+	guest_ssh "$vm" 'umask 077; install -o runner -g runner -m 0400 /dev/stdin /home/runner/.runway-jit
+systemd-run --unit=runway-runner -p User=runner -p Group=runner -p WorkingDirectory=/opt/runway/runner -p KillMode=control-group \
+  --setenv=HOME=/home/runner --setenv=USER=runner --setenv=LOGNAME=runner --setenv=LANG=C.UTF-8 \
+  --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --setenv=RUNNER_TOOL_CACHE=/opt/hostedtoolcache --setenv=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
+  /bin/bash -c "j=\$(cat /home/runner/.runway-jit); rm -f /home/runner/.runway-jit; exec /opt/runway/runner/bin/Runner.Listener run --jitconfig \"\$j\""' < "$work/jit"
+	rm -f "$work/jit"
+	sleep 10
+	guest_ssh "$vm" 'systemctl is-active runway-runner' >/dev/null || die "runner did not start"
+	trap - EXIT
+}
+
+# Remove the scale-set records of one runner and its job (cache-assignments
+# also prunes records older than a day).
+forget_assignment() {
+	local id=$1 dir=$run_root/assignments job
+	[[ $id =~ ^[0-9]+$ ]] || return 0
+	job=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["job_id"])' "$dir/$id.json" 2>/dev/null || true)
+	rm -f "$dir/$id.json" "$dir/$id.json.tmp"
+	[[ $job =~ ^[0-9a-f-]{36}$ ]] && rm -f "$dir/job-$job.json" "$dir/job-$job.json.tmp"
+	return 0
+}
+
+teardown() {
+	local vm=$1
+	valid_vm "$vm"
+	local work=$work_root/$vm zv=metal/runway-sg-$vm ns=rsg-$vm index=""
+	[ -f "$work/index" ] && index=$(cat "$work/index")
+	# Fail closed first: without a binding the host refuses every request.
+	rm -f "$run_root/bindings/$vm.json" "$run_root/bindings/$vm.json.tmp"
+	if [ -f "$work/runner.json" ] && [ -s "$token_file" ]; then
+		local id repository status
+		read -r id repository < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["runner_id"], d["repository"])' "$work/runner.json")
+		status=$(github DELETE "/repos/$repository/actions/runners/$id" | tail -1)
+		case $status in 204 | 404) ;; *) echo "warning: runner $id deletion returned $status" >&2 ;; esac
+		forget_assignment "$id"
+	fi
+	systemctl stop "runway-guest-$vm.service" 2>/dev/null || true
+	systemctl reset-failed "runway-guest-$vm.service" 2>/dev/null || true
+	pkill -9 -f "firecracker --api-sock $work/fc.sock" 2>/dev/null || true
+	systemctl stop "runway-cache-host@$vm.service" 2>/dev/null || true
+	systemctl reset-failed "runway-cache-host@$vm.service" 2>/dev/null || true
+	mountpoint -q "$work/root" 2>/dev/null && umount "$work/root"
+	ip netns del "$ns" 2>/dev/null || true
+	[ -n "$index" ] && ip link del "rsg${index}h" 2>/dev/null || true
+	sleep 1
+	if zfs list -H "$zv" >/dev/null 2>&1; then zfs destroy "$zv" || { sleep 3; zfs destroy "$zv"; }; fi
+	rm -rf "$work" "$run_root/vms/$vm"
+	echo "{\"vm_id\":\"$vm\",\"torn_down\":true}"
+}
+
+# reap tears down every guest whose VM unit is no longer running, for example
+# one stopped at RuntimeMaxSec, so its binding, runner, clone and network go too.
+reap() {
+	local work vm
+	for work in "$work_root"/*/; do
+		[ -d "$work" ] || continue
+		vm=$(basename "$work")
+		[[ $vm =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -e "$work/started" ] || continue
+		systemctl is-active --quiet "runway-guest-$vm.service" && continue
+		teardown "$vm"
+	done
+}
+
+status() {
+	echo "bindings: $(ls "$run_root/bindings" 2>/dev/null | tr '\n' ' ')"
+	systemctl list-units --no-legend 'runway-guest-*' 'runway-cache-host@*' 2>/dev/null || true
+	zfs list -H -o name 2>/dev/null | grep '^metal/runway-sg-' || true
+	ip netns list | grep '^rsg-' || true
+}
+
+case ${1:-} in
+prepare-image) shift; prepare_image "$@" ;;
+launch) shift; launch "$@" ;;
+teardown) shift; teardown "$@" ;;
+reap) reap ;;
+status) status ;;
+ssh) shift; valid_vm "${1:-}"; guest_ssh "$@" ;;
+*) die "usage: prepare-image NAME METAL_IMAGE [WORKER_DIR] | launch VM_ID INDEX [--no-runner] | teardown VM_ID | reap | status | ssh VM_ID [COMMAND]" ;;
+esac

@@ -1,0 +1,28 @@
+[Unit]
+Description=Runway standalone cache host for guest %i (vsock 1025/1026/1027)
+After=runway-cache-data.service
+Wants=runway-cache-data.service
+
+[Service]
+Type=simple
+ExecStart=/opt/runway-cache/bin/runway --action cache-host --config /etc/runway-cache/host.json --vm-id %i
+# Started and stopped by the standalone guest launcher; never restarted, so a
+# restarted host cannot release a second job for the same guest. The launcher
+# caps guest lifetime at RuntimeMaxSec.
+Restart=no
+RuntimeMaxSec=12h
+UMask=0077
+MemoryMax=1G
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/run/runway-cache/vms/%i
+ReadOnlyPaths=/etc/runway-cache /run/runway-cache/bindings /run/runway-cache/assignments
+# The host signs grants; it never sees the Garage key or the data service's secrets.
+InaccessiblePaths=-/etc/runway-cache/garage-key.json -/etc/runway-cache/cache-data.json -/etc/runway-cache/cache-data.json.previous -/etc/runway-cache/cache-data.json.pre-review -/etc/runway-cache/tls/cache-data.key -/etc/runway-cache/assignments.json

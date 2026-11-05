@@ -1,0 +1,30 @@
+[Unit]
+Description=Runway regional cache data service (TLS on 127.0.0.1:18445)
+After=runway-garage.service chrony.service time-sync.target
+Wants=runway-garage.service time-sync.target
+
+[Service]
+Type=simple
+ExecStart=/opt/runway-cache/bin/runway --action cache-data --config /etc/runway-cache/cache-data.json
+# On restart, recovery re-verifies every indexed object against Garage
+# (lost objects become misses).
+Restart=always
+RestartSec=5
+UMask=0077
+MemoryMax=1G
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/runway-cache
+ReadOnlyPaths=/etc/runway-cache
+# Only its own configuration (which embeds the Garage key) and TLS key.
+InaccessiblePaths=-/etc/runway-cache/signing-key.pem -/etc/runway-cache/github-token -/etc/runway-cache/host.json -/etc/runway-cache/assignments.json
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+{
+ "id": 580439734,
+ "node_id": "R_kgDOIpjOtg",
+ "name": "frappe",
+ "full_name": "BreadGenie/frappe",
+ "private": false,
+ "owner": {
+  "login": "BreadGenie",
+  "id": 63963181,
+  "type": "User"
+ },
+ "html_url": "https://github.com/BreadGenie/frappe",
+ "fork": true,
+ "default_branch": "develop",
+ "visibility": "public"
+}
