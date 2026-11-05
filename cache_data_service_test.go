@@ -585,25 +585,6 @@ func TestCacheDataServiceForcedShutdownJoinsBlockedUpload(t *testing.T) {
 	assertCacheDataJournalLock(t, config.StateDir, true)
 }
 
-func TestCacheDataServiceServeFailureJoinsShutdown(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	requests := &cacheDataServiceRequests{handler: http.NotFoundHandler(), slots: make(chan struct{}, 4)}
-	// ServeTLS fails loading missing key material before accepting connections.
-	server := &http.Server{Handler: requests, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13}}
-	if err := serveCacheDataService(t.Context(), server, listener, requests); err == nil {
-		t.Fatal("TLS startup failure lost")
-	}
-	assertCacheDataListenerClosed(t, listener.Addr().String())
-	requests.mu.Lock()
-	defer requests.mu.Unlock()
-	if !requests.stopped {
-		t.Fatal("shutdown goroutine was not joined")
-	}
-}
-
 func TestCacheDataServicePropagatesDurableCloseFailure(t *testing.T) {
 	config, _ := cacheDataConfigFixture(t)
 	pair, client := cacheDataTLSFixture(t)

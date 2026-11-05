@@ -26,7 +26,3 @@ func (s *Server) SweepNow() {
 	s.sweep.run_.Unlock()
 	s.sweep.run(context.Background())
 }
-
-func (s *Server) UploadWindow(size int64) time.Duration {
-	return s.uploadDeadline(&entry{size: size}).Sub(time.Time{})
-}

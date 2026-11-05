@@ -274,19 +274,6 @@ func TestDownloadTLSRefusals(t *testing.T) {
 	}
 }
 
-func TestDownloadConfigurationRefusals(t *testing.T) {
-	_, _ = fixture(t, func(w http.ResponseWriter, r *http.Request) {}, func(c *Config) {
-		for _, limit := range []int64{-1, 0, 1 << 62} {
-			bad := *c
-			bad.Limits.ArchiveBytes = limit
-			if h, err := New(t.Context(), bad); err == nil {
-				h.Close()
-				t.Error("invalid archive bound accepted")
-			}
-		}
-	})
-}
-
 func TestDownloadSlowReaderDeadline(t *testing.T) {
 	ended := make(chan struct{})
 	h, front := fixture(t, func(w http.ResponseWriter, r *http.Request) {

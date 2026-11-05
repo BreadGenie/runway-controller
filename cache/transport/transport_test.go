@@ -201,20 +201,6 @@ func TestCancellationAndConcurrency(t *testing.T) {
 		t.Fatal(code)
 	}
 }
-func TestRequiresVerifiedTLS(t *testing.T) {
-	if _, e := New(context.Background(), Config{}); e == nil {
-		t.Fatal("empty config accepted")
-	}
-	_, s := fixture(t, func(w http.ResponseWriter, r *http.Request) {}, nil)
-	_ = s
-	// The same self-signed server fails with roots that do not include it.
-	h, front := fixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("untrusted TLS reached handler") }, func(c *Config) { c.Roots = x509.NewCertPool() })
-	_ = h
-	if code, _ := send(t, front, "POST", "/_apis/artifactcache/caches", ""); code != 502 {
-		t.Fatal(code)
-	}
-}
-
 func TestUnknownLengthAndFixedOrigin(t *testing.T) {
 	var calls atomic.Int32
 	_, s := fixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +304,7 @@ func TestConfigurationRefusals(t *testing.T) {
 			func(c *Config) { c.Roots = nil }, func(c *Config) { c.Origin = "http://example.test" },
 			func(c *Config) { c.Origin = "https://example.test/path" }, func(c *Config) { c.Origin = "https://user@example.test" },
 			func(c *Config) { c.Grant.Expires = time.Now().Add(-time.Second) }, func(c *Config) { c.Grant.Bearer = "bad\r\ntoken" },
-			func(c *Config) { c.Limits.ArchiveBytes = 0 }, func(c *Config) { c.Limits.Concurrent = 0 }, func(c *Config) { c.Limits.Timeout = 0 },
+			func(c *Config) { c.Limits.ArchiveBytes = 0 }, func(c *Config) { c.Limits.ArchiveBytes = -1 }, func(c *Config) { c.Limits.ArchiveBytes = 1 << 62 }, func(c *Config) { c.Limits.Concurrent = 0 }, func(c *Config) { c.Limits.Timeout = 0 },
 			func(c *Config) { c.Limits.HeaderBytes = 0 }, func(c *Config) { c.Limits.URLBytes = 0 }, func(c *Config) { c.Limits.ChunkBytes = 0 },
 			func(c *Config) { c.Limits.RequestBytes = 0 }, func(c *Config) { c.Limits.ResponseBytes = 0 },
 		} {

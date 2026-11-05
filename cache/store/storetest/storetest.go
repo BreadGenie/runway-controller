@@ -34,7 +34,6 @@ type Garage struct {
 	Mu       sync.Mutex
 	Objects  map[string][]byte
 	Puts     int
-	Deletes  int
 	Requests map[string]int // by method, including failed ones
 	Fail     bool           // answer every request with 503
 	PutDelay time.Duration  // wait before reading a PUT body
@@ -112,7 +111,6 @@ func (g *Garage) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(data)
 	case http.MethodDelete:
 		delete(g.Objects, r.URL.Path)
-		g.Deletes++
 		g.Mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -238,11 +236,8 @@ type Service struct {
 	Clock  *Clock
 }
 
-// Options adjust the store configuration before start.
-type Options func(*store.Config)
-
 // Start runs a store with 1 KiB archives, a 4 KiB budget and the given options.
-func Start(t testing.TB, options ...Options) *Service {
+func Start(t testing.TB, options ...func(*store.Config)) *Service {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

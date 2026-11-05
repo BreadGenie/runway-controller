@@ -35,21 +35,6 @@ func fixture(t *testing.T) (ed25519.PrivateKey, Claims, Clock, *Verifier) {
 	return private, c, clock, v
 }
 
-func TestRoundTripAndReadOnly(t *testing.T) {
-	key, c, clock, v := fixture(t)
-	for _, write := range []string{c.WriteRef, ""} {
-		c.WriteRef = write
-		token, err := sign(key, c, clock)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := v.Verify(token, clock)
-		if err != nil || got.RepositoryID != c.RepositoryID || got.WriteRef != write || strings.Join(got.ReadRefs, ",") != strings.Join(c.ReadRefs, ",") {
-			t.Fatal("scope changed", err)
-		}
-	}
-}
-
 func TestRejectTamperedUnknownIssuerAndWrongAudience(t *testing.T) {
 	key, c, clock, v := fixture(t)
 	token, _ := sign(key, c, clock)

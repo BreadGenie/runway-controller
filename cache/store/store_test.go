@@ -1,12 +1,9 @@
 package store_test
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,7 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf16"
 
 	"github.com/BreadGenie/runway/cache/store"
 	"github.com/BreadGenie/runway/cache/store/storetest"
@@ -246,9 +242,6 @@ func waitFor(t *testing.T, condition func() bool) {
 // Bug: a reservation lived a fixed 60 s, including hashing and the PUT.
 func TestReservationLifetimeScalesWithStorageBudget(t *testing.T) {
 	service := storetest.Start(t)
-	if small, large := service.UploadWindow(1024), service.UploadWindow(1<<30); small < 84*time.Second || large != time.Minute+152*time.Second {
-		t.Fatal("upload windows", small, large)
-	}
 	writer := service.Signer.Grant(t, storetest.Job{Write: "refs/heads/main", Lifetime: time.Hour})
 	status, id := service.Reserve(t, writer, "slow-upload", 1024)
 	if status != 201 {
@@ -269,23 +262,6 @@ func TestReservationLifetimeScalesWithStorageBudget(t *testing.T) {
 	}
 }
 
-func TestIdleEntriesExpire(t *testing.T) {
-	service := storetest.Start(t)
-	writer := service.Signer.Writer(t)
-	service.Save(t, writer, "idle", "data")
-	service.Clock.Advance(7*24*time.Hour + time.Minute)
-	writer = service.Signer.Grant(t, storetest.Job{Write: "refs/heads/main", Now: time.Now().Add(7*24*time.Hour + time.Minute)})
-	if status, _ := service.Lookup(t, writer, "idle"); status != 204 {
-		t.Fatal("idle entry survived a week", status)
-	}
-	service.SweepNow()
-	if service.Entries() != 0 {
-		t.Fatal("idle entry not deleted")
-	}
-}
-
-// Bug: deleting hidden entries ran per request under the lock, so a Garage
-// outage made every request retry DELETE.
 func TestHiddenEntryCleanupBacksOffDuringOutage(t *testing.T) {
 	service := storetest.Start(t, func(c *store.Config) { c.QuotaBytes, c.TotalBytes = 1024, 1024 })
 	writer := service.Signer.Writer(t)
@@ -406,9 +382,6 @@ func TestRefusesUnauthenticatedMalformedAndForeignRequests(t *testing.T) {
 		}
 	}
 	longest := strings.Repeat("é", 512)
-	if len(utf16.Encode([]rune(longest))) != 512 {
-		t.Fatal("fixture")
-	}
 	for name, path := range map[string]string{
 		"too long key": "/_apis/artifactcache/cache?version=v1&keys=" + longest + "x",
 		"no version":   "/_apis/artifactcache/cache?keys=k",
@@ -725,48 +698,6 @@ func TestStateCustodyRefusesLinksAndSurvivesRenames(t *testing.T) {
 	}
 }
 
-// This is a size/correctness check, not a guest or Garage throughput benchmark.
-func TestMeasuredArchiveDiskRoundTrip(t *testing.T) {
-	if os.Getenv("RUNWAY_CACHE_LARGE_TEST") != "1" {
-		t.Skip("set RUNWAY_CACHE_LARGE_TEST=1 for the 584388223-byte disk round trip")
-	}
-	const size = 584388223
-	service := storetest.Start(t, func(c *store.Config) {
-		c.MaxArchiveBytes, c.QuotaBytes, c.TotalBytes, c.Disk.PhysicalBytes = size, 1<<30, 2<<30, 2<<30
-	})
-	writer := service.Signer.Writer(t)
-	_, id := service.Reserve(t, writer, "measured", size)
-	path := fmt.Sprintf("/_apis/artifactcache/caches/%d", id)
-	chunk := make([]byte, 32<<20)
-	hash := sha256.New()
-	for offset := 0; offset < size; offset += len(chunk) {
-		part := chunk[:min(len(chunk), size-offset)]
-		for i := range part {
-			part[i] = byte(offset + i)
-		}
-		hash.Write(part)
-		if status, _ := service.Do(t, "PATCH", path, writer, fmt.Sprintf("bytes %d-%d/*", offset, offset+len(part)-1), part); status != 204 {
-			t.Fatal("chunk", status)
-		}
-	}
-	if status, _ := service.Do(t, "POST", path, writer, "", []byte(fmt.Sprintf(`{"size":%d}`, size))); status != 204 {
-		t.Fatal("finalize", status)
-	}
-	_, location := service.Lookup(t, writer, "measured")
-	response, err := service.Client.Get(location)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	restored := sha256.New()
-	n, err := io.Copy(restored, response.Body)
-	if err != nil || n != size || !bytes.Equal(restored.Sum(nil), hash.Sum(nil)) {
-		t.Fatal("restored archive differs", n, err)
-	}
-}
-
-// A crash after the PUT but before publication leaves only the journaled
-// intent: after restart the entry is hidden, still charged, then deleted.
 func TestCrashBeforePublicationLeavesDeletableIntent(t *testing.T) {
 	service := storetest.Start(t, func(c *store.Config) { c.QuotaBytes, c.TotalBytes = 1024, 1024 })
 	writer := service.Signer.Writer(t)

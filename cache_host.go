@@ -168,8 +168,8 @@ func newCacheHost(config cacheHostConfig, vmID string, log func(map[string]any))
 type cacheHost struct {
 	vmID, uds    string
 	bindings     cacheBindingSource
-	authority    cacheJobAuthority // nil when unavailable is set
-	unavailable  string            // why setup is disabled for this whole VM
+	authority    *githubCacheJobAuthority // nil when unavailable is set
+	unavailable  string                   // why setup is disabled for this whole VM
 	clock        func(context.Context) (grant.Clock, error)
 	key          ed25519.PrivateKey
 	audience     string

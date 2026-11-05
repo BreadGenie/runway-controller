@@ -16,19 +16,6 @@ import (
 	"github.com/BreadGenie/runway/cache/grant"
 )
 
-// Job authority answers one question for the standalone host: given a guest the
-// host has authenticated by its own vsock peer, and the guest's untrusted frozen
-// setup context, which job may receive a cache grant, if any? confirm runs at
-// the administrative gate, whose 45-second window absorbs GitHub's assignment
-// latency; authorize runs at setup and renewal. The standalone implementation
-// uses only host-held sources: the runner scale-set message session and the
-// GitHub REST API with the host credential. A future Central-backed source can
-// implement the same interface.
-type cacheJobAuthority interface {
-	confirm(ctx context.Context, binding cacheGuestBinding, release cacheJobRelease) (cacheJobConfirmation, error)
-	authorize(ctx context.Context, binding cacheGuestBinding, release cacheJobRelease, setup grant.SetupRequest) (cacheJobGrant, error)
-}
-
 // cacheJobGrant is verified input to grant.IssueSetup.
 type cacheJobGrant struct {
 	Authorization grant.Authorization
