@@ -92,7 +92,7 @@ func (fixture *githubFixture) RoundTrip(request *http.Request) (*http.Response, 
 type fakeAssignments struct {
 	mu      sync.Mutex
 	runners map[int64]cacheAssignment
-	jobs    map[string]cacheJobRecord
+	records map[string]cacheJobRecord
 }
 
 func (fake *fakeAssignments) assignment(runnerID int64) (cacheAssignment, error) {
@@ -108,11 +108,23 @@ func (fake *fakeAssignments) assignment(runnerID int64) (cacheAssignment, error)
 func (fake *fakeAssignments) job(jobID string) (cacheJobRecord, error) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	record, ok := fake.jobs[jobID]
+	record, ok := fake.records[jobID]
 	if !ok {
 		return cacheJobRecord{}, errCacheJobNotFound
 	}
 	return record, nil
+}
+
+func (fake *fakeAssignments) jobs(runID int64) ([]cacheJobRecord, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var records []cacheJobRecord
+	for _, record := range fake.records {
+		if record.WorkflowRunID == runID {
+			records = append(records, record)
+		}
+	}
+	return records, nil
 }
 
 type authorityCase struct {
@@ -135,7 +147,7 @@ func newAuthorityCase(t *testing.T) *authorityCase {
 		}
 	}
 	value := func(s string) *string { return &s }
-	jobID := "6f1d3e1c-5a43-4c2f-9f3e-0d5b8f2b7a11"
+	jobID, coldJobID := "6f1d3e1c-5a43-4c2f-9f3e-0d5b8f2b7a11", "0e2c4a6b-8d1f-4e3a-9b5c-7d9e1f3a5b7c"
 	now := time.Now()
 	return &authorityCase{
 		repo: loadGitHubFixture(t, "repo.json"), run: loadGitHubFixture(t, "run.json"), jobs: []map[string]any{jobs},
@@ -145,9 +157,11 @@ func newAuthorityCase(t *testing.T) *authorityCase {
 			Repository: value(fixtureRepository), RepositoryID: value("580439734"), RunID: value("41867135947"), RunAttempt: value("1"),
 			Ref: value(fixtureRef), RefType: value("branch"), SHA: value(fixtureSHA), EventName: value("workflow_dispatch"), BaseRef: value(""), HeadRef: value(""),
 		}},
-		// The scale-set session saw the job UUID assigned in run 41867135947.
-		assignments: &fakeAssignments{runners: map[int64]cacheAssignment{}, jobs: map[string]cacheJobRecord{
-			jobID: {Version: 1, JobID: jobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, ObservedAt: now},
+		// The scale-set session saw both Integration jobs assigned in run 41867135947;
+		// release is the warm runner's (219) job, "Integration (mariadb, 1)".
+		assignments: &fakeAssignments{runners: map[int64]cacheAssignment{}, records: map[string]cacheJobRecord{
+			jobID:     {Version: 1, JobID: jobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, JobDisplayName: "Integration (mariadb, 1)", ObservedAt: now},
+			coldJobID: {Version: 1, JobID: coldJobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, JobDisplayName: "Integration (mariadb, 2)", ObservedAt: now},
 		}},
 	}
 }
@@ -177,24 +191,31 @@ func fixtureJob(test *authorityCase, runner string) map[string]any {
 	return nil
 }
 
-// confirmAndAuthorize runs the gate-time confirmation, then setup authorization.
-func (test *authorityCase) confirmAndAuthorize(t *testing.T, authority githubCacheJobAuthority, budget time.Duration) (cacheJobGrant, error) {
+// resolve runs the setup-time resolution with the setup's run as the hint.
+func (test *authorityCase) resolve(t *testing.T, authority githubCacheJobAuthority, budget time.Duration) (cacheJobRelease, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), budget)
 	defer cancel()
-	confirmed, err := authority.confirm(ctx, test.binding, test.release)
+	return authority.resolve(ctx, test.binding, cacheRunHint(test.setup))
+}
+
+// resolveAndAuthorize resolves the bound runner's job, then authorizes setup.
+func (test *authorityCase) resolveAndAuthorize(t *testing.T, authority githubCacheJobAuthority, budget time.Duration) (cacheJobGrant, error) {
+	t.Helper()
+	release, err := test.resolve(t, authority, budget)
 	if err != nil {
 		return cacheJobGrant{}, err
 	}
-	release := test.release
-	release.Confirmed = &confirmed
+	if release.JobID != test.release.JobID || release.Stop != test.binding.ExpiresAt {
+		t.Fatalf("resolved the wrong job %+v", release)
+	}
 	return authority.authorize(t.Context(), test.binding, release, test.setup)
 }
 
 func TestGitHubJobAuthorityGrantsTheBoundRunnersInProgressJob(t *testing.T) {
 	test := newAuthorityCase(t)
 	authority, fixture := test.authority(t)
-	verified, err := test.confirmAndAuthorize(t, authority, time.Second)
+	verified, err := test.resolveAndAuthorize(t, authority, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,21 +241,19 @@ func TestGitHubJobAuthorityGrantsTheBoundRunnersInProgressJob(t *testing.T) {
 
 func TestGitHubJobAuthorityConfirmsFromScaleSetJobStarted(t *testing.T) {
 	test := newAuthorityCase(t)
-	delete(test.assignments.jobs, test.release.JobID) // JobAssigned missed; JobStarted alone suffices
+	delete(test.assignments.records, test.release.JobID) // JobAssigned missed; JobStarted alone suffices
 	test.assignments.runners[219] = cacheAssignment{Version: 1, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", JobID: test.release.JobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, ObservedAt: time.Now()}
 	authority, fixture := test.authority(t)
-	if _, err := test.confirmAndAuthorize(t, authority, time.Second); err != nil {
+	if _, err := test.resolveAndAuthorize(t, authority, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if fixture.calls[fixtureJobsPath] != 0 {
 		t.Fatal("REST jobs list read although the session confirmed", fixture.calls)
 	}
 	for name, change := range map[string]func(*cacheAssignment){
-		"other job":     func(r *cacheAssignment) { r.JobID = "11111111-2222-4333-8444-555555555555" },
 		"other name":    func(r *cacheAssignment) { r.RunnerName = "someone-else" },
 		"other repo":    func(r *cacheAssignment) { r.Repository = "BreadGenie/other" },
 		"completed job": func(r *cacheAssignment) { r.Completed = true },
-		"other request": func(r *cacheAssignment) { r.RequestID = 7 },
 		"tag workflow": func(r *cacheAssignment) {
 			r.JobWorkflowRef = "BreadGenie/frappe/.github/workflows/server-tests.yml@refs/tags/runway-cache-test-20261104"
 		},
@@ -244,7 +263,7 @@ func TestGitHubJobAuthorityConfirmsFromScaleSetJobStarted(t *testing.T) {
 		change(&record)
 		c.assignments.runners[219] = record
 		authority, _ := c.authority(t)
-		if _, err := c.confirmAndAuthorize(t, authority, time.Second); err == nil {
+		if _, err := c.resolveAndAuthorize(t, authority, time.Second); err == nil {
 			t.Fatalf("%s confirmed", name)
 		}
 	}
@@ -265,7 +284,7 @@ func TestGitHubJobAuthorityPollsUntilAssignmentIsVisible(t *testing.T) {
 	}
 	test.jobs = []map[string]any{queued, queued, running}
 	authority, fixture := test.authority(t)
-	if _, err := test.confirmAndAuthorize(t, authority, time.Second); err != nil {
+	if _, err := test.resolveAndAuthorize(t, authority, time.Second); err != nil {
 		t.Fatal("lagging assignment not polled", err)
 	}
 	if fixture.calls[fixtureJobsPath] != 3 {
@@ -275,7 +294,7 @@ func TestGitHubJobAuthorityPollsUntilAssignmentIsVisible(t *testing.T) {
 	test.jobs = []map[string]any{queued}
 	authority, _ = test.authority(t)
 	started := time.Now()
-	if _, err := test.confirmAndAuthorize(t, authority, 200*time.Millisecond); !errors.Is(err, errCacheJobNotFound) || time.Since(started) > time.Second {
+	if _, err := test.resolveAndAuthorize(t, authority, 200*time.Millisecond); !errors.Is(err, errCacheJobNotFound) || time.Since(started) > time.Second {
 		t.Fatalf("unbounded or trusting confirmation: %v after %s", err, time.Since(started))
 	}
 	// Setup without a confirmation is refused outright.
@@ -296,16 +315,27 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 		"completed job": {func(c *authorityCase) {
 			fixtureJob(c, "runway-cache-test-1104-warm")["status"] = "completed"
 		}, errCacheJobCompleted},
-		"job uuid unknown to the session": {func(c *authorityCase) { c.release.JobID = "22222222-3333-4444-8555-666666666666" }, errCacheJobNotFound},
-		"job uuid in another repository": {func(c *authorityCase) {
-			record := c.assignments.jobs[c.release.JobID]
+		"job not yet assigned in the session": {func(c *authorityCase) { delete(c.assignments.records, c.release.JobID) }, errCacheJobNotFound},
+		"job record in another repository": {func(c *authorityCase) {
+			record := c.assignments.records[c.release.JobID]
 			record.Repository = "BreadGenie/other"
-			c.assignments.jobs[c.release.JobID] = record
+			c.assignments.records[c.release.JobID] = record
+		}, errCacheJobNotFound},
+		"rerun repeats the display name": {func(c *authorityCase) {
+			record := c.assignments.records[c.release.JobID]
+			record.JobID = "33333333-4444-4555-8666-777777777777"
+			c.assignments.records[record.JobID] = record
 		}, errCacheJobMismatch},
+		"no run to read": {func(c *authorityCase) { c.setup.Context.RunID = nil }, errCacheJobNotFound},
+		"session sent no display name": {func(c *authorityCase) {
+			record := c.assignments.records[c.release.JobID]
+			record.JobDisplayName = ""
+			c.assignments.records[c.release.JobID] = record
+		}, errCacheJobNotFound},
 		"wrong repository in setup":   {func(c *authorityCase) { c.setup.Context.Repository = value("BreadGenie/frappe-fork") }, errCacheJobMismatch},
-		"wrong repository in binding": {func(c *authorityCase) { c.binding.Repository = "BreadGenie/other" }, errCacheJobMismatch},
+		"wrong repository in binding": {func(c *authorityCase) { c.binding.Repository = "BreadGenie/other" }, errCacheJobNotFound},
 		"repository renamed":          {func(c *authorityCase) { c.repo["full_name"] = "BreadGenie/renamed" }, errCacheRepository},
-		"forged run id":               {func(c *authorityCase) { c.setup.Context.RunID = value("41867135948") }, errCacheJobMismatch},
+		"forged run id":               {func(c *authorityCase) { c.setup.Context.RunID = value("41867135948") }, errCacheJobNotFound},
 		"forged run attempt":          {func(c *authorityCase) { c.setup.Context.RunAttempt = value("2") }, errCacheJobMismatch},
 		"forged sha":                  {func(c *authorityCase) { c.setup.Context.SHA = value(strings.Repeat("a", 40)) }, errCacheRepository},
 		"pull request": {func(c *authorityCase) {
@@ -324,12 +354,9 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 		"tag as branch": {func(c *authorityCase) {
 			c.run["head_branch"] = "v15.0.0"
 			c.setup.Context.Ref = value("refs/heads/v15.0.0")
-			record := c.assignments.jobs[c.release.JobID]
+			record := c.assignments.records[c.release.JobID]
 			record.JobWorkflowRef = "BreadGenie/frappe/.github/workflows/server-tests.yml@refs/tags/v15.0.0"
-			c.assignments.jobs[c.release.JobID] = record
-		}, errCacheJobMismatch},
-		"request id unknown to the session": {func(c *authorityCase) {
-			c.release.RequestID = 7
+			c.assignments.records[c.release.JobID] = record
 		}, errCacheJobMismatch},
 		"duplicate runner assignment": {func(c *authorityCase) {
 			fixtureJob(c, "runway-cache-test-1104-cold")["runner_id"] = json.Number("219")
@@ -340,7 +367,7 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 			c := newAuthorityCase(t)
 			test.change(c)
 			authority, _ := c.authority(t)
-			_, err := c.confirmAndAuthorize(t, authority, 150*time.Millisecond)
+			_, err := c.resolveAndAuthorize(t, authority, 150*time.Millisecond)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("got %v, want %v", err, test.want)
 			}
@@ -351,15 +378,11 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 func TestGitHubJobAuthorityRenewalRechecksTheSingleJob(t *testing.T) {
 	test := newAuthorityCase(t)
 	authority, fixture := test.authority(t)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	confirmed, err := authority.confirm(ctx, test.binding, test.release)
-	if err != nil || confirmed.RESTJobID != 126704211772 || confirmed.Source != "rest_jobs" {
-		t.Fatal("REST confirmation lost the job id", confirmed, err)
+	release, err := test.resolve(t, authority, time.Second)
+	if err != nil || release.Confirmed.RESTJobID != 126704211772 || release.Confirmed.Source != "rest_jobs" {
+		t.Fatal("REST confirmation lost the job id", release, err)
 	}
-	confirmed.ConfirmedAt = time.Now().Add(-cacheConfirmationFresh - time.Second)
-	release := test.release
-	release.Confirmed = &confirmed
+	release.Confirmed.ConfirmedAt = time.Now().Add(-cacheConfirmationFresh - time.Second)
 	if _, err := authority.authorize(t.Context(), test.binding, release, test.setup); err != nil {
 		t.Fatal("running job refused at renewal", err)
 	}
@@ -377,18 +400,14 @@ func TestGitHubJobAuthorityRenewalRechecksTheSingleJob(t *testing.T) {
 // trust: it falls back to the run's REST jobs.
 func TestGitHubJobAuthorityRenewalWithoutScaleSetRecordRechecksREST(t *testing.T) {
 	test := newAuthorityCase(t)
-	delete(test.assignments.jobs, test.release.JobID)
+	delete(test.assignments.records, test.release.JobID)
 	test.assignments.runners[219] = cacheAssignment{Version: 1, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", JobID: test.release.JobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, ObservedAt: time.Now()}
 	authority, fixture := test.authority(t)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	confirmed, err := authority.confirm(ctx, test.binding, test.release)
-	if err != nil || confirmed.Source != "scale_set_started" {
-		t.Fatal("scale-set confirmation", confirmed, err)
+	release, err := test.resolve(t, authority, time.Second)
+	if err != nil || release.Confirmed.Source != "scale_set_started" {
+		t.Fatal("scale-set confirmation", release, err)
 	}
-	confirmed.ConfirmedAt = time.Now().Add(-cacheConfirmationFresh - time.Second)
-	release := test.release
-	release.Confirmed = &confirmed
+	release.Confirmed.ConfirmedAt = time.Now().Add(-cacheConfirmationFresh - time.Second)
 	if _, err := authority.authorize(t.Context(), test.binding, release, test.setup); err != nil || fixture.calls[fixtureJobsPath] != 0 {
 		t.Fatal("running record should renew without REST", err, fixture.calls)
 	}
@@ -408,7 +427,7 @@ func TestGitHubJobAuthorityIsBoundedByItsDeadline(t *testing.T) {
 	authority, fixture := test.authority(t)
 	fixture.stall = true
 	started := time.Now()
-	if _, err := test.confirmAndAuthorize(t, authority, 200*time.Millisecond); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := test.resolveAndAuthorize(t, authority, 200*time.Millisecond); err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("stalled GitHub did not refuse by deadline", err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {

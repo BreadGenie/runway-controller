@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -22,14 +21,12 @@ import (
 
 	"github.com/BreadGenie/runway/cache/grant"
 	"github.com/BreadGenie/runway/cache/transport"
-	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
 // The standalone cache host serves one Firecracker guest's guest-initiated
 // vsock ports through that VM's own Unix sockets (<vm_dir>/<vm-id>/v.sock_PORT):
 //
-//	1025 administrative job gate (standalone release, see below)
 //	1026 cache setup: GitHub-verified job authority, host clock, signed grant
 //	1027 job-bound translator to the regional cache-data service
 //
@@ -37,12 +34,12 @@ import (
 // must be the Firecracker process recorded in the root-written launcher binding
 // for this VM. Request bodies never select the VM, runner or repository.
 //
-// Standalone job gate: there is no Central release decision. The gate releases
-// a well-formed request only from a bound VM, pins that job UUID and request ID
-// as the only job this VM's ephemeral runner may set up a cache for, and returns
-// the binding's expiry as the execution stop. Admission is GitHub's assignment
-// of a job to the JIT runner the launcher registered; the gate adds no admission
-// policy, quarantine or hold.
+// Job identity is host-held: the first setup resolves the job GitHub assigned to
+// the binding's runner ID and pins it as the only job this VM's ephemeral
+// runner may set up a cache for, until the binding's expiry. The guest runs the
+// stock Actions runner and never names its job. Admission is GitHub's
+// assignment of a job to the JIT runner the launcher registered; the host adds
+// no admission policy, quarantine or hold.
 type cacheHostConfig struct {
 	Version         int    `json:"version"`
 	RegionID        string `json:"region_id"`
@@ -65,15 +62,6 @@ const (
 const (
 	cacheHostRenewWindow  = 6 * time.Minute
 	cacheHostRenewBackoff = 5 * time.Second
-)
-
-// The gate confirms the assignment before releasing. The runner's gate helper
-// waits 45 s for the release, so up to 35 s absorbs GitHub's assignment latency
-// without touching the guest image. An unconfirmed job is still released; its
-// setup is then disabled and it keeps GitHub's cache.
-var (
-	cacheHostConfirmBudget = 35 * time.Second
-	cacheHostGateDeadline  = 44 * time.Second
 )
 
 func decodeCacheHostConfig(data []byte) (cacheHostConfig, error) {
@@ -112,9 +100,9 @@ func readCacheSigningKey(path string) (ed25519.PrivateKey, error) {
 	return key, nil
 }
 
-// runCacheHost serves one VM until SIGINT/SIGTERM (launcher teardown). Port
-// 1025 releases the job, so it is served whatever else fails: a missing key,
-// CA or credential only disables cache setup (the job keeps GitHub's cache).
+// runCacheHost serves one VM until SIGINT/SIGTERM (launcher teardown). A
+// missing key, CA or credential only disables cache setup (the job keeps
+// GitHub's cache); it never stops the host.
 func runCacheHost(configPath, vmID string) error {
 	if !cacheVMIDPattern.MatchString(vmID) {
 		return errors.New("cache-host requires a valid --vm-id")
@@ -181,17 +169,17 @@ type cacheHost struct {
 
 	ctx        context.Context
 	mu         sync.Mutex
-	release    *cacheJobRelease
-	confirming chan struct{} // closed when the in-flight confirmation ends
+	release    *cacheJobRelease // the resolved job, pinned for this VM
+	confirming chan struct{}    // closed when the in-flight resolution ends
 	nonces     map[string]bool
-	setup      *grant.SetupRequest // the one enabled setup of this release
+	setup      *grant.SetupRequest // the one enabled setup of this job
 	current    *transport.Handler
 	expires    time.Time
 }
 
-// Connection slots per port: the gate and setup are one exchange per job, and
-// the relay opens at most eight translator connections.
-var cacheHostSlots = map[int]int{1025: 2, 1026: 2, 1027: 16}
+// Connection slots per port: setup is one exchange per job, and the relay
+// opens at most eight translator connections.
+var cacheHostSlots = map[int]int{1026: 2, 1027: 16}
 
 func cacheHostLogger(out io.Writer) func(map[string]any) {
 	var mu sync.Mutex
@@ -260,7 +248,7 @@ func (host *cacheHost) serve(parent context.Context) error {
 	host.nonces = map[string]bool{}
 	listeners := map[int]net.Listener{}
 	old := syscall.Umask(0077)
-	for _, port := range []int{1025, 1026, 1027} {
+	for _, port := range []int{1026, 1027} {
 		path := host.uds + "_" + strconv.Itoa(port)
 		_ = os.Remove(path)
 		listener, err := net.Listen("unix", path)
@@ -278,7 +266,6 @@ func (host *cacheHost) serve(parent context.Context) error {
 		keyID = grant.KeyID(host.key.Public().(ed25519.PublicKey))
 	}
 	host.log(map[string]any{"event": "listening", "vm_id": host.vmID, "uds": host.uds, "key_id": keyID})
-	go host.accept(listeners[1025], host.gate, cacheHostGateDeadline)
 	go host.accept(listeners[1026], host.serveSetup, 5*time.Second)
 	server := &http.Server{
 		Handler: http.HandlerFunc(host.translate), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384,
@@ -353,42 +340,6 @@ func (conn *cacheHostSlotConn) Close() error {
 	return conn.Conn.Close()
 }
 
-type cacheGateRequest struct {
-	Version   int    `json:"version"`
-	JobID     string `json:"job_id"`
-	RequestID int64  `json:"request_id"`
-	Nonce     string `json:"nonce"`
-}
-
-func (host *cacheHost) gate(conn net.Conn) {
-	line, err := bufio.NewReaderSize(io.LimitReader(conn, 4096), 4096).ReadSlice('\n')
-	var request cacheGateRequest
-	if err != nil || readCacheObject(line[:len(line)-1], []string{"version", "job_id", "request_id", "nonce"}) != nil || json.Unmarshal(line, &request) != nil || request.Version != 1 || !canonicalCacheUUID(request.JobID) || !canonicalCacheUUID(request.Nonce) || request.RequestID < 0 {
-		host.log(map[string]any{"event": "release_refused", "vm_id": host.vmID, "reason": "malformed"})
-		return
-	}
-	binding, reason := host.authenticate(conn)
-	if reason == "" {
-		host.mu.Lock()
-		switch {
-		case host.release == nil:
-			host.release = &cacheJobRelease{JobID: request.JobID, RequestID: request.RequestID, Stop: binding.ExpiresAt}
-		case host.release.JobID != request.JobID || host.release.RequestID != request.RequestID:
-			reason = "second_job" // an ephemeral runner runs exactly one job
-		}
-		host.mu.Unlock()
-	}
-	if reason != "" {
-		host.log(map[string]any{"event": "release_refused", "vm_id": host.vmID, "reason": reason, "job_id": request.JobID})
-		return
-	}
-	host.confirmRelease(binding)
-	response := map[string]any{"version": 1, "job_id": request.JobID, "request_id": request.RequestID, "nonce": request.Nonce, "released": true, "release_id": uuid.NewString(), "stop_unix_seconds": binding.ExpiresAt.Unix()}
-	data, _ := json.Marshal(response)
-	_, err = conn.Write(append(data, '\n'))
-	host.log(map[string]any{"event": "release", "vm_id": host.vmID, "runner_id": binding.RunnerID, "job_id": request.JobID, "request_id": request.RequestID, "ok": err == nil})
-}
-
 func (host *cacheHost) serveSetup(conn net.Conn) {
 	request, err := grant.ReadSetup(conn)
 	if err != nil {
@@ -416,8 +367,8 @@ func (host *cacheHost) serveSetup(conn net.Conn) {
 }
 
 // enable returns "" after installing a translator, or the refusal reason. A
-// release gets at most one enabled setup; refused attempts cost the guest a
-// connection slot and share one confirmation.
+// job gets at most one enabled setup; refused attempts cost the guest a
+// connection slot and share one resolution.
 func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string {
 	binding, reason := host.authenticate(conn)
 	if reason != "" {
@@ -427,14 +378,12 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 		return host.unavailable
 	}
 	host.mu.Lock()
-	release, enabled, replay := host.release, host.setup != nil, host.nonces[request.Nonce]
-	if release != nil && !replay && !enabled {
+	enabled, replay := host.setup != nil, host.nonces[request.Nonce]
+	if !replay && !enabled {
 		host.nonces[request.Nonce] = true
 	}
 	host.mu.Unlock()
 	switch {
-	case release == nil:
-		return "not_released"
 	case enabled:
 		return "already_enabled"
 	case replay:
@@ -442,12 +391,9 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 	}
 	ctx, cancel := context.WithTimeout(host.ctx, cacheHostSetupBudget)
 	defer cancel()
-	if release.Confirmed == nil {
-		// The gate's confirmation timed out; try once more within the setup budget.
-		release = host.confirmWithin(ctx, binding)
-		if release == nil || release.Confirmed == nil {
-			return "unconfirmed"
-		}
+	release := host.resolveWithin(ctx, binding, cacheRunHint(request))
+	if release == nil {
+		return "unconfirmed"
 	}
 	handler, expires, reason := host.issue(ctx, binding, *release, request)
 	if reason != "" {
@@ -471,23 +417,22 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 	return ""
 }
 
-// confirmRelease runs at the gate: it waits (bounded) until host-held sources
-// show the pinned job assigned to this VM's runner, and records the result.
-func (host *cacheHost) confirmRelease(binding cacheGuestBinding) {
-	if host.authority == nil {
-		return
+// cacheRunHint is the guest-reported run ID, or 0. It only selects which run's
+// REST jobs to read; the bound runner ID decides which job is this VM's.
+func cacheRunHint(request grant.SetupRequest) int64 {
+	if request.Context.RunID == nil || !cacheCanonicalPositive(*request.Context.RunID) {
+		return 0
 	}
-	ctx, cancel := context.WithTimeout(host.ctx, cacheHostConfirmBudget)
-	defer cancel()
-	host.confirmWithin(ctx, binding)
+	runID, _ := strconv.ParseInt(*request.Context.RunID, 10, 64)
+	return runID
 }
 
-// confirmWithin returns the release, confirming it first if needed. Concurrent
-// callers share one confirmation instead of each polling GitHub.
-func (host *cacheHost) confirmWithin(ctx context.Context, binding cacheGuestBinding) *cacheJobRelease {
+// resolveWithin returns the pinned job, resolving it first if needed.
+// Concurrent callers share one resolution instead of each polling GitHub.
+func (host *cacheHost) resolveWithin(ctx context.Context, binding cacheGuestBinding, runHint int64) *cacheJobRelease {
 	host.mu.Lock()
 	release, inFlight := host.release, host.confirming
-	if release == nil || release.Confirmed != nil || inFlight != nil {
+	if release != nil || inFlight != nil {
 		host.mu.Unlock()
 		if inFlight != nil {
 			select {
@@ -510,19 +455,18 @@ func (host *cacheHost) confirmWithin(ctx context.Context, binding cacheGuestBind
 		host.mu.Unlock()
 	}()
 	started := time.Now()
-	confirmed, err := host.authority.confirm(ctx, binding, *release)
+	resolved, err := host.authority.resolve(ctx, binding, runHint)
 	if err != nil {
-		host.log(map[string]any{"event": "confirm_refused", "vm_id": host.vmID, "job_id": release.JobID, "reason": cacheAuthorityReason(err), "ms": time.Since(started).Milliseconds()})
-		return release
+		host.log(map[string]any{"event": "confirm_refused", "vm_id": host.vmID, "reason": cacheAuthorityReason(err), "ms": time.Since(started).Milliseconds()})
+		return nil
 	}
 	host.mu.Lock()
 	defer host.mu.Unlock()
-	if host.release.JobID == release.JobID && host.release.Confirmed == nil {
-		updated := *host.release
-		updated.Confirmed = &confirmed
-		host.release = &updated
+	if host.release == nil {
+		host.release = &resolved // an ephemeral runner runs exactly one job
 	}
-	host.log(map[string]any{"event": "confirmed", "vm_id": host.vmID, "job_id": release.JobID, "source": confirmed.Source, "run_id": confirmed.RunID, "rest_job_id": confirmed.RESTJobID, "workflow_ref": confirmed.WorkflowRef, "ms": time.Since(started).Milliseconds()})
+	confirmed := host.release.Confirmed
+	host.log(map[string]any{"event": "confirmed", "vm_id": host.vmID, "job_id": host.release.JobID, "request_id": host.release.RequestID, "source": confirmed.Source, "run_id": confirmed.RunID, "rest_job_id": confirmed.RESTJobID, "workflow_ref": confirmed.WorkflowRef, "ms": time.Since(started).Milliseconds()})
 	return host.release
 }
 

@@ -6,24 +6,27 @@ Only same-repository branch pushes and workflow_dispatch qualify; PRs, forks,
 tags, container jobs and unsupported revisions retain GitHub caching.
 A static external-Node wrapper hashes only supported action candidates and lazily
 selects one job-scoped route over setup wire v2, using GITHUB_* hints verified
-against GitHub REST. The host supplies job identity from the 1025 release.
-The separate Metal runner administrative gate is unchanged.
+against GitHub REST. The guest runs the stock Actions runner with no patch;
+the host resolves job identity itself.
 A failure before setup also keeps GitHub caching. After setup, a failed
 restore or save is a cache miss or warning, not a retry against GitHub;
 fail-on-cache-miss still fails the job as it would upstream.
 
 The root launcher binds each ephemeral scale-set-39 runner to its Firecracker
-PID. cache-host authenticates the socket peer, then confirms the job UUID and
-request ID against the scale-set session and GitHub REST. Guest claims alone
+PID. cache-host authenticates the socket peer, then resolves the bound runner's
+job UUID and request ID from host-held sources: the scale-set JobStarted record
+for the runner ID, or before it arrives, the run's in-progress REST job on that
+runner tied by display name to its one JobAssigned record. Guest claims alone
 never authorize a grant. The per-VM vsock ports are:
 
-- 1025: confirm within 35 seconds and release the bound job even on failure.
-- 1026: one setup per release; verify run, attempt, repository, branch, SHA and
-  host-held workflow ref before signing an Ed25519 repository/ref grant.
+- 1026: one setup per job; resolve and pin the job within the setup budget,
+  verify run, attempt, repository, branch, SHA and host-held workflow ref,
+  then sign an Ed25519 repository/ref grant.
 - 1027: translate supported cache requests to cache-data over authenticated TLS.
 
-Setup failures disable regional caching without failing the job. Clock, key,
-CA or token failure must leave the gate available. Grants expire within the
+Setup failures disable regional caching without failing the job, including an
+unresolved or ambiguous job (a rerun before JobStarted repeats display names).
+Clock, key, CA or token failure only disables setup. Grants expire within the
 verified job deadline and 30 minutes; renewal rechecks the running job. Host
 time comes from adjtimex, with uncertainty checked before granting or serving.
 Signing keys and Garage credentials never enter the guest.

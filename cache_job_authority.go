@@ -99,9 +99,9 @@ func checkCachePrivateDirectory(dir string) error {
 	return nil
 }
 
-// cacheJobRelease is the job UUID and request ID the bound runner presented to
-// the administrative gate, plus the stop the host returned. Confirmed is set only
-// once host-held sources show that job assigned to this VM's runner.
+// cacheJobRelease is the job the host resolved for the bound runner (its UUID
+// and request ID), the binding's stop, and the host-held source that proved it.
+// Nothing in it comes from the guest.
 type cacheJobRelease struct {
 	JobID     string
 	RequestID int64
@@ -118,20 +118,24 @@ type cacheJobConfirmation struct {
 	Source                       string // "scale_set_started" or "rest_jobs"
 }
 
-// githubCacheJobAuthority confirms the assignment from two host-held sources,
-// whichever answers first:
-//   - the scale-set session's JobStarted record (runner ID/name, job UUID, run);
-//   - the REST jobs list of the run the session's JobAssigned record names for
-//     the gate's job UUID: an in-progress job with the bound runner_id/name.
+// githubCacheJobAuthority resolves the bound runner's job from two host-held
+// sources, whichever answers first:
+//   - the scale-set session's JobStarted record for the runner ID (job UUID,
+//     request ID, run, workflow ref). It arrives about a minute into the job.
+//   - the run's REST jobs list: the single in-progress job on the bound
+//     runner_id/name, tied by display name to the one JobAssigned record of that
+//     run. JobAssigned arrives at assignment, so early setups need this path.
 //
-// authorize then requires that confirmation, the repository and the exact run
-// and attempt (event, branch, SHA, same-repository head), and on renewal that
-// the job is still in progress. It never trusts the guest when GitHub is slow.
+// The guest's run ID only says which run to read; a job on another run cannot
+// carry the bound runner's ID. authorize then requires the repository and the
+// exact run and attempt (event, branch, SHA, same-repository head), and on
+// renewal that the job is still in progress. It never trusts the guest when
+// GitHub is slow.
 type githubCacheJobAuthority struct {
 	client      *http.Client
 	assignments cacheAssignmentSource
 	regionID    string
-	interval    time.Duration // confirmation poll interval
+	interval    time.Duration // resolution poll interval
 	now         func() time.Time
 }
 
@@ -148,91 +152,111 @@ func (authority githubCacheJobAuthority) valid(binding cacheGuestBinding) bool {
 	return authority.client != nil && authority.assignments != nil && authority.interval > 0 && authority.now != nil && authority.regionID != "" && binding.validate() == nil
 }
 
-func (authority githubCacheJobAuthority) confirm(ctx context.Context, binding cacheGuestBinding, release cacheJobRelease) (cacheJobConfirmation, error) {
-	if !authority.valid(binding) || !canonicalCacheUUID(release.JobID) {
-		return cacheJobConfirmation{}, grant.ErrInvalid
+// resolve polls until the context ends for the bound runner's job. runHint is
+// the guest-reported run ID, used only to choose which run's jobs to read.
+func (authority githubCacheJobAuthority) resolve(ctx context.Context, binding cacheGuestBinding, runHint int64) (cacheJobRelease, error) {
+	if !authority.valid(binding) {
+		return cacheJobRelease{}, grant.ErrInvalid
 	}
-	var runID, attempt int64
-	var workflowRef string
+	var attempt int64
 	for {
 		if started, err := authority.assignments.assignment(binding.RunnerID); err == nil {
-			if started.JobID != release.JobID || started.RequestID != release.RequestID || started.RunnerName != binding.RunnerName || started.Repository != binding.Repository {
-				return cacheJobConfirmation{}, errCacheJobMismatch // this runner took a different job
+			if started.RunnerName != binding.RunnerName || started.Repository != binding.Repository {
+				return cacheJobRelease{}, errCacheJobMismatch
 			}
 			if started.Completed {
-				return cacheJobConfirmation{}, errCacheJobCompleted
+				return cacheJobRelease{}, errCacheJobCompleted
 			}
-			return cacheJobConfirmation{RunID: started.WorkflowRunID, WorkflowRef: started.JobWorkflowRef, StartedAt: started.ObservedAt, ConfirmedAt: authority.now(), Source: "scale_set_started"}, nil
+			confirmed := cacheJobConfirmation{RunID: started.WorkflowRunID, WorkflowRef: started.JobWorkflowRef, StartedAt: started.ObservedAt, ConfirmedAt: authority.now(), Source: "scale_set_started"}
+			return cacheJobRelease{JobID: started.JobID, RequestID: started.RequestID, Stop: binding.ExpiresAt, Confirmed: &confirmed}, nil
 		} else if !errors.Is(err, errCacheJobNotFound) {
-			return cacheJobConfirmation{}, err
+			return cacheJobRelease{}, err
 		}
-		if runID == 0 {
-			if job, err := authority.assignments.job(release.JobID); err == nil {
-				if job.Repository != binding.Repository || job.RequestID != release.RequestID {
-					return cacheJobConfirmation{}, errCacheJobMismatch
-				}
-				runID, workflowRef = job.WorkflowRunID, job.JobWorkflowRef
-			} else if !errors.Is(err, errCacheJobNotFound) {
-				return cacheJobConfirmation{}, err
-			}
-		}
-		if runID != 0 {
-			confirmed, err := authority.confirmREST(ctx, binding, runID, &attempt)
+		if runHint > 0 {
+			release, err := authority.resolveREST(ctx, binding, runHint, &attempt)
 			if err == nil {
-				confirmed.WorkflowRef = workflowRef
-				return confirmed, nil
+				return release, nil
 			}
 			if !errors.Is(err, errCacheJobNotFound) {
-				return cacheJobConfirmation{}, err
+				return cacheJobRelease{}, err
 			}
 		}
 		timer := time.NewTimer(authority.interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return cacheJobConfirmation{}, errors.Join(errCacheJobNotFound, ctx.Err())
+			return cacheJobRelease{}, errors.Join(errCacheJobNotFound, ctx.Err())
 		case <-timer.C:
 		}
 	}
 }
 
+// resolveREST maps the bound runner's in-progress REST job to its job UUID
+// through the run's JobAssigned records. A rerun attempt repeats display names,
+// so more than one candidate refuses rather than guess.
+func (authority githubCacheJobAuthority) resolveREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64) (cacheJobRelease, error) {
+	confirmed, job, err := authority.confirmREST(ctx, binding, runID, attempt)
+	if err != nil {
+		return cacheJobRelease{}, err
+	}
+	records, err := authority.assignments.jobs(runID)
+	if err != nil {
+		return cacheJobRelease{}, err
+	}
+	var matched []cacheJobRecord
+	for _, record := range records {
+		if record.Repository == binding.Repository && record.JobDisplayName != "" && record.JobDisplayName == job.Name {
+			matched = append(matched, record)
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return cacheJobRelease{}, errCacheJobNotFound // JobAssigned not recorded yet
+	case 1:
+	default:
+		return cacheJobRelease{}, errCacheJobMismatch
+	}
+	confirmed.WorkflowRef = matched[0].JobWorkflowRef
+	return cacheJobRelease{JobID: matched[0].JobID, RequestID: matched[0].RequestID, Stop: binding.ExpiresAt, Confirmed: &confirmed}, nil
+}
+
 // confirmREST looks for the bound runner's in-progress job in the run's current
 // attempt. A missing or still-queued job is errCacheJobNotFound (keep polling).
-func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64) (cacheJobConfirmation, error) {
+func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64) (cacheJobConfirmation, cacheGitHubJob, error) {
 	if *attempt == 0 {
 		data, err := readCacheGitHubMetadata(ctx, authority.client, "/repos/"+binding.Repository+"/actions/runs/"+strconv.FormatInt(runID, 10))
 		if err != nil {
-			return cacheJobConfirmation{}, errors.Join(errCacheJobNotFound, err)
+			return cacheJobConfirmation{}, cacheGitHubJob{}, errors.Join(errCacheJobNotFound, err)
 		}
 		var run struct {
 			RunAttempt int64 `json:"run_attempt"`
 		}
 		if json.Unmarshal(data, &run) != nil || run.RunAttempt <= 0 {
-			return cacheJobConfirmation{}, errCacheRepository
+			return cacheJobConfirmation{}, cacheGitHubJob{}, errCacheRepository
 		}
 		*attempt = run.RunAttempt
 	}
 	job, err := readCacheBoundJob(ctx, authority.client, binding.Repository, runID, *attempt, binding.RunnerID)
 	switch {
 	case errors.Is(err, errCacheJobNotFound), errors.Is(err, errCacheJobMismatch):
-		return cacheJobConfirmation{}, err
+		return cacheJobConfirmation{}, cacheGitHubJob{}, err
 	case err != nil:
-		return cacheJobConfirmation{}, errors.Join(errCacheJobNotFound, err) // transient: keep polling
+		return cacheJobConfirmation{}, cacheGitHubJob{}, errors.Join(errCacheJobNotFound, err) // transient: keep polling
 	case cacheJobPending(job.Status):
-		return cacheJobConfirmation{}, errCacheJobNotFound
+		return cacheJobConfirmation{}, cacheGitHubJob{}, errCacheJobNotFound
 	case job.Status != "in_progress":
-		return cacheJobConfirmation{}, errCacheJobCompleted
+		return cacheJobConfirmation{}, cacheGitHubJob{}, errCacheJobCompleted
 	case job.RunnerName != binding.RunnerName || job.RunID != runID || job.RunAttempt != *attempt || job.StartedAt.IsZero():
-		return cacheJobConfirmation{}, errCacheJobMismatch
+		return cacheJobConfirmation{}, cacheGitHubJob{}, errCacheJobMismatch
 	}
-	return cacheJobConfirmation{RunID: runID, RunAttempt: *attempt, RESTJobID: job.ID, StartedAt: job.StartedAt, ConfirmedAt: authority.now(), Source: "rest_jobs"}, nil
+	return cacheJobConfirmation{RunID: runID, RunAttempt: *attempt, RESTJobID: job.ID, StartedAt: job.StartedAt, ConfirmedAt: authority.now(), Source: "rest_jobs"}, job, nil
 }
 
 func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding cacheGuestBinding, release cacheJobRelease, setup grant.SetupRequest) (cacheJobGrant, error) {
 	if !authority.valid(binding) {
 		return cacheJobGrant{}, grant.ErrInvalid
 	}
-	// The gate supplies job identity; setup supplies only untrusted context.
+	// resolve supplies job identity; setup supplies only untrusted context.
 	if !canonicalCacheUUID(release.JobID) || release.Stop.IsZero() {
 		return cacheJobGrant{}, errCacheJobMismatch
 	}
@@ -312,7 +336,7 @@ func (authority githubCacheJobAuthority) stillRunning(ctx context.Context, bindi
 
 type cacheGitHubJob struct {
 	ID, RunID, RunAttempt, RunnerID int64
-	Status, RunnerName              string
+	Name, Status, RunnerName        string
 	StartedAt                       time.Time
 }
 
@@ -329,6 +353,7 @@ func (field *cacheNullable[T]) UnmarshalJSON(data []byte) error {
 
 type cacheGitHubJobWire struct {
 	ID         int64                    `json:"id"`
+	Name       string                   `json:"name"`
 	RunID      int64                    `json:"run_id"`
 	RunAttempt int64                    `json:"run_attempt"`
 	Status     string                   `json:"status"`
@@ -343,7 +368,7 @@ func (wire cacheGitHubJobWire) job() (cacheGitHubJob, error) {
 	if wire.ID <= 0 || wire.RunID <= 0 || wire.RunAttempt <= 0 || wire.Status == "" || !wire.RunnerID.Present || !wire.RunnerName.Present || !wire.StartedAt.Present {
 		return cacheGitHubJob{}, errCacheRepository
 	}
-	job := cacheGitHubJob{ID: wire.ID, RunID: wire.RunID, RunAttempt: wire.RunAttempt, Status: wire.Status}
+	job := cacheGitHubJob{ID: wire.ID, Name: wire.Name, RunID: wire.RunID, RunAttempt: wire.RunAttempt, Status: wire.Status}
 	if wire.RunnerID.Value != nil {
 		job.RunnerID = *wire.RunnerID.Value
 	}

@@ -21,7 +21,7 @@ func (fake *fakeAcquirer) AcquireJobs(_ context.Context, ids []int64) ([]int64, 
 
 func scaleSetJob(jobID string, run int64, repo string) scaleset.JobMessageBase {
 	owner, name, _ := strings.Cut(repo, "/")
-	return scaleset.JobMessageBase{JobID: jobID, WorkflowRunID: run, OwnerName: owner, RepositoryName: name, EventName: "workflow_dispatch", RunnerRequestID: 0, JobWorkflowRef: repo + "/.github/workflows/server-tests.yml@refs/heads/main"}
+	return scaleset.JobMessageBase{JobID: jobID, WorkflowRunID: run, OwnerName: owner, RepositoryName: name, EventName: "workflow_dispatch", RunnerRequestID: 0, JobWorkflowRef: repo + "/.github/workflows/server-tests.yml@refs/heads/main", JobDisplayName: "Integration (mariadb, 1)"}
 }
 
 func TestCacheAssignmentScalerRecordsHostObservedAssignments(t *testing.T) {
@@ -45,8 +45,11 @@ func TestCacheAssignmentScalerRecordsHostObservedAssignments(t *testing.T) {
 	if err != nil || len(acquirer.requested) != 1 || acquirer.requested[0][0] != 7 {
 		t.Fatal("available job not acquired", err, acquirer.requested)
 	}
-	if record, err := files.job(job); err != nil || record.WorkflowRunID != 41890164615 {
+	if record, err := files.job(job); err != nil || record.WorkflowRunID != 41890164615 || record.JobDisplayName != "Integration (mariadb, 1)" {
 		t.Fatal("assigned job not recorded", record, err)
+	}
+	if records, err := files.jobs(41890164615); err != nil || len(records) != 1 || records[0].JobID != job {
+		t.Fatal("run's job records not listed", records, err)
 	}
 	if _, err := files.job("0a60a1aa-a79e-5fb1-a32f-8c1a8c35ff75"); !errors.Is(err, errCacheJobNotFound) {
 		t.Fatal("foreign repository recorded", err)

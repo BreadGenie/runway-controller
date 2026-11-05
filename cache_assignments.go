@@ -83,7 +83,9 @@ func decodeCacheAssignment(data []byte) (cacheAssignment, error) {
 }
 
 // cacheJobRecord is the scale-set view of one job (JobAssigned/JobStarted):
-// which run, repository and workflow ref its UUID belongs to. It names no runner.
+// which run, repository, workflow ref and display name its UUID belongs to. It
+// names no runner; the display name ties it to the REST job a runner took. An
+// empty name is kept but never matches a REST job.
 type cacheJobRecord struct {
 	Version        int       `json:"version"`
 	JobID          string    `json:"job_id"`
@@ -92,10 +94,16 @@ type cacheJobRecord struct {
 	Repository     string    `json:"repository"`
 	EventName      string    `json:"event_name"`
 	JobWorkflowRef string    `json:"job_workflow_ref"`
+	JobDisplayName string    `json:"job_display_name"`
 	ObservedAt     time.Time `json:"observed_at"`
 }
 
+var cacheJobRecordFields = []string{"version", "job_id", "request_id", "workflow_run_id", "repository", "event_name", "job_workflow_ref", "job_display_name", "observed_at"}
+
 func (record cacheJobRecord) validate() error {
+	if len(record.JobDisplayName) > 1024 {
+		return grant.ErrInvalid
+	}
 	return cacheAssignment{Version: record.Version, RunnerID: 1, RunnerName: "-", JobID: record.JobID, RequestID: record.RequestID, WorkflowRunID: record.WorkflowRunID, Repository: record.Repository, EventName: record.EventName, JobWorkflowRef: record.JobWorkflowRef, ObservedAt: record.ObservedAt}.validate()
 }
 
@@ -104,6 +112,7 @@ func (record cacheJobRecord) validate() error {
 type cacheAssignmentSource interface {
 	assignment(runnerID int64) (cacheAssignment, error)
 	job(jobID string) (cacheJobRecord, error)
+	jobs(runID int64) ([]cacheJobRecord, error)
 }
 
 func (files cacheAssignmentFiles) job(jobID string) (cacheJobRecord, error) {
@@ -116,10 +125,33 @@ func (files cacheAssignmentFiles) job(jobID string) (cacheJobRecord, error) {
 	}
 	data, err := readCacheOwnedFile(path)
 	var record cacheJobRecord
-	if err != nil || readCacheObject(data, []string{"version", "job_id", "request_id", "workflow_run_id", "repository", "event_name", "job_workflow_ref", "observed_at"}) != nil || json.Unmarshal(data, &record) != nil || record.validate() != nil || record.JobID != jobID {
+	if err != nil || readCacheObject(data, cacheJobRecordFields) != nil || json.Unmarshal(data, &record) != nil || record.validate() != nil || record.JobID != jobID {
 		return cacheJobRecord{}, grant.ErrInvalid
 	}
 	return record, nil
+}
+
+// jobs returns the valid job records of one workflow run. A record that does
+// not decode (one written before display names were kept) is skipped.
+func (files cacheAssignmentFiles) jobs(runID int64) ([]cacheJobRecord, error) {
+	if runID <= 0 || checkCacheOwnedDirectory(files.dir) != nil {
+		return nil, grant.ErrInvalid
+	}
+	entries, err := os.ReadDir(files.dir)
+	if err != nil {
+		return nil, grant.ErrInvalid
+	}
+	var records []cacheJobRecord
+	for _, entry := range entries {
+		jobID, ok := strings.CutPrefix(entry.Name(), "job-")
+		if jobID, ok = strings.CutSuffix(jobID, ".json"); !ok || !canonicalCacheUUID(jobID) {
+			continue
+		}
+		if record, err := files.job(jobID); err == nil && record.WorkflowRunID == runID {
+			records = append(records, record)
+		}
+	}
+	return records, nil
 }
 
 type cacheAssignmentFiles struct{ dir string }
@@ -227,7 +259,7 @@ func (scaler *cacheAssignmentScaler) Scale(ctx context.Context, message *scalese
 	}
 	for _, job := range message.JobAssignedMessages {
 		err := scaler.recordJob(job.JobMessageBase, received)
-		scaler.log(map[string]any{"event": "job_assigned", "received_at": received, "request_id": job.RunnerRequestID, "job_id": job.JobID, "run_id": job.WorkflowRunID, "job_workflow_ref": job.JobWorkflowRef, "recorded": err == nil})
+		scaler.log(map[string]any{"event": "job_assigned", "received_at": received, "request_id": job.RunnerRequestID, "job_id": job.JobID, "run_id": job.WorkflowRunID, "job_workflow_ref": job.JobWorkflowRef, "job_display_name": job.JobDisplayName, "recorded": err == nil})
 	}
 	for _, job := range message.JobStartedMessages {
 		scaler.recordJob(job.JobMessageBase, received)
@@ -258,7 +290,7 @@ func (scaler *cacheAssignmentScaler) assignment(job scaleset.JobMessageBase, run
 // recordJob writes the first observation of a job UUID; a later message may not
 // move that UUID to another run, repository or workflow ref.
 func (scaler *cacheAssignmentScaler) recordJob(job scaleset.JobMessageBase, received time.Time) error {
-	record := cacheJobRecord{Version: 1, JobID: job.JobID, RequestID: job.RunnerRequestID, WorkflowRunID: job.WorkflowRunID, Repository: job.OwnerName + "/" + job.RepositoryName, EventName: job.EventName, JobWorkflowRef: job.JobWorkflowRef, ObservedAt: received}
+	record := cacheJobRecord{Version: 1, JobID: job.JobID, RequestID: job.RunnerRequestID, WorkflowRunID: job.WorkflowRunID, Repository: job.OwnerName + "/" + job.RepositoryName, EventName: job.EventName, JobWorkflowRef: job.JobWorkflowRef, JobDisplayName: job.JobDisplayName, ObservedAt: received}
 	if record.Repository != scaler.repository || record.validate() != nil {
 		return grant.ErrInvalid
 	}

@@ -12,7 +12,7 @@
 # store. Metal prunes images and kernels it does not use, and newer Metal moves kernels to a
 # digest-named store, so launch never reads Metal's files.
 # launch clones the prepared runner image, starts runway-cache-host@VM_ID (the
-# guest's vsock 1025/1026/1027 host side) and the VM, registers one ephemeral
+# guest's vsock 1026/1027 host side) and the VM, registers one ephemeral
 # scale-set JIT runner with the host GitHub credential, writes the root-only binding
 # (VM -> Firecracker PID, runner ID/name, repository) and starts the runner.
 # --no-runner stops before registration, leaving an unbound guest.
@@ -28,7 +28,7 @@
 set -euo pipefail
 umask 077
 
-# Prepare a fresh Metal base with only the administrative gate.
+# Prepared from a stock Metal image: the guest runs the unmodified Actions runner.
 image=${RUNWAY_GUEST_IMAGE:-regional-cache-node-v2}
 image_dataset=metal/runway-images
 image_root=/var/lib/runway-standalone-images
