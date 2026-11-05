@@ -74,7 +74,7 @@ func startCacheHostFixture(t *testing.T, test *authorityCase, configure ...func(
 	logs, logMu := &strings.Builder{}, &sync.Mutex{}
 	bindings := &fakeBindings{}
 	host := &cacheHost{
-		vmID: test.binding.VMID, uds: uds, bindings: bindings, authority: authority,
+		vmID: test.binding.VMID, uds: uds, bindings: bindings, authority: &authority,
 		clock: func(context.Context) (grant.Clock, error) {
 			now := time.Now()
 			return grant.Clock{Earliest: now.Add(-300 * time.Millisecond), Latest: now.Add(300 * time.Millisecond)}, nil

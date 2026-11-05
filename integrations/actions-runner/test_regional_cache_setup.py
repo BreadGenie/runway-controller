@@ -126,17 +126,6 @@ class CacheSetupTests(unittest.TestCase):
             self.assertEqual(helper.main(), 0)
         self.assertEqual(json.loads(output.getvalue()), helper.disabled(request()))
 
-    def connect(address):
-            probe.__exit__.assert_called_once()
-            self.assertEqual(address, (socket.VMADDR_CID_HOST, 1026))
-        native.connect.side_effect = connect
-        output = io.StringIO()
-        with mock.patch.object(helper.sys, "stdin", Input()), mock.patch.object(helper.sys, "stdout", output), mock.patch.object(helper.socket, "socket", side_effect=[probe, native]):
-            self.assertEqual(helper.main(), 0)
-        self.assertEqual(factory.call_args_list, [mock.call(socket.AF_INET, socket.SOCK_STREAM), mock.call(socket.AF_VSOCK, socket.SOCK_STREAM)])
-        self.assertEqual(json.loads(native.sendall.call_args.args[0]), request())
-        self.assertEqual(json.loads(output.getvalue()), response)
-
     def test_duplicate_input_and_size(self):
         for data in [b'{"version":1,"version":1}', b'x'*32769]:
             with self.assertRaises(ValueError):

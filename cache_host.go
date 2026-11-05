@@ -157,7 +157,7 @@ func newCacheHost(config cacheHostConfig, vmID string, log func(map[string]any))
 		host.unavailable = "github_credential_unavailable"
 	default:
 		host.key, host.roots = key, roots
-		host.authority = githubCacheJobAuthority{client: client, assignments: cacheAssignmentFiles{dir: config.AssignmentDir}, regionID: config.RegionID, interval: time.Second, now: time.Now}
+		host.authority = &githubCacheJobAuthority{client: client, assignments: cacheAssignmentFiles{dir: config.AssignmentDir}, regionID: config.RegionID, interval: time.Second, now: time.Now}
 	}
 	if host.unavailable != "" {
 		log(map[string]any{"event": "setup_unavailable", "vm_id": vmID, "reason": host.unavailable})
