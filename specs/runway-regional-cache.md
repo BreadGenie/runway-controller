@@ -1,45 +1,70 @@
 # Regional Actions cache
 
-Status: draft design. No cache service, routing change or storage deployment is implemented.
+Status: standalone development deployment on blr-1.
 
-## Purpose
+## Scope
 
-Keep existing workflow files and supported cache actions unchanged while serving dependency-cache archives from storage near Runway runners. Start with the measured Yarn cache path used by `actions/setup-node`. The [performance plan](runway-performance-optimization.md) owns comparison conditions and acceptance targets.
+Serve dependency-cache archives near disposable Firecracker runners without
+workflow changes. Supported pinned clients are actions/cache@0057852b (v4.3.0)
+and actions/setup-node@24997072 (v6.5.0), using cache protocol v1.
+Artifacts, logs and other action traffic retain their existing routes.
+PRs, forks, tags and unsupported actions retain GitHub caching.
 
-The retained passing Server shard restored the same 584,388,223-byte archive in 623.766 seconds on BLR and 7.627 seconds hosted. Reported progress places most delay before the complete download. A separate host-only public download reached approximately 112 MiB/s, but used a different endpoint. These observations justify investigating regional caching; they do not establish the cause of the current GitHub cache slowdown or prove regional-cache performance.
+## Authority
 
-## Compatibility contract
+The trusted root launcher registers an ephemeral runner in scale set 39 and
+writes a root-only binding of VM, Firecracker PID, repository and runner identity.
+cache-host checks the connecting socket peer against that PID.
+The guest supplies claims, never authority.
 
-- Preserve supported upstream cache actions and setup actions without workflow edits. Record exact tested action and runner versions; do not claim compatibility with every action by inference.
-- Preserve cache key, version, exact-hit, restore-key, lookup-only, save/restore and supported archive semantics. Verify current protocol behaviour from the pinned clients before implementing it.
-- Preserve repository, branch, tag and pull-request access boundaries, including fork jobs. The control plane derives permissions from authenticated job context; a guest-supplied repository, key or ref is not authority.
-- Keep artifacts, logs, job assignment, execution release and ordinary network traffic on their existing paths. Do not treat a shared service URL or token as cache-only without proving the protocol boundary.
-- Cache failure remains visible and follows the supported action's contract. A cache miss must not become false success or silently broaden access.
+cache-assignments is an admission dependency because its scale-set session acquires jobs for the scale set.
+It records JobAssigned and JobStarted evidence in root-only files, pruned by age.
+At port 1025 the host confirms the job UUID and request ID against that session
+and REST, with a 35-second confirmation budget. The bound guest is released even
+if confirmation fails; regional setup then stays disabled.
+At port 1026 setup checks the confirmed job, exact run and attempt, branch, SHA,
+same-repository head and the host-held workflow ref suffix. Only branch pushes
+and manual dispatch qualify. One release permits one setup.
 
-## Storage and trust proposal
+The host signs short-lived grants and renews them in the background after a
+fresh running-job check. Stale session records require REST confirmation.
+Clock uncertainty comes exclusively from adjtimex: unsynchronized clocks disable
+setup. Clock, key, CA or token failure must never remove the 1025 listener.
+cacheJobAuthority is the small seam for a future Central source; that integration
+is outside this standalone implementation.
 
-Use a regional archive service with immutable published entries and a fresh restore into each disposable guest. Shared writable guest mounts and sticky disks are outside this first feature. This is a proposal for design review, not approval of a new runtime trust boundary.
+## Data path
 
-Uploads remain private and incomplete until the service validates their bounded size and commits the complete entry atomically. Concurrent writers cannot replace a committed entry. Aborted uploads have bounded lifetime and cleanup. Readers cannot see a partial archive. Caches remain untrusted job data and never become trusted runner image or bootstrap input.
+cache-setup establishes the route once before steps. The runner patch isolates
+setup faults from job execution and skips container jobs. A bounded relay carries
+only supported cache requests to port 1027. cache-host injects the grant into a
+TLS connection to cache-data. Guests never receive signing or Garage keys.
 
-Use narrowly scoped, expiring capabilities for cache operations, with explicit repository/ref access, method, object and size restrictions. Never expose service-wide or storage-account credentials to a guest. Digest-based deduplication must not expose cross-tenant existence or grant cross-tenant access.
+cache-data uses disk staging and a persistent single-node Garage on blr-1.
+Published entries are immutable. Uploads reserve quota and remain invisible
+until complete size and digest verification and durable publication.
+Downloads hash while copying to a private spool and verify before serving bytes.
+The journal retains the legacy prototype/ object prefix, storage identity,
+publication intents and hashed read tickets. Startup verifies indexed objects
+within a shared recovery budget. Missing or damaged objects become misses;
+unreachable storage refuses startup. Unknown objects are never adopted.
 
-Account for storage and transfer independently from executable guest capacity. Define per-repository and tenant quotas, upload/download concurrency, retention, eviction, deletion and operator observability before deployment. Eviction produces a cache miss; it must not alter an entry while readers use it.
+Published uploads release their spool. In-use entries are refcounted; Garage I/O
+and streaming run outside the global lock. A bounded background sweep retries
+hidden-object cleanup with backoff. Disk custody uses flock and startup wiping.
+Storage deadlines and reservation lifetime scale with size; ticket expiry is
+checked before fetching. Cache loss never changes runner image contents.
 
-## Implementation sequence
+## Validation and operations
 
-1. Trace the actual pinned `setup-node` and cache clients: discovery, authentication, lookup, segmented download, upload and publication. Identify a supported integration seam that preserves action integrity and does not redirect unrelated traffic. A hostname or environment override alone is not a proven solution.
-2. Specify identity and access decisions with real branch/default-branch/PR/fork cases. Establish control-plane ownership and inspect existing artifact infrastructure before selecting a new service or storage system. Cargo is a candidate in the architecture, not a selected implementation.
-3. Build a local protocol prototype with disposable storage and fixture credentials. Exercise the actual pinned action/client where possible. Demonstrate miss, save, hit, restore-key, concurrent save, interrupted upload, expiry and denied cross-repository/ref reads.
-4. Measure pinned archive transfer and extraction separately against the existing path. Preserve the fixed guest shape and record cache state and failures. Diagnose any guest/network bottleneck independently of introducing the service.
-5. Deploy only to declared development infrastructure after review of the trust and resource contract. Run the unchanged Server workflow and retain full cleanup evidence. Repeated matched qualification remains required before claiming parity.
+Run the Go build, vet, unit and race gates, pinned clients through the relay,
+and offline Python suites after each stage. Exercise real Garage separately.
+Live validation requires two confirmed shards, grants, warm restores, passing
+Integration and refusals for forged runs, sibling UUIDs, unbound guests and
+tag-as-branch claims. Preserve the existing Garage journal across upgrades.
+See [deployment](../deploy/blr-garage/README.md),
+[launcher](../deploy/standalone-guest/README.md) and
+[validation](../docs/regional-cache-validation.md).
 
-## Open decisions
-
-The protocol integration mechanism, service owner, storage backend, GitHub-cache migration/fallback policy, quota values and outage behaviour are unresolved. Do not choose them implicitly in implementation. In particular, never bypass cache authorization by globally proxying authenticated GitHub traffic, and do not replay uncertain writes across two backends without a defined identity and publication rule.
-
-## Validation
-
-Acceptance requires upstream-client compatibility, no cross-tenant or disallowed ref access, immutable atomic publication, bounded resource use and cleanup, correct behaviour under cancellation/concurrency/outage, and measured improvement with unchanged workflows. Keep all existing authority, clock, admission, network and execution deadlines intact. Any runtime change renews its affected qualification; no charge deletion or unqualified guest is permitted for benchmarking.
-
-Blacksmith documents [transparent colocated Actions caching](https://docs.blacksmith.sh/blacksmith-caching/dependencies-actions) and a separate [sticky-disk snapshot mechanism](https://github.com/useblacksmith/stickydisk#architecture). These are design references, not evidence of our implementation or disclosure of their internal routing mechanism. GitHub's [dependency caching reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) owns the upstream access and matching semantics to verify against the selected client revision.
+Repeated matched performance qualification remains outstanding.
+A Firecracker jailer for the standalone launcher is a follow-up.

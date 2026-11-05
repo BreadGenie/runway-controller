@@ -1,0 +1,28 @@
+[Unit]
+Description=Credential-free regional cache relay
+After=systemd-sysusers.service systemd-modules-load.service
+Requires=systemd-sysusers.service
+
+[Service]
+Type=exec
+User=runner
+Group=runner
+ExecStart=/usr/bin/python3 -I /opt/runway/bin/cache-relay
+Restart=no
+KillMode=control-group
+UMask=0077
+MemoryMax=64M
+TasksMax=16
+LimitNOFILE=64
+CPUQuota=100%
+TimeoutStartSec=5
+TimeoutStopSec=5
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_VSOCK
+
+[Install]
+WantedBy=multi-user.target

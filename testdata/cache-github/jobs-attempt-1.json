@@ -1,0 +1,41 @@
+{
+ "total_count": 3,
+ "jobs": [
+  {
+   "id": 126704137470,
+   "run_id": 41867135947,
+   "run_attempt": 1,
+   "name": "Plan Tests",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-04T16:25:56Z",
+   "completed_at": "2026-11-04T16:26:02Z",
+   "runner_id": 1000001648,
+   "runner_name": "GitHub Actions 1000001648"
+  },
+  {
+   "id": 126704211355,
+   "run_id": 41867135947,
+   "run_attempt": 1,
+   "name": "Integration (mariadb, 2)",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-04T16:26:06Z",
+   "completed_at": "2026-11-04T16:36:34Z",
+   "runner_id": 218,
+   "runner_name": "runway-cache-test-1104-cold"
+  },
+  {
+   "id": 126704211772,
+   "run_id": 41867135947,
+   "run_attempt": 1,
+   "name": "Integration (mariadb, 1)",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-04T16:44:22Z",
+   "completed_at": "2026-11-04T16:56:09Z",
+   "runner_id": 219,
+   "runner_name": "runway-cache-test-1104-warm"
+  }
+ ]
+}

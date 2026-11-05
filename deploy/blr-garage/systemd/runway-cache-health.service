@@ -1,0 +1,10 @@
+[Unit]
+Description=Runway regional cache health check
+
+[Service]
+Type=oneshot
+# Tear down guests whose VM stopped (for example at RuntimeMaxSec) first.
+ExecStartPre=-/opt/runway-cache/bin/runway-standalone-guest reap
+ExecStart=/opt/runway-cache/bin/runway-cache-health
+MemoryMax=256M
+NoNewPrivileges=yes

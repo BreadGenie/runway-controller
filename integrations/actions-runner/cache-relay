@@ -1,0 +1,154 @@
+#!/usr/bin/python3 -I
+"""Carry the fixed guest cache endpoint to its dedicated host vsock endpoint."""
+
+import selectors
+import signal
+import socket
+import threading
+import time
+
+ADDRESS = ("127.0.0.1", 18080)
+HOST = (socket.VMADDR_CID_HOST, 1027)
+BUFFER_BYTES = 65536
+# A large save's finalize hashes and stores the archive before any byte comes
+# back; idle must outlast the host's per-request limit (cache_host.go).
+IDLE_SECONDS = 330
+FIRST_BYTE_SECONDS = 5
+CONNECTIONS = 8
+
+
+def relay(left, right, stop, idle_seconds=IDLE_SECONDS):
+    """Bound memory and idle lifetime while preserving byte order and half-close."""
+    peers = {left: right, right: left}
+    pending = {left: bytearray(), right: bytearray()}
+    eof = set()
+    shutdown = set()
+    for connection in peers:
+        connection.setblocking(False)
+    deadline = time.monotonic() + idle_seconds
+    with selectors.DefaultSelector() as selector:
+        while not stop.is_set():
+            if time.monotonic() >= deadline:
+                return
+            for connection, other in peers.items():
+                if other in eof and not pending[connection] and connection not in shutdown:
+                    connection.shutdown(socket.SHUT_WR)
+                    shutdown.add(connection)
+                events = 0
+                if connection not in eof and len(pending[other]) < BUFFER_BYTES:
+                    events |= selectors.EVENT_READ
+                if pending[connection]:
+                    events |= selectors.EVENT_WRITE
+                try:
+                    selector.unregister(connection)
+                except KeyError:
+                    pass
+                if events:
+                    selector.register(connection, events)
+            if len(eof) == 2 and not any(pending.values()):
+                return
+            for key, events in selector.select(min(0.1, max(0, deadline-time.monotonic()))):
+                connection = key.fileobj
+                other = peers[connection]
+                if events & selectors.EVENT_READ:
+                    try:
+                        data = connection.recv(BUFFER_BYTES-len(pending[other]))
+                    except BlockingIOError:
+                        continue
+                    if data:
+                        pending[other].extend(data)
+                        deadline = time.monotonic() + idle_seconds
+                    else:
+                        eof.add(connection)
+                if events & selectors.EVENT_WRITE:
+                    try:
+                        sent = connection.send(pending[connection])
+                    except BlockingIOError:
+                        continue
+                    if sent == 0:
+                        return
+                    del pending[connection][:sent]
+                    deadline = time.monotonic() + idle_seconds
+
+
+def serve(listener, stop, connect, first_byte_seconds=FIRST_BYTE_SECONDS):
+    """Own every connection and worker; the host enforces attempt authorization."""
+    slots = threading.BoundedSemaphore(CONNECTIONS)
+    workers = set()
+    listener.settimeout(0.1)
+
+    def worker(connection):
+        try:
+            with connection:
+                # The setup availability probe sends no HTTP. Do not occupy a
+                # native socket whose guest half-close Firecracker cannot relay.
+                connection.settimeout(0.1)
+                deadline = time.monotonic() + first_byte_seconds
+                while not stop.is_set() and time.monotonic() < deadline:
+                    try:
+                        first = connection.recv(1, socket.MSG_PEEK)
+                        break
+                    except socket.timeout:
+                        continue
+                else:
+                    return
+                if not first:
+                    return
+                with connect() as upstream:
+                    relay(connection, upstream, stop)
+        except OSError:
+            pass  # Close this byte stream; never log credentials or retry writes.
+        finally:
+            slots.release()
+
+    try:
+        while not stop.is_set():
+            finished = {thread for thread in workers if not thread.is_alive()}
+            for thread in finished:
+                thread.join()
+            workers.difference_update(finished)
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            if not slots.acquire(blocking=False):
+                connection.close()
+                continue
+            thread = threading.Thread(target=worker, args=(connection,))
+            try:
+                thread.start()
+            except RuntimeError:
+                connection.close()
+                slots.release()
+                raise
+            workers.add(thread)
+    finally:
+        stop.set()
+        listener.close()
+        for thread in workers:
+            thread.join()
+
+
+def connect_host():
+    connection = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(5)
+        connection.connect(HOST)
+        return connection
+    except OSError:
+        connection.close()
+        raise
+
+
+def main():
+    stop = threading.Event()
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, lambda *_: stop.set())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(ADDRESS)
+        listener.listen(CONNECTIONS)
+        serve(listener, stop, connect_host)
+
+
+if __name__ == "__main__":
+    main()
