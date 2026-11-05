@@ -8,7 +8,7 @@ cache miss. See the [standalone spec](../../specs/runway-regional-cache.md).
 | --- | --- | --- |
 | `runway-garage.service` | S3 `127.0.0.1:3900`, RPC `127.0.0.1:3901`, admin `127.0.0.1:3903` | `/var/lib/runway-garage/{meta,data}` (root filesystem, replication 1) |
 | `runway-cache-data.service` | TLS 1.3 `127.0.0.1:18445` | journal `/var/lib/runway-cache/state`, staging `/var/lib/runway-cache/spools` |
-| `runway-cache-host@VM.service` | per-guest vsock sockets `/run/runway-cache/vms/VM/v.sock_{1025,1026,1027}` | none (started by the [guest launcher](../standalone-guest/README.md)) |
+| `runway-cache-host@VM.service` | per-guest vsock sockets `/run/runway-cache/vms/VM/v.sock_{1026,1027}` | none (started by the [guest launcher](../standalone-guest/README.md)) |
 | `runway-cache-assignments.service` | – (outbound scale-set message session) | records `/run/runway-cache/assignments/` |
 | `runway-cache-health.timer` | – | runs the health check every 5 minutes |
 

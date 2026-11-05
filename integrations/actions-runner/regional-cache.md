@@ -3,8 +3,8 @@
 See the [standalone spec](../../specs/runway-regional-cache.md).
 The static `cmd/cache-node` wrapper replaces the guest runner's external node20
 and node24 executables; their original binaries remain beside them as node.real.
-No regional-cache runner build is needed. The separate 1025 administrative gate
-still lives in the Metal image's Runner.Worker and is outside this integration.
+The guest runs the stock, checksum-pinned Actions runner from the Metal image;
+no runner patch or Runner.Worker build is needed.
 
 Supported bundle identities:
 
@@ -22,8 +22,8 @@ Container executables under /__e pass through; containers also lack the guest's
 
 The first supported bundle reads GITHUB_* context hints and exchanges one bounded
 JSON line with vsock 1026. Wire version 2 sends version, nonce and context only;
-the host takes job UUID and request ID from its authenticated 1025 release and
-verifies context against GitHub REST. The response echoes version and nonce,
+the host resolves job UUID and request ID for the bound runner from host-held
+scale-set and REST records, and verifies context against GitHub REST. The response echoes version and nonce,
 with outcome and the fixed credential-free route http://127.0.0.1:18080/.
 Setup probes the relay for at most 0.2s, connects vsock within 1s and has a total
 4s budget including lock wait. Errors keep GitHub caching; setup never retries.
@@ -41,5 +41,5 @@ Existing node.real files are preserved on repeated installation.
 
 Build with `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o cache-node ./cmd/cache-node`
 and pass that binary as install.sh's second argument. Deploy host and guest
-together: wire v1 is unsupported. Use an unregistered Metal runner image without
-the retired regional cache changes; image preparation never swaps Runner.Worker.
+together: wire v1 is unsupported. Prepare the guest image from an unregistered
+stock Metal runner image; image preparation never swaps Runner.Worker.

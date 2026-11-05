@@ -1,5 +1,5 @@
 [Unit]
-Description=Runway standalone cache host for guest %i (vsock 1025/1026/1027)
+Description=Runway standalone cache host for guest %i (vsock 1026/1027)
 After=runway-cache-data.service
 Wants=runway-cache-data.service
 

@@ -133,10 +133,6 @@ func exchangeLine(t *testing.T, path string, request any) map[string]any {
 	return response
 }
 
-func (host *runningCacheHost) gate(t *testing.T, jobID string) map[string]any {
-	return exchangeLine(t, host.uds+"_1025", map[string]any{"version": 1, "job_id": jobID, "request_id": 0, "nonce": "3d1f7c2a-8b4e-4f6a-9c1d-2e3f4a5b6c7d"})
-}
-
 func (host *runningCacheHost) setup(t *testing.T, request grant.SetupRequest) string {
 	response := exchangeLine(t, host.uds+"_1026", request)
 	if response == nil {
@@ -177,8 +173,8 @@ func (host *runningCacheHost) eventually(text string) bool {
 func TestCacheHostRefusesUnboundGuest(t *testing.T) {
 	test := newAuthorityCase(t)
 	host := startCacheHostFixture(t, test)
-	if response := host.gate(t, test.release.JobID); response != nil {
-		t.Fatal("unbound guest released", response)
+	if _, err := os.Stat(host.uds + "_1025"); !os.IsNotExist(err) {
+		t.Fatal("the retired 1025 gate socket is served", err)
 	}
 	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("unbound") {
 		t.Fatal("unbound guest enabled", outcome)
@@ -188,21 +184,13 @@ func TestCacheHostRefusesUnboundGuest(t *testing.T) {
 	}
 }
 
-func TestCacheHostGrantsOnlyTheReleasedVerifiedJob(t *testing.T) {
+func TestCacheHostGrantsOnlyTheResolvedVerifiedJob(t *testing.T) {
 	test := newAuthorityCase(t)
+	// JobStarted names runner 219's job, so a forged run ID cannot select another.
+	test.assignments.runners[219] = cacheAssignment{Version: 1, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", JobID: test.release.JobID, WorkflowRunID: 41867135947, Repository: fixtureRepository, EventName: "workflow_dispatch", JobWorkflowRef: fixtureWorkflow, ObservedAt: time.Now()}
 	host := startCacheHostFixture(t, test)
 	binding := test.binding
 	host.bindings.set(&binding)
-	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("not_released") {
-		t.Fatal("setup before release enabled", outcome)
-	}
-	response := host.gate(t, test.release.JobID)
-	if response == nil || response["released"] != true || int64(response["stop_unix_seconds"].(float64)) != binding.ExpiresAt.Unix() {
-		t.Fatal("bound runner not released", response)
-	}
-	if again := host.gate(t, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"); again != nil {
-		t.Fatal("ephemeral runner released a second job")
-	}
 	otherRun := test.setup
 	value := "41867135948"
 	otherRun.Context.RunID, otherRun.Nonce = &value, "6f7a8b9c-0d1e-4f2a-8b3c-4d5e6f7a8b9c"
@@ -215,8 +203,11 @@ func TestCacheHostGrantsOnlyTheReleasedVerifiedJob(t *testing.T) {
 	if status := host.lookup(t); status != http.StatusServiceUnavailable {
 		t.Fatal("translator installed before a verified setup", status)
 	}
-	if outcome := host.setup(t, test.setup); outcome != "enabled" {
+	if outcome := host.setup(t, test.setup); outcome != "enabled" || !host.eventually(`"job_id":"`+test.release.JobID+`"`) {
 		t.Fatal("verified job not enabled", outcome)
+	}
+	if strings.Count(host.logsText(), `"event":"confirmed"`) != 1 {
+		t.Fatal("the pinned job was resolved again")
 	}
 	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("already_enabled") {
 		t.Fatal("replayed setup accepted", outcome)
@@ -224,7 +215,7 @@ func TestCacheHostGrantsOnlyTheReleasedVerifiedJob(t *testing.T) {
 	second := test.setup
 	second.Nonce = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"
 	if outcome := host.setup(t, second); outcome != "disabled" {
-		t.Fatal("a second setup for the release enabled", outcome)
+		t.Fatal("a second setup for the job enabled", outcome)
 	}
 	if status := host.lookup(t); status != http.StatusNoContent {
 		t.Fatal("verified lookup not forwarded", status)
@@ -269,24 +260,18 @@ func TestCacheHostConfigurationIsStrict(t *testing.T) {
 	}
 }
 
-func TestCacheHostGateReleasesUnconfirmedJobButSetupFallsBack(t *testing.T) {
-	budget := cacheHostConfirmBudget
-	cacheHostConfirmBudget = 300 * time.Millisecond
-	t.Cleanup(func() { cacheHostConfirmBudget = budget })
+func TestCacheHostSetupFallsBackWhenTheJobIsUnconfirmed(t *testing.T) {
 	test := newAuthorityCase(t)
 	test.binding.RunnerID = 999 // GitHub never shows this runner in the run
 	host := startCacheHostFixture(t, test)
 	binding := test.binding
 	host.bindings.set(&binding)
 	started := time.Now()
-	if response := host.gate(t, test.release.JobID); response == nil || response["released"] != true {
-		t.Fatal("unconfirmed job not released; cache must never block the job")
-	}
-	if elapsed := time.Since(started); elapsed < 250*time.Millisecond || elapsed > 2*time.Second || !host.eventually(`"event":"confirm_refused"`) {
-		t.Fatal("gate confirmation not bounded", elapsed)
-	}
-	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("unconfirmed") {
+	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("unconfirmed") || !host.eventually(`"event":"confirm_refused"`) {
 		t.Fatal("unconfirmed job enabled", outcome)
+	}
+	if elapsed := time.Since(started); elapsed > cacheHostSetupBudget+time.Second {
+		t.Fatal("resolution not bounded by the setup budget", elapsed)
 	}
 	if status := host.lookup(t); status != http.StatusServiceUnavailable {
 		t.Fatal("unconfirmed job reached the translator", status)
@@ -298,16 +283,15 @@ func TestCacheHostGateReleasesUnconfirmedJobButSetupFallsBack(t *testing.T) {
 	}
 }
 
-func TestCacheHostGateConfirmsBeforeSetup(t *testing.T) {
+// Before JobStarted arrives, the REST job on the bound runner names the job
+// through its JobAssigned record.
+func TestCacheHostResolvesTheJobBeforeJobStarted(t *testing.T) {
 	test := newAuthorityCase(t)
 	host := startCacheHostFixture(t, test)
 	binding := test.binding
 	host.bindings.set(&binding)
-	if host.gate(t, test.release.JobID) == nil || !host.eventually(`"event":"confirmed"`) || !host.eventually(`"source":"rest_jobs"`) {
-		t.Fatal("gate did not confirm the assignment")
-	}
-	if outcome := host.setup(t, test.setup); outcome != "enabled" {
-		t.Fatal("confirmed job not enabled", outcome)
+	if outcome := host.setup(t, test.setup); outcome != "enabled" || !host.eventually(`"source":"rest_jobs"`) || !host.eventually(`"job_id":"`+test.release.JobID+`"`) {
+		t.Fatal("job not resolved from REST and JobAssigned", outcome, host.logsText())
 	}
 }
 
@@ -318,8 +302,8 @@ func (host *runningCacheHost) logsText() string {
 }
 
 // Bug: cache-host exited at startup when the key, CA or credential was
-// unreadable, so the gate never answered and the job failed.
-func TestCacheHostServesTheGateWhenSetupIsUnavailable(t *testing.T) {
+// unreadable. It must keep serving and refuse setup with the reason.
+func TestCacheHostAnswersSetupWhenItIsUnavailable(t *testing.T) {
 	test := newAuthorityCase(t)
 	dir, err := os.MkdirTemp("/tmp", "rch")
 	if err != nil {
@@ -355,9 +339,6 @@ func TestCacheHostServesTheGateWhenSetupIsUnavailable(t *testing.T) {
 			t.Fatal("cache host did not listen")
 		}
 	}
-	if response := running.gate(t, test.release.JobID); response == nil || response["released"] != true {
-		t.Fatal("gate not served without setup custody", response)
-	}
 	if outcome := running.setup(t, test.setup); outcome != "disabled" || !running.logged("signing_key_unavailable") {
 		t.Fatal("setup not disabled", outcome, running.logsText())
 	}
@@ -371,7 +352,7 @@ func TestCacheHostRenewsInTheBackgroundWithoutBlockingRequests(t *testing.T) {
 	})
 	binding := test.binding
 	host.bindings.set(&binding)
-	if host.gate(t, test.release.JobID) == nil || host.setup(t, test.setup) != "enabled" {
+	if host.setup(t, test.setup) != "enabled" {
 		t.Fatal("setup")
 	}
 	host.github.mu.Lock()
@@ -402,19 +383,13 @@ func TestCacheHostRenewsInTheBackgroundWithoutBlockingRequests(t *testing.T) {
 	}
 }
 
-// Concurrent setups share one confirmation, and excess connections are closed.
-func TestCacheHostSharesConfirmationAndBoundsConnections(t *testing.T) {
-	budget := cacheHostConfirmBudget
-	cacheHostConfirmBudget = 400 * time.Millisecond
-	t.Cleanup(func() { cacheHostConfirmBudget = budget })
+// Concurrent setups share one resolution, and excess connections are closed.
+func TestCacheHostSharesResolutionAndBoundsConnections(t *testing.T) {
 	test := newAuthorityCase(t)
-	delete(test.assignments.jobs, test.release.JobID) // nothing confirms: every caller polls
+	delete(test.assignments.records, test.release.JobID) // nothing resolves: every caller polls
 	host := startCacheHostFixture(t, test)
 	binding := test.binding
 	host.bindings.set(&binding)
-	gated := make(chan map[string]any)
-	go func() { gated <- host.gate(t, test.release.JobID) }()
-	time.Sleep(50 * time.Millisecond)
 	var wg sync.WaitGroup
 	for _, nonce := range []string{"8b9c0d1e-2f3a-4b4c-8d5e-6f7a8b9c0d1e", "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f"} {
 		wg.Add(1)
@@ -428,9 +403,6 @@ func TestCacheHostSharesConfirmationAndBoundsConnections(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if <-gated == nil {
-		t.Fatal("gate refused")
-	}
 	if refused := strings.Count(host.logsText(), `"event":"confirm_refused"`); refused != 1 {
 		t.Fatal("confirmations run:", refused)
 	}
