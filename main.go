@@ -169,7 +169,15 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 	appID := os.Getenv("RUNWAY_GITHUB_APP_CLIENT_ID")
 	keyFile := os.Getenv("RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE")
 	installation := os.Getenv("RUNWAY_GITHUB_APP_INSTALLATION_ID")
-	if appID != "" || keyFile != "" || installation != "" {
+	hasApp := appID != "" || keyFile != "" || installation != ""
+	// The standalone launcher passes the root-only host credential by path.
+	if tokenFile := os.Getenv("RUNWAY_GITHUB_TOKEN_FILE"); tokenFile != "" {
+		if hasApp {
+			return nil, errors.New("select one GitHub credential source")
+		}
+		return cacheGitHubClient(url, tokenFile, options...)
+	}
+	if hasApp {
 		id, err := strconv.ParseInt(installation, 10, 64)
 		if err != nil || id <= 0 || appID == "" || keyFile == "" {
 			return nil, errors.New("provide all three RUNWAY_GITHUB_APP_* variables")
