@@ -25,12 +25,12 @@ Guests boot only from the launcher's own image store (`metal/runway-images/NAME`
 and `/var/lib/runway-standalone-images/NAME/vmlinux`). Metal prunes images and
 kernels it does not use, and newer Metal moves kernels out of the image
 directory, so `prepare-image` copies the disk and kernel once, accepting either
-Metal layout:
+Metal layout. Choose a base with the 1025 administrative gate only; do not
+reuse the retired regional-cache Worker build:
 
 ```sh
-runway-standalone-guest prepare-image regional-cache-review-20261105 \
-  sha256:f0dc9f17c4d910a057a017eb613e97ff093b34e686114937869f10ec07f17ade \
-  /root/runway-review-20261105/runner
+runway-standalone-guest prepare-image regional-cache-node-v2 \
+  sha256:f0dc9f17c4d910a057a017eb613e97ff093b34e686114937869f10ec07f17ade
 ```
 
 Set RUNWAY_GUEST_IMAGE to select another prepared image.

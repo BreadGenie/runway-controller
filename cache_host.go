@@ -405,8 +405,14 @@ func (host *cacheHost) serveSetup(conn net.Conn) {
 		}
 		return *value
 	}
+	host.mu.Lock()
+	jobID, requestID := "", int64(0)
+	if host.release != nil {
+		jobID, requestID = host.release.JobID, host.release.RequestID
+	}
+	host.mu.Unlock()
 	c := request.Context
-	host.log(map[string]any{"event": "setup", "vm_id": host.vmID, "enabled": reason == "", "reason": reason, "job_id": request.JobID, "request_id": request.RequestID, "repository": text(c.Repository), "run_id": text(c.RunID), "run_attempt": text(c.RunAttempt), "ref": text(c.Ref), "event_name": text(c.EventName), "sha": text(c.SHA)})
+	host.log(map[string]any{"event": "setup", "vm_id": host.vmID, "enabled": reason == "", "reason": reason, "job_id": jobID, "request_id": requestID, "repository": text(c.Repository), "run_id": text(c.RunID), "run_attempt": text(c.RunAttempt), "ref": text(c.Ref), "event_name": text(c.EventName), "sha": text(c.SHA)})
 }
 
 // enable returns "" after installing a translator, or the refusal reason. A
@@ -429,8 +435,6 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 	switch {
 	case release == nil:
 		return "not_released"
-	case release.JobID != request.JobID || release.RequestID != request.RequestID:
-		return "job_mismatch"
 	case enabled:
 		return "already_enabled"
 	case replay:

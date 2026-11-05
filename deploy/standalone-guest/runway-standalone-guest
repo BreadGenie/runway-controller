@@ -1,7 +1,7 @@
 #!/bin/bash
 # Trusted root launcher for standalone disposable Firecracker guests on blr-1.
 #
-#   runway-standalone-guest prepare-image NAME METAL_IMAGE [WORKER_DIR]
+#   runway-standalone-guest prepare-image NAME METAL_IMAGE
 #   runway-standalone-guest launch VM_ID INDEX [--no-runner]
 #   runway-standalone-guest teardown VM_ID
 #   runway-standalone-guest reap        (tear down guests whose VM has stopped)
@@ -9,8 +9,7 @@
 #   runway-standalone-guest ssh VM_ID [COMMAND...]   (root shell in the guest)
 #
 # prepare-image copies a Metal image's disk and kernel into the launcher's own
-# store, optionally replacing Runner.Worker.{dll,pdb} from WORKER_DIR. Metal
-# prunes images and kernels it does not use, and newer Metal moves kernels to a
+# store. Metal prunes images and kernels it does not use, and newer Metal moves kernels to a
 # digest-named store, so launch never reads Metal's files.
 # launch clones the prepared runner image, starts runway-cache-host@VM_ID (the
 # guest's vsock 1025/1026/1027 host side) and the VM, registers one ephemeral
@@ -29,8 +28,8 @@
 set -euo pipefail
 umask 077
 
-# The preserved runner base with this review's tested Runner.Worker.
-image=${RUNWAY_GUEST_IMAGE:-regional-cache-review-20261105}
+# Prepare a fresh Metal base with only the administrative gate.
+image=${RUNWAY_GUEST_IMAGE:-regional-cache-node-v2}
 image_dataset=metal/runway-images
 image_root=/var/lib/runway-standalone-images
 metal_images=/var/lib/metal/images
@@ -62,14 +61,11 @@ guest_ssh() {
 }
 
 prepare_image() {
-	local name=$1 from=$2 worker=${3:-}
+	local name=$1 from=$2
 	valid_image "$name"
 	[[ $from =~ ^sha256:[0-9a-f]{64}$ ]] || die "METAL_IMAGE must be a sha256: image reference"
-	local ds=$image_dataset/$name dir=$image_root/$name kernel digest root
+	local ds=$image_dataset/$name dir=$image_root/$name kernel digest
 	! zfs list -H "$ds" >/dev/null 2>&1 && [ ! -e "$dir" ] || die "image $name already exists"
-	if [ -n "$worker" ]; then
-		[ -f "$worker/Runner.Worker.dll" ] && [ -f "$worker/Runner.Worker.pdb" ] || die "WORKER_DIR needs Runner.Worker.dll and .pdb"
-	fi
 	digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_sha256"].lower())' "$metal_images/$from/manifest.json") || die "no manifest for $from"
 	# Older Metal keeps the kernel beside the manifest, newer Metal in kernels/.
 	kernel=$metal_images/$from/vmlinux
@@ -82,18 +78,7 @@ prepare_image() {
 	# A full copy, not a clone: Metal may destroy its image while guests run.
 	zfs list -H "$image_dataset" >/dev/null 2>&1 || zfs create -o mountpoint=none "$image_dataset"
 	zfs send "metal/images/$from@ready" | zfs receive "$ds"
-	if [ -n "$worker" ]; then
-		udevadm settle
-		root=$dir/root
-		mkdir "$root"
-		mount "/dev/zvol/$ds" "$root"
-		install -m 0644 "$worker/Runner.Worker.dll" "$worker/Runner.Worker.pdb" "$root/opt/runway/runner/bin/"
-		umount "$root"
-		rmdir "$root"
-		zfs destroy "$ds@ready"
-		zfs snapshot "$ds@ready"
-	fi
-	printf '%s worker=%s\n' "$from" "${worker:+$(sha256sum "$worker/Runner.Worker.dll" | cut -c1-64)}" > "$dir/source"
+	printf '%s\n' "$from" > "$dir/source"
 	trap - EXIT
 	echo "{\"image\":\"$name\",\"from\":\"$from\",\"kernel_sha256\":\"$digest\"}"
 }
@@ -139,7 +124,16 @@ launch() {
 	# No Atlas metadata or managed initializer: the launcher starts the runner.
 	for unit in atlas-metadata.service runway-initialize.service; do ln -sf /dev/null "$root/etc/systemd/system/$unit"; done
 	# This branch's guest cache helpers (install.sh stages them), not the image's.
-	install -m 0755 "$guest_files/cache-relay" "$guest_files/cache-setup" "$root/opt/runway/bin/"
+	install -m 0755 "$guest_files/cache-relay" "$root/opt/runway/bin/"
+	# The guest's /run is tmpfs: systemd-tmpfiles creates the route directory at boot.
+	mkdir -p "$root/etc/tmpfiles.d"
+	printf 'd /run/runway 0700 runner runner -\n' > "$root/etc/tmpfiles.d/runway-cache.conf"
+	local node
+	for node in "$root"/opt/runway/runner/externals/node{20,24}/bin/node; do
+		[ -f "$node" ] || continue
+		[ -f "$node.real" ] || mv "$node" "$node.real"
+		install -m 0755 "$guest_files/cache-node" "$node"
+	done
 	install -m 0644 "$guest_files/runway-cache-relay.service" "$root/etc/systemd/system/"
 	ln -sf ../runway-cache-relay.service "$root/etc/systemd/system/multi-user.target.wants/runway-cache-relay.service"
 	chown 1001:1001 "$root/opt/runway/runner"
@@ -312,5 +306,5 @@ teardown) shift; teardown "$@" ;;
 reap) reap ;;
 status) status ;;
 ssh) shift; valid_vm "${1:-}"; guest_ssh "$@" ;;
-*) die "usage: prepare-image NAME METAL_IMAGE [WORKER_DIR] | launch VM_ID INDEX [--no-runner] | teardown VM_ID | reap | status | ssh VM_ID [COMMAND]" ;;
+*) die "usage: prepare-image NAME METAL_IMAGE | launch VM_ID INDEX [--no-runner] | teardown VM_ID | reap | status | ssh VM_ID [COMMAND]" ;;
 esac

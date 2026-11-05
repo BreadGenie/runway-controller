@@ -10,17 +10,18 @@ func text(value string) *string { return &value }
 
 const testNonce = "8db8f716-c5da-40e2-9f0a-fb0e4e2bc40d"
 
-func TestSetupWireStrictAndZeroRequestSupported(t *testing.T) {
-	_, c, _, _ := fixture(t)
-	request := SetupRequest{Version: 1, JobID: c.JobID, Nonce: testNonce, RequestID: 0}
+func TestSetupWireStrict(t *testing.T) {
+	request := SetupRequest{Version: 2, Nonce: testNonce}
 	encoded := string(mustJSON(t, request))
-	if got, err := DecodeSetup([]byte(encoded)); err != nil || got.RequestID != 0 {
-		t.Fatal("valid zero request or missing source fields refused", err)
+	if _, err := DecodeSetup([]byte(encoded)); err != nil {
+		t.Fatal("valid setup refused", err)
 	}
 	for _, bad := range []string{
-		strings.Replace(encoded, `"request_id":0`, `"request_id":null`, 1),
-		strings.Replace(encoded, `"request_id":0`, `"request_id":false`, 1),
-		strings.Replace(encoded, `"request_id":0`, `"request_id":0,"request_id":1`, 1),
+		strings.Replace(encoded, `"version":2`, `"version":2,"job_id":"18259e53-743c-49b8-a55b-59564db482a1"`, 1),
+		strings.Replace(encoded, `"version":2`, `"version":2,"request_id":0`, 1),
+		strings.Replace(encoded, `"version":2`, `"version":null`, 1),
+		strings.Replace(encoded, `"version":2`, `"version":1`, 1),
+		strings.Replace(encoded, `"version":2`, `"version":2,"version":2`, 1),
 		strings.Replace(encoded, `"repository":null`, `"repository":null,"repository":null`, 1),
 		strings.Replace(encoded, `"repository":null`, `"Repository":null`, 1),
 		strings.Replace(encoded, `"repository":null`, `"repository":{"token":"secret"}`, 1),
@@ -41,7 +42,7 @@ func TestSetupDerivesScopeOnlyForSupportedVerifiedContext(t *testing.T) {
 		ReadRefs: []string{"refs/heads/unrelated"}, WriteRef: "refs/heads/unrelated",
 	}
 	policy := RepositoryPolicy{RepositoryID: 456, Repository: "owner/repo", DefaultBranch: "main"}
-	request := SetupRequest{Version: 1, JobID: claims.JobID, Nonce: testNonce, Context: SetupContext{
+	request := SetupRequest{Version: 2, Nonce: testNonce, Context: SetupContext{
 		Repository: text("owner/repo"), RepositoryID: text("456"), RunID: text("123"), RunAttempt: text("1"), Ref: text("refs/heads/feature"), RefType: text("branch"), SHA: text(strings.Repeat("a", 40)), EventName: text("workflow_dispatch"),
 	}}
 	token, err := IssueSetup(key, claims.Audience, a, policy, request, clock)
@@ -63,7 +64,6 @@ func TestSetupDerivesScopeOnlyForSupportedVerifiedContext(t *testing.T) {
 		func(r *SetupRequest) { r.Context.RefType = text("tag") },
 		func(r *SetupRequest) { r.Context.BaseRef = text("main") },
 		func(r *SetupRequest) { r.Context.SHA = nil },
-		func(r *SetupRequest) { r.RequestID = 1 },
 	} {
 		bad := request
 		change(&bad)

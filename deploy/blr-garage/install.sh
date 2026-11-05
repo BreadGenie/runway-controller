@@ -1,12 +1,13 @@
 #!/bin/bash
 # Install or upgrade the persistent regional-cache services on blr-1.
-#   install.sh /path/to/runway   (a linux/amd64 build of this repository)
+#   install.sh /path/to/runway /path/to/cache-node (static linux/amd64 builds)
 # Idempotent. Keeps the previous binaries as *.previous for rollback. Never
 # touches metal.service, metald state or its ZFS pool.
 set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
-runway=${1:?usage: install.sh /path/to/runway-binary}
+runway=${1:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
+cache_node=${2:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 # shellcheck source=garage.pin
 . "$here/garage.pin"
@@ -43,7 +44,8 @@ replace "$here/health.sh" /opt/runway-cache/bin/runway-cache-health 0755
 replace "$here/../standalone-guest/runway-standalone-guest" /opt/runway-cache/bin/runway-standalone-guest 0755
 replace "$here/../standalone-guest/setup-probe.py" /opt/runway-cache/bin/runway-setup-probe 0755
 # This branch's guest cache helpers; the launcher copies them into each guest.
-for helper in cache-relay cache-setup; do
+replace "$cache_node" /opt/runway-cache/guest/cache-node 0755
+for helper in cache-relay; do
 	replace "$here/../../integrations/actions-runner/$helper" "/opt/runway-cache/guest/$helper" 0755
 done
 replace "$here/../standalone-guest/runway-cache-relay.service" /opt/runway-cache/guest/runway-cache-relay.service 0644

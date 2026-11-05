@@ -141,7 +141,7 @@ func newAuthorityCase(t *testing.T) *authorityCase {
 		repo: loadGitHubFixture(t, "repo.json"), run: loadGitHubFixture(t, "run.json"), jobs: []map[string]any{jobs},
 		binding: cacheGuestBinding{Version: 1, VMID: "rc-warm", VsockUDS: "/run/runway-cache/vms/rc-warm/v.sock", FirecrackerPID: 4242, GuestCID: 3, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", Repository: fixtureRepository, ExpiresAt: now.Add(3 * time.Hour)},
 		release: cacheJobRelease{JobID: jobID, RequestID: 0, Stop: now.Add(3 * time.Hour)},
-		setup: grant.SetupRequest{Version: 1, JobID: jobID, RequestID: 0, Nonce: "9c0f8e4a-2f7d-4e1b-8a3c-5d6e7f8a9b0c", Context: grant.SetupContext{
+		setup: grant.SetupRequest{Version: 2, Nonce: "9c0f8e4a-2f7d-4e1b-8a3c-5d6e7f8a9b0c", Context: grant.SetupContext{
 			Repository: value(fixtureRepository), RepositoryID: value("580439734"), RunID: value("41867135947"), RunAttempt: value("1"),
 			Ref: value(fixtureRef), RefType: value("branch"), SHA: value(fixtureSHA), EventName: value("workflow_dispatch"), BaseRef: value(""), HeadRef: value(""),
 		}},
@@ -210,7 +210,7 @@ func TestGitHubJobAuthorityGrantsTheBoundRunnersInProgressJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claims.RunID != 41867135947 || claims.RunAttempt != 1 || claims.RepositoryID != 580439734 || claims.JobID != test.setup.JobID || claims.WriteRef != fixtureRef || len(claims.ReadRefs) != 2 || claims.ReadRefs[1] != "refs/heads/develop" {
+	if claims.RunID != 41867135947 || claims.RunAttempt != 1 || claims.RepositoryID != 580439734 || claims.JobID != test.release.JobID || claims.WriteRef != fixtureRef || len(claims.ReadRefs) != 2 || claims.ReadRefs[1] != "refs/heads/develop" {
 		t.Fatalf("wrong grant scope %+v", claims)
 	}
 	if fixture.calls[fixtureJobsPath] != 1 {
@@ -307,8 +307,6 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 		"repository renamed":          {func(c *authorityCase) { c.repo["full_name"] = "BreadGenie/renamed" }, errCacheRepository},
 		"forged run id":               {func(c *authorityCase) { c.setup.Context.RunID = value("41867135948") }, errCacheJobMismatch},
 		"forged run attempt":          {func(c *authorityCase) { c.setup.Context.RunAttempt = value("2") }, errCacheJobMismatch},
-		"forged job uuid":             {func(c *authorityCase) { c.setup.JobID = "11111111-2222-4333-8444-555555555555" }, errCacheJobMismatch},
-		"forged request id":           {func(c *authorityCase) { c.setup.RequestID = 7 }, errCacheJobMismatch},
 		"forged sha":                  {func(c *authorityCase) { c.setup.Context.SHA = value(strings.Repeat("a", 40)) }, errCacheRepository},
 		"pull request": {func(c *authorityCase) {
 			c.run["event"] = "pull_request"
@@ -331,7 +329,7 @@ func TestGitHubJobAuthorityRefusesUnverifiedJobs(t *testing.T) {
 			c.assignments.jobs[c.release.JobID] = record
 		}, errCacheJobMismatch},
 		"request id unknown to the session": {func(c *authorityCase) {
-			c.release.RequestID, c.setup.RequestID = 7, 7
+			c.release.RequestID = 7
 		}, errCacheJobMismatch},
 		"duplicate runner assignment": {func(c *authorityCase) {
 			fixtureJob(c, "runway-cache-test-1104-cold")["runner_id"] = json.Number("219")

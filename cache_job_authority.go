@@ -232,8 +232,8 @@ func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding 
 	if !authority.valid(binding) {
 		return cacheJobGrant{}, grant.ErrInvalid
 	}
-	// The request names the job the gate released; the body is otherwise untrusted.
-	if !canonicalCacheUUID(release.JobID) || release.Stop.IsZero() || setup.JobID != release.JobID || setup.RequestID != release.RequestID {
+	// The gate supplies job identity; setup supplies only untrusted context.
+	if !canonicalCacheUUID(release.JobID) || release.Stop.IsZero() {
 		return cacheJobGrant{}, errCacheJobMismatch
 	}
 	confirmed := release.Confirmed
@@ -259,7 +259,7 @@ func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding 
 		return cacheJobGrant{}, err
 	}
 	// Run event, branch, SHA, attempt and same-repository head (no fork) must
-	// equal the frozen context; PR, tag and fork runs are refused here.
+	// equal the guest context; PR, tag and fork runs are refused here.
 	if err := verifyCacheWorkflowRun(ctx, authority.client, policy, runID, c); err != nil {
 		return cacheJobGrant{}, err
 	}
@@ -273,7 +273,7 @@ func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding 
 		deadline = binding.ExpiresAt
 	}
 	authorization := grant.Authorization{
-		RegionID: authority.regionID, JobID: setup.JobID, RequestID: setup.RequestID,
+		RegionID: authority.regionID, JobID: release.JobID, RequestID: release.RequestID,
 		RunID: runID, RunAttempt: attempt, Deadline: deadline,
 	}
 	return cacheJobGrant{Authorization: authorization, Policy: policy}, nil
