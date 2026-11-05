@@ -1,13 +1,18 @@
 #!/bin/bash
 # Trusted root launcher for standalone disposable Firecracker guests on blr-1.
 #
+#   runway-standalone-guest prepare-image NAME METAL_IMAGE [WORKER_DIR]
 #   runway-standalone-guest launch VM_ID INDEX [--no-runner]
 #   runway-standalone-guest teardown VM_ID
 #   runway-standalone-guest reap        (tear down guests whose VM has stopped)
 #   runway-standalone-guest status
 #   runway-standalone-guest ssh VM_ID [COMMAND...]   (root shell in the guest)
 #
-# launch clones the cached runner image, starts runway-cache-host@VM_ID (the
+# prepare-image copies a Metal image's disk and kernel into the launcher's own
+# store, optionally replacing Runner.Worker.{dll,pdb} from WORKER_DIR. Metal
+# prunes images and kernels it does not use, and newer Metal moves kernels to a
+# digest-named store, so launch never reads Metal's files.
+# launch clones the prepared runner image, starts runway-cache-host@VM_ID (the
 # guest's vsock 1025/1026/1027 host side) and the VM, registers one ephemeral
 # scale-set JIT runner with the host GitHub credential, writes the root-only binding
 # (VM -> Firecracker PID, runner ID/name, repository) and starts the runner.
@@ -19,12 +24,16 @@
 # scale set name, which is the workflow's runs-on label), RUNWAY_SCALE_SET_ID; optional
 # RUNWAY_GUEST_IMAGE, RUNWAY_GUEST_HOURS (default 3, at most the cache-host
 # unit's RuntimeMaxSec), RUNWAY_GUEST_VCPUS (2),
-# RUNWAY_GUEST_MEMORY_MIB (5120). Never touches metal.service or metald state.
+# RUNWAY_GUEST_MEMORY_MIB (5120). Only reads Metal's image store; never touches
+# metal.service or metald state.
 set -euo pipefail
 umask 077
 
-# Rebuilt from the preserved base with this review's tested Runner.Worker.
+# The preserved runner base with this review's tested Runner.Worker.
 image=${RUNWAY_GUEST_IMAGE:-regional-cache-review-20261105}
+image_dataset=metal/runway-images
+image_root=/var/lib/runway-standalone-images
+metal_images=/var/lib/metal/images
 token_file=/etc/runway-cache/github-token
 ssh_key=/var/lib/fc-metal/keys/id_ed25519
 run_root=/run/runway-cache
@@ -35,6 +44,7 @@ hours=${RUNWAY_GUEST_HOURS:-3}
 die() { echo "runway-standalone-guest: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
 valid_vm() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "invalid VM id"; }
+valid_image() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || die "invalid image name"; }
 
 # GitHub REST call with the host credential. The token never appears in argv:
 # printf is a shell builtin and curl reads the header from a pipe.
@@ -51,9 +61,48 @@ guest_ssh() {
 		-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=5 root@172.16.0.2 "$@"
 }
 
+prepare_image() {
+	local name=$1 from=$2 worker=${3:-}
+	valid_image "$name"
+	[[ $from =~ ^sha256:[0-9a-f]{64}$ ]] || die "METAL_IMAGE must be a sha256: image reference"
+	local ds=$image_dataset/$name dir=$image_root/$name kernel digest root
+	! zfs list -H "$ds" >/dev/null 2>&1 && [ ! -e "$dir" ] || die "image $name already exists"
+	if [ -n "$worker" ]; then
+		[ -f "$worker/Runner.Worker.dll" ] && [ -f "$worker/Runner.Worker.pdb" ] || die "WORKER_DIR needs Runner.Worker.dll and .pdb"
+	fi
+	digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_sha256"].lower())' "$metal_images/$from/manifest.json") || die "no manifest for $from"
+	# Older Metal keeps the kernel beside the manifest, newer Metal in kernels/.
+	kernel=$metal_images/$from/vmlinux
+	[ -f "$kernel" ] || kernel=/var/lib/metal/kernels/$digest
+	[ -f "$kernel" ] || die "kernel $digest not found"
+	trap 'echo "runway-standalone-guest: prepare of $name failed; removing it" >&2; mountpoint -q "$dir/root" && umount "$dir/root"; zfs destroy -r "$ds" 2>/dev/null; rm -rf "$dir"' EXIT
+	install -d -m 0700 "$image_root" "$dir"
+	cp "$kernel" "$dir/vmlinux"
+	[ "$(sha256sum "$dir/vmlinux" | cut -c1-64)" = "$digest" ] || die "kernel digest mismatch"
+	# A full copy, not a clone: Metal may destroy its image while guests run.
+	zfs list -H "$image_dataset" >/dev/null 2>&1 || zfs create -o mountpoint=none "$image_dataset"
+	zfs send "metal/images/$from@ready" | zfs receive "$ds"
+	if [ -n "$worker" ]; then
+		udevadm settle
+		root=$dir/root
+		mkdir "$root"
+		mount "/dev/zvol/$ds" "$root"
+		install -m 0644 "$worker/Runner.Worker.dll" "$worker/Runner.Worker.pdb" "$root/opt/runway/runner/bin/"
+		umount "$root"
+		rmdir "$root"
+		zfs destroy "$ds@ready"
+		zfs snapshot "$ds@ready"
+	fi
+	printf '%s worker=%s\n' "$from" "${worker:+$(sha256sum "$worker/Runner.Worker.dll" | cut -c1-64)}" > "$dir/source"
+	trap - EXIT
+	echo "{\"image\":\"$name\",\"from\":\"$from\",\"kernel_sha256\":\"$digest\"}"
+}
+
 launch() {
 	local vm=$1 index=$2 runner=${3:-}
 	valid_vm "$vm"
+	valid_image "$image"
+	zfs list -H "$image_dataset/$image@ready" >/dev/null 2>&1 && [ -f "$image_root/$image/vmlinux" ] || die "image $image not prepared (see prepare-image)"
 	[[ $index =~ ^[1-9]$ ]] || die "INDEX must be 1-9 (selects the veth subnet)"
 	if [ "$runner" != --no-runner ]; then
 		: "${RUNWAY_REPOSITORY:?set RUNWAY_REPOSITORY}" "${RUNWAY_RUNNER_LABEL:?set RUNWAY_RUNNER_LABEL}" "${RUNWAY_SCALE_SET_ID:?set RUNWAY_SCALE_SET_ID}"
@@ -71,7 +120,7 @@ launch() {
 	install -d -m 0700 "$work_root" "$work" "$socket_dir" "$run_root/bindings"
 	echo "$index" > "$work/index"
 
-	zfs clone "metal/images/$image@ready" "$zv"
+	zfs clone "$image_dataset/$image@ready" "$zv"
 	zfs set volsize=40G "$zv"
 	udevadm settle
 	e2fsck -fp "/dev/zvol/$zv" >/dev/null || [ $? -le 1 ]
@@ -125,11 +174,11 @@ YAML
 	ip netns exec "$ns" iptables -t nat -A POSTROUTING -o "$guest_if" -j MASQUERADE
 	ip netns exec "$ns" iptables -t mangle -A FORWARD -o "$guest_if" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-	python3 -I - "$work" "$image" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" <<'PY'
+	python3 -I - "$work" "$image_root/$image/vmlinux" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" <<'PY'
 import json, sys
-work, image, zv, tap, uds, vcpus, memory = sys.argv[1:]
+work, kernel, zv, tap, uds, vcpus, memory = sys.argv[1:]
 config = {
-    "boot-source": {"kernel_image_path": f"/var/lib/metal/images/{image}/vmlinux",
+    "boot-source": {"kernel_image_path": kernel,
                     "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"},
     "drives": [{"drive_id": "rootfs", "path_on_host": f"/dev/zvol/{zv}", "is_root_device": True, "is_read_only": False}],
     "network-interfaces": [{"iface_id": "eth0", "host_dev_name": tap, "guest_mac": "06:00:ac:10:00:02"}],
@@ -256,10 +305,11 @@ status() {
 }
 
 case ${1:-} in
+prepare-image) shift; prepare_image "$@" ;;
 launch) shift; launch "$@" ;;
 teardown) shift; teardown "$@" ;;
 reap) reap ;;
 status) status ;;
 ssh) shift; valid_vm "${1:-}"; guest_ssh "$@" ;;
-*) die "usage: launch VM_ID INDEX [--no-runner] | teardown VM_ID | reap | status | ssh VM_ID [COMMAND]" ;;
+*) die "usage: prepare-image NAME METAL_IMAGE [WORKER_DIR] | launch VM_ID INDEX [--no-runner] | teardown VM_ID | reap | status | ssh VM_ID [COMMAND]" ;;
 esac
