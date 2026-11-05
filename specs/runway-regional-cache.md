@@ -4,6 +4,10 @@ Standalone deployment on blr-1 for actions/cache@0057852b (v4.3.0) and
 setup-node@24997072 (v6.5.0), cache protocol v1. Other traffic keeps its route.
 Only same-repository branch pushes and workflow_dispatch qualify; PRs, forks,
 tags, container jobs and unsupported revisions retain GitHub caching.
+A static external-Node wrapper hashes only supported action candidates and lazily
+selects one job-scoped route over setup wire v2, using GITHUB_* hints verified
+against GitHub REST. The host supplies job identity from the 1025 release.
+The separate Metal runner administrative gate is unchanged.
 A failure before setup also keeps GitHub caching. After setup, a failed
 restore or save is a cache miss or warning, not a retry against GitHub;
 fail-on-cache-miss still fails the job as it would upstream.

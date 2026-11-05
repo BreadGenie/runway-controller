@@ -9,19 +9,14 @@ import (
 	"strings"
 )
 
-// SetupRequest is the maintained runner's cache setup wire format. The runner
-// freezes the original job message context before the administrative gate.
-// Every field is untrusted guest input.
+// SetupRequest contains untrusted guest hints; job identity comes from release.
 type SetupRequest struct {
-	Version   int          `json:"version"`
-	JobID     string       `json:"job_id"`
-	RequestID int64        `json:"request_id"`
-	Nonce     string       `json:"nonce"`
-	Context   SetupContext `json:"context"`
+	Version int          `json:"version"`
+	Nonce   string       `json:"nonce"`
+	Context SetupContext `json:"context"`
 }
 
-// SetupContext contains only allowlisted original GitHub message scalars.
-// A missing GitHub field is represented by null, never manufactured from env.
+// SetupContext contains allowlisted GITHUB_* environment hints.
 type SetupContext struct {
 	Repository   *string `json:"repository"`
 	RepositoryID *string `json:"repository_id"`
@@ -59,7 +54,7 @@ func DecodeSetup(data []byte) (SetupRequest, error) {
 	}
 	decoder = json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&result) != nil || result.Version != 1 || !canonicalUUID(result.JobID) || !canonicalUUID(result.Nonce) || result.RequestID < 0 {
+	if decoder.Decode(&result) != nil || result.Version != 2 || !canonicalUUID(result.Nonce) {
 		return SetupRequest{}, ErrInvalid
 	}
 	return result, nil
@@ -93,11 +88,11 @@ func setupObject(decoder *json.Decoder, depth int) error {
 		}
 		if depth == 0 {
 			switch key {
-			case "version", "request_id":
+			case "version":
 				if _, ok := value.(json.Number); !ok {
 					return ErrInvalid
 				}
-			case "job_id", "nonce":
+			case "nonce":
 				if _, ok := value.(string); !ok {
 					return ErrInvalid
 				}
@@ -115,7 +110,7 @@ func setupObject(decoder *json.Decoder, depth int) error {
 	if end, err := decoder.Token(); err != nil || end != json.Delim('}') {
 		return ErrInvalid
 	}
-	if depth == 0 && (len(seen) != 5 || !seen["version"] || !seen["job_id"] || !seen["request_id"] || !seen["nonce"] || !seen["context"]) {
+	if depth == 0 && (len(seen) != 3 || !seen["version"] || !seen["nonce"] || !seen["context"]) {
 		return ErrInvalid
 	}
 	if depth == 1 {
@@ -137,7 +132,7 @@ func setupObject(decoder *json.Decoder, depth int) error {
 // the default branch, and writes only the job's branch.
 func IssueSetup(key ed25519.PrivateKey, audience string, a Authorization, policy RepositoryPolicy, request SetupRequest, clock Clock) (string, error) {
 	c := request.Context
-	if request.Version != 1 || !canonicalUUID(request.Nonce) || request.JobID != a.JobID || request.RequestID != a.RequestID || c.Repository == nil || policy.Repository != *c.Repository || policy.RepositoryID <= 0 || !decimalEquals(c.RepositoryID, policy.RepositoryID) || !decimalEquals(c.RunID, a.RunID) || !decimalEquals(c.RunAttempt, a.RunAttempt) || c.Ref == nil || c.RefType == nil || *c.RefType != "branch" || c.EventName == nil || (*c.EventName != "push" && *c.EventName != "workflow_dispatch") || !empty(c.BaseRef) || !empty(c.HeadRef) || c.SHA == nil || !commitSHA(*c.SHA) {
+	if request.Version != 2 || !canonicalUUID(request.Nonce) || c.Repository == nil || policy.Repository != *c.Repository || policy.RepositoryID <= 0 || !decimalEquals(c.RepositoryID, policy.RepositoryID) || !decimalEquals(c.RunID, a.RunID) || !decimalEquals(c.RunAttempt, a.RunAttempt) || c.Ref == nil || c.RefType == nil || *c.RefType != "branch" || c.EventName == nil || (*c.EventName != "push" && *c.EventName != "workflow_dispatch") || !empty(c.BaseRef) || !empty(c.HeadRef) || c.SHA == nil || !commitSHA(*c.SHA) {
 		return "", ErrInvalid
 	}
 	if !strings.HasPrefix(*c.Ref, "refs/heads/") || !validRef(*c.Ref) || len(*c.Ref) == len("refs/heads/") || policy.DefaultBranch == "" || !validRef("refs/heads/"+policy.DefaultBranch) {

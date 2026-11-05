@@ -11,7 +11,7 @@ import (
 
 func wireRequest(t *testing.T) []byte {
 	t.Helper()
-	request := SetupRequest{Version: 1, JobID: "18259e53-743c-49b8-a55b-59564db482a1", Nonce: "8427b75b-75ae-48eb-839a-a90528f15511"}
+	request := SetupRequest{Version: 2, Nonce: "8427b75b-75ae-48eb-839a-a90528f15511"}
 	data, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestSetupWireRespondsWithoutGuestHalfClose(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if len(response) != 6 || response["route"] != "http://127.0.0.1:18080/" || response["outcome"] != "enabled" || response["request_id"] != float64(0) {
+	if len(response) != 4 || response["route"] != "http://127.0.0.1:18080/" || response["outcome"] != "enabled" || response["version"] != float64(2) {
 		t.Fatal("response contract changed")
 	}
 }
