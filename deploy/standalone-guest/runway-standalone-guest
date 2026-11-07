@@ -25,7 +25,8 @@
 # scale set name, which is the workflow's runs-on label), RUNWAY_SCALE_SET_ID; optional
 # RUNWAY_GUEST_IMAGE, RUNWAY_GUEST_HOURS (default 3, at most the cache-host
 # unit's RuntimeMaxSec), RUNWAY_GUEST_VCPUS (2),
-# RUNWAY_GUEST_MEMORY_MIB (5120). Only reads Metal's image store; never touches
+# RUNWAY_GUEST_MEMORY_MIB (5120), RUNWAY_GUEST_CLOCKSOURCE (kvm-clock or tsc;
+# unset keeps the guest kernel's choice). Only reads Metal's image store; never touches
 # metal.service or metald state.
 set -euo pipefail
 umask 077
@@ -46,6 +47,7 @@ run_root=/run/runway-cache
 work_root=/var/lib/runway-standalone
 guest_files=/opt/runway-cache/guest
 hours=${RUNWAY_GUEST_HOURS:-3}
+clocksource=${RUNWAY_GUEST_CLOCKSOURCE:-}
 
 die() { echo "runway-standalone-guest: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
@@ -125,6 +127,7 @@ launch() {
 	local base=$((index * 4)) root max_hours
 	# The binding (and so the guest) must not outlive its cache-host process.
 	max_hours=$(sed -n 's/^RuntimeMaxSec=\([0-9]*\)h$/\1/p' /etc/systemd/system/runway-cache-host@.service)
+	case $clocksource in "" | kvm-clock | tsc) ;; *) die "RUNWAY_GUEST_CLOCKSOURCE must be kvm-clock or tsc" ;; esac
 	[[ $hours =~ ^[1-9][0-9]*$ ]] && [ -n "$max_hours" ] && [ "$hours" -le "$max_hours" ] || die "RUNWAY_GUEST_HOURS must be 1-${max_hours:-?}"
 	[ ! -e "$work" ] && [ ! -e "$socket_dir" ] || die "$vm already exists"
 	ip link show "$host_if" >/dev/null 2>&1 && die "index $index in use"
@@ -196,12 +199,16 @@ YAML
 	ip netns exec "$ns" iptables -t nat -A POSTROUTING -o "$guest_if" -j MASQUERADE
 	ip netns exec "$ns" iptables -t mangle -A FORWARD -o "$guest_if" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-	python3 -I - "$work" "$image_root/$image/vmlinux" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" <<'PY'
+	python3 -I - "$work" "$image_root/$image/vmlinux" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" "$clocksource" <<'PY'
 import json, sys
-work, kernel, zv, tap, uds, vcpus, memory = sys.argv[1:]
+work, kernel, zv, tap, uds, vcpus, memory, clocksource = sys.argv[1:]
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+# Nested KVM withholds a stable kvm-clock, so the guest's vDSO falls back to a
+# clock_gettime syscall; tsc restores the fast path where the TSC is stable.
+if clocksource:
+    boot_args += " clocksource=" + clocksource
 config = {
-    "boot-source": {"kernel_image_path": kernel,
-                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"},
+    "boot-source": {"kernel_image_path": kernel, "boot_args": boot_args},
     "drives": [{"drive_id": "rootfs", "path_on_host": f"/dev/zvol/{zv}", "is_root_device": True, "is_read_only": False}],
     "network-interfaces": [{"iface_id": "eth0", "host_dev_name": tap, "guest_mac": "06:00:ac:10:00:02"}],
     "vsock": {"guest_cid": 3, "uds_path": uds},
