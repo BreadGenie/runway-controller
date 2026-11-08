@@ -14,7 +14,7 @@ index ea1bd3c..3c324ec 100644
 +Each pool admits at most its configured concurrency, with an additional fixed pilot limit of four active or cleanup-pending leases per Team. A lease remains capacity-consuming until both the VM is absent and GitHub runner cleanup is reported. This is admission accounting, not billing enforcement.
 diff --git a/central/api/runway.py b/central/api/runway.py
 new file mode 100644
-index 0000000..09909cc
+index 0000000..8c21f7b
 --- /dev/null
 +++ b/central/api/runway.py
 @@ -0,0 +1,56 @@
@@ -75,7 +75,7 @@ index 0000000..09909cc
 +def request_delete(pool: str, owner_id: str, fence: int, lease_id: str) -> dict:
 +	return regional.request_delete(pool, owner_id, fence, lease_id)
 diff --git a/central/hooks.py b/central/hooks.py
-index 3745dc5..c078b53 100644
+index 3745dc5..245f873 100644
 --- a/central/hooks.py
 +++ b/central/hooks.py
 @@ -191,6 +191,7 @@ doc_events = {
@@ -104,6 +104,15 @@ index 3745dc5..c078b53 100644
  	"Team SSH Key": "central.permissions.team_ssh_key_has_permission",
  	"Virtual Machine": "central.permissions.server_has_permission",
  	"IAM Permission Probe": "central.permissions.iam_permission_probe_has_permission",
+@@ -390,6 +395,8 @@ has_permission = {
+ 
+ # --------------------------------
+ 
++auth_hooks = ["central.runway.authenticate_cache"]
++
+ # auth_hooks = [
+ # 	"central.auth.validate"
+ # ]
 diff --git a/central/identity/doctype/team/team.json b/central/identity/doctype/team/team.json
 index 8bc99af..9674310 100644
 --- a/central/identity/doctype/team/team.json
@@ -123,6 +132,67 @@ index 8bc99af..9674310 100644
    }
   ],
   "modified": "2026-09-17 12:00:00.000000",
+diff --git a/central/infrastructure/doctype/region/region.json b/central/infrastructure/doctype/region/region.json
+index d7afe78..4adda26 100644
+--- a/central/infrastructure/doctype/region/region.json
++++ b/central/infrastructure/doctype/region/region.json
+@@ -36,7 +36,9 @@
+   "cargo_base_url",
+   "cargo_registered_at",
+   "cargo_delivery_section",
+-  "cargo_webhook_secret"
++  "cargo_webhook_secret",
++  "cache_service_url",
++  "cache_service_credential"
+  ],
+  "fields": [
+   {
+@@ -231,6 +233,17 @@
+    "fieldname": "region_id",
+    "fieldtype": "Int",
+    "label": "Region ID"
++  },
++  {
++   "fieldname": "cache_service_url",
++   "fieldtype": "Data",
++   "label": "Cache Service URL"
++  },
++  {
++   "fieldname": "cache_service_credential",
++   "fieldtype": "Password",
++   "label": "Cache Service Credential",
++   "read_only": 1
+   }
+  ],
+  "grid_page_length": 50,
+diff --git a/central/infrastructure/doctype/region/region.py b/central/infrastructure/doctype/region/region.py
+index 5c06c1b..5c1b07d 100644
+--- a/central/infrastructure/doctype/region/region.py
++++ b/central/infrastructure/doctype/region/region.py
+@@ -9,13 +9,14 @@ from frappe.model.document import Document
+ 
+ from central.infrastructure.doctype.region.atlas_connection import AtlasConnectionMixin
+ from central.infrastructure.doctype.region.cargo_connection import CargoConnectionMixin
++from central.runway import CacheConnectionMixin
+ from central.integrations.proxy import ProxyClient
+ from central.sso import mint_proxy_token
+ 
+ REGIONAL_SERVICES = ("proxy", "atlas", "cargo")
+ 
+ 
+-class Region(AtlasConnectionMixin, CargoConnectionMixin, Document):
++class Region(AtlasConnectionMixin, CargoConnectionMixin, CacheConnectionMixin, Document):
+ 	"""One region. Its own identity and geography live here; its connection to each
+ 	regional service is a clearly separated half, mixed in from that service's own
+ 	module — `AtlasConnectionMixin` (atlas_connection.py) and `CargoConnectionMixin`
+@@ -60,6 +61,7 @@ class Region(AtlasConnectionMixin, CargoConnectionMixin, Document):
+ 	def validate(self) -> None:
+ 		self.validate_atlas_connection()
+ 		self.validate_cargo_connection()
++		self.validate_cache_connection()
+ 
+ 	@staticmethod
+ 	def get_zone(region: str) -> str:
 diff --git a/central/infrastructure/doctype/runner_lease/__init__.py b/central/infrastructure/doctype/runner_lease/__init__.py
 new file mode 100644
 index 0000000..e69de29
@@ -147,7 +217,7 @@ index 0000000..f28ed7a
 +});
 diff --git a/central/infrastructure/doctype/runner_lease/runner_lease.json b/central/infrastructure/doctype/runner_lease/runner_lease.json
 new file mode 100644
-index 0000000..8589a47
+index 0000000..42dfe5f
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
 @@ -0,0 +1,269 @@
@@ -480,10 +550,10 @@ new file mode 100644
 index 0000000..e69de29
 diff --git a/central/infrastructure/doctype/runner_pool/runner_pool.json b/central/infrastructure/doctype/runner_pool/runner_pool.json
 new file mode 100644
-index 0000000..7e3e952
+index 0000000..491f47f
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_pool/runner_pool.json
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,198 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Pool",
@@ -510,7 +580,8 @@ index 0000000..7e3e952
 +  "controller_owner",
 +  "fence",
 +  "owner_expires_at",
-+  "last_error"
++  "last_error",
++  "regional_cache"
 + ],
 + "fields": [
 +  {
@@ -647,6 +718,12 @@ index 0000000..7e3e952
 +   "label": "Last Error",
 +   "fieldtype": "Small Text",
 +   "read_only": 1
++  },
++  {
++   "fieldname": "regional_cache",
++   "fieldtype": "Check",
++   "label": "Regional Cache",
++   "default": "0"
 +  }
 + ],
 + "permissions": [
@@ -750,7 +827,7 @@ index 0000000..1497f64
 +};
 diff --git a/central/infrastructure/runway.py b/central/infrastructure/runway.py
 new file mode 100644
-index 0000000..3327522
+index 0000000..3273173
 --- /dev/null
 +++ b/central/infrastructure/runway.py
 @@ -0,0 +1,301 @@
@@ -1057,10 +1134,10 @@ index 0000000..3327522
 +	return lease_snapshot(lease)
 diff --git a/central/integrations/runway.py b/central/integrations/runway.py
 new file mode 100644
-index 0000000..b65506a
+index 0000000..41d813a
 --- /dev/null
 +++ b/central/integrations/runway.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,195 @@
 +import frappe
 +from frappe.utils import get_datetime, now_datetime
 +
@@ -1213,6 +1290,9 @@ index 0000000..b65506a
 +
 +
 +def sweep() -> None:
++	from central.runway import reconcile_cache_buckets
++
++	reconcile_cache_buckets()
 +	# A system task repairs only VMs bearing an existing pool and lease identity.
 +	for row in frappe.get_all("Runner Pool", fields=["name", "team"]):
 +		pool = frappe.get_doc("Runner Pool", row.name)
@@ -1281,9 +1361,300 @@ index ae9cdee..0af37f5 100644
 +def runner_lease_has_permission(doc, user: str | None = None, ptype: str | None = None, **kwargs) -> bool:
 +	"""1. Operators inspect leases. 2. Others can only read their authorized Team."""
 +	return _team_field_has_permission(doc, ("server:view",), (), user, ptype)
+diff --git a/central/runway.py b/central/runway.py
+new file mode 100644
+index 0000000..550d62d
+--- /dev/null
++++ b/central/runway.py
+@@ -0,0 +1,256 @@
++"""Narrow regional cache authority. This credential is never a Central API key."""
++
++import secrets
++from hmac import compare_digest
++from ipaddress import IPv6Address
++from urllib.parse import urlsplit
++
++import frappe
++import requests
++
++from central.iam import user_has_operator_bypass
++from central.infrastructure.runway import iso_utc
++from central.integrations.object_storage import BucketInteractions
++from central.services.doctype.team_service.team_service import get_bucket_name
++
++METHODS = {"central.runway.cache_lease", "central.runway.cache_bucket"}
++CACHE_USER = "runway-cache@central.invalid"
++
++
++def authenticate_cache():
++	header = frappe.get_request_header("Authorization", "")
++	# Normal Central API keys contain a colon and retain normal Frappe authentication.
++	if not header.startswith("token ") or ":" in header[6:]:
++		return
++	token = header[6:]
++	cmd = frappe.local.form_dict.get("cmd") or frappe.request.path.removeprefix("/api/method/")
++	if cmd not in METHODS or frappe.request.path != "/api/method/" + cmd or frappe.request.method != "GET":
++		raise frappe.AuthenticationError
++	matches = []
++	for name in frappe.get_all("Region", filters={"status": "Active"}, pluck="name"):
++		region = frappe.get_doc("Region", name)
++		credential = region.get_password("cache_service_credential", raise_exception=False)
++		if credential and compare_digest(token, credential):
++			matches.append(name)
++	if len(matches) != 1:
++		raise frappe.AuthenticationError
++	frappe.local.runway_cache_region = matches[0]
++	# A roleless system user satisfies Frappe's auth hook without operator authority.
++	arguments = frappe.local.form_dict
++	frappe.set_user(CACHE_USER)
++	frappe.local.form_dict = arguments
++
++
++def cache_region():
++	region = getattr(frappe.local, "runway_cache_region", None)
++	if not region or frappe.session.user != CACHE_USER:
++		raise frappe.AuthenticationError
++	return region
++
++
++def respond(body, status=200):
++	# Exact wire keys: no Frappe `message` envelope.
++	frappe.response.update(body)
++	frappe.response["http_status_code"] = status
++
++
++@frappe.whitelist(methods=["GET"])
++def cache_lease(address: str):
++	region = cache_region()
++	try:
++		mesh = IPv6Address(address)
++		if mesh.packed[:2] != b"\xfd\xaa":
++			return respond({"error": "not_found"}, 404)
++		address = str(mesh)
++	except ValueError:
++		return respond({"error": "not_found"}, 404)
++	matches = []
++	for row in frappe.get_all("Runner Lease", filters={"mesh_address": address}, fields=["name", "pool"]):
++		lease = frappe.get_doc("Runner Lease", row.name)
++		pool = frappe.get_doc("Runner Pool", row.pool)
++		if (
++			pool.region == region
++			and lease.vm_id
++			and lease.phase not in ("deleting", "deleted")
++			and lease.deadline
++			and frappe.utils.get_datetime(lease.deadline) > frappe.utils.now_datetime()
++		):
++			matches.append((lease, pool))
++	if len(matches) != 1:
++		return respond({"error": "ambiguous" if matches else "not_found"}, 409 if matches else 404)
++	lease, pool = matches[0]
++	job = None
++	if (
++		lease.job_id
++		or lease.started
++		or lease.workflow_run_id
++		or lease.job_display_name
++		or lease.job_workflow_ref
++		or lease.event_name
++	):
++		job = {
++			"job_id": lease.job_id or "",
++			"request_id": int(lease.request_id or 0),
++			"run_id": int(lease.workflow_run_id or 0),
++			"run_attempt": int(lease.run_attempt or 0),
++			"display_name": lease.job_display_name or "",
++			"workflow_ref": lease.job_workflow_ref or "",
++			"event_name": lease.event_name or "",
++			"started": bool(lease.started),
++		}
++	respond(
++		{
++			"lease": lease.name,
++			"team": lease.team,
++			"tenant_id": int(frappe.db.get_value("Team", lease.team, "tenant_id")),
++			"region": region,
++			"repository": lease.repository
++			or pool.repository_url.removeprefix("https://github.com/").rstrip("/"),
++			"vm_id": lease.vm_id,
++			"mesh_address": address,
++			"runner_id": int(lease.runner_id or 0),
++			"runner_name": lease.runner_name or "",
++			"job": job,
++			"deadline": iso_utc(lease.deadline),
++		}
++	)
++
++
++def bucket_filters(team, region):
++	return {
++		"team": team,
++		"region": region,
++		"add_on_service": "storage",
++		"runway_cache": 1,
++		"bucket_name": get_bucket_name(team, region, "runway-cache"),
++	}
++
++
++@frappe.whitelist(methods=["GET"])
++def cache_bucket(team: str):
++	region = cache_region()
++	if not frappe.db.exists("Team", team):
++		return respond({"error": "not_found"}, 404)
++	name = frappe.db.exists("Team Service", {**bucket_filters(team, region), "status": "Active"})
++	if not name:
++		return respond({"error": "not_found"}, 404)
++	service = frappe.get_doc("Team Service", name)
++	respond(
++		{
++			"team": team,
++			"tenant_id": int(frappe.db.get_value("Team", team, "tenant_id")),
++			"bucket": service.bucket_name,
++			"endpoint": service.endpoint_url,
++			"region": service.region,
++			"access_key": service.access_key,
++			"secret_key": service.get_password("secret_access_key"),
++		}
++	)
++
++
++def reconcile_cache_buckets():
++	# Run outside document-save transactions. Frappe locks a pool before its hooks;
++	# reconciling there would invert the Team -> Pool order used by lease admission.
++	pairs = {(row.team, row.region) for row in frappe.get_all("Runner Pool", fields=["team", "region"])}
++	for row in frappe.get_all(
++		"Team Service",
++		filters={"add_on_service": "storage", "runway_cache": 1},
++		fields=["team", "region", "bucket_name"],
++	):
++		if row.region:
++			pairs.add((row.team, row.region))
++	for team, region in sorted(pairs):
++		# A new transaction also discards the enumeration's repeatable-read snapshot.
++		frappe.db.commit()
++		try:
++			reconcile_cache_bucket(team, region)
++			frappe.db.commit()
++		except Exception:
++			frappe.db.rollback()
++			# No credentials or upstream response bodies in logs.
++			frappe.logger().warning(
++				"Runway cache reconciliation failed for team %s region %s; retry pending", team, region
++			)
++
++
++def reconcile_cache_bucket(team, region):
++	# Team lock serializes reconciliations, including first create. Pool reads use
++	# current locking reads rather than an older repeatable-read snapshot.
++	frappe.db.get_value("Team", team, "name", for_update=True)
++	filters = bucket_filters(team, region)
++	name = frappe.db.get_value("Team Service", filters, "name", for_update=True)
++	enabled = frappe.db.get_value(
++		"Runner Pool",
++		{"team": team, "region": region, "status": "Active", "regional_cache": 1},
++		"name",
++		for_update=True,
++	)
++	if enabled and not name:
++		frappe.get_doc({"doctype": "Team Service", **filters}).insert(ignore_permissions=True)
++	elif name and not enabled:
++		service = frappe.get_doc("Team Service", name, for_update=True)
++		client = BucketInteractions(service).client
++		# Only this dedicated cache namespace is disposable. Failures retain the Team
++		# Service and its credentials, so a later reconciliation can finish draining.
++		for page in client.get_paginator("list_objects_v2").paginate(Bucket=service.bucket_name):
++			objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
++			if objects:
++				result = client.delete_objects(
++					Bucket=service.bucket_name, Delete={"Objects": objects, "Quiet": True}
++				)
++				if result.get("Errors"):
++					frappe.throw("Cache bucket cleanup failed; retry reconciliation.")
++		service.delete(ignore_permissions=True)
++
++
++class CacheConnectionMixin:
++	def validate_cache_connection(self):
++		self.cache_service_url = (self.cache_service_url or "").strip().rstrip("/")
++		if self.cache_service_url:
++			url = urlsplit(self.cache_service_url)
++			if (
++				url.scheme != "https"
++				or not url.hostname
++				or url.username
++				or url.password
++				or url.query
++				or url.fragment
++			):
++				frappe.throw("Cache service URL must be HTTPS without credentials, query or fragment.")
++
++	@frappe.whitelist(methods=["POST"])
++	def enroll_cache(self):
++		if not user_has_operator_bypass():
++			raise frappe.PermissionError
++		self.check_permission("write")
++		self.flags.for_update = True
++		self.reload()
++		self.validate_cache_connection()
++		if not self.cache_service_url:
++			frappe.throw("Set the cache service URL first.")
++		if not frappe.db.exists("User", CACHE_USER):
++			frappe.get_doc(
++				{
++					"doctype": "User",
++					"email": CACHE_USER,
++					"first_name": "Runway Cache",
++					"user_type": "System User",
++					"enabled": 0,
++					"send_welcome_email": 0,
++				}
++			).insert(ignore_permissions=True, ignore_if_duplicate=True)
++		credential = secrets.token_urlsafe(32)
++		from central.sso import central_url, mint_cargo_token
++
++		# Same regional management JWT trust used to enrol Cargo; never authenticate configure with the new secret itself.
++		response = requests.post(
++			self.cache_service_url + "/configure",
++			headers={"X-Cargo-Access-Token": mint_cargo_token(self.get_atlas_region_id())},
++			json={"central_url": central_url(), "region": self.name, "credential": credential},
++			timeout=(5, 20),
++			allow_redirects=False,
++		)
++		if response.status_code != 200 or response.json() != {"configured": True}:
++			frappe.throw("Cache service rejected configuration.")
++		self.cache_service_credential = credential
++		self.save()
+diff --git a/central/services/doctype/team_service/team_service.json b/central/services/doctype/team_service/team_service.json
+index c91f242..127e2fb 100644
+--- a/central/services/doctype/team_service/team_service.json
++++ b/central/services/doctype/team_service/team_service.json
+@@ -18,7 +18,8 @@
+   "endpoint_url",
+   "credentials_section",
+   "access_key",
+-  "secret_access_key"
++  "secret_access_key",
++  "runway_cache"
+  ],
+  "fields": [
+   {
+@@ -105,6 +106,14 @@
+    "fieldtype": "Password",
+    "label": "Secret Access Key",
+    "read_only": 1
++  },
++  {
++   "fieldname": "runway_cache",
++   "fieldtype": "Check",
++   "label": "Runway Cache",
++   "default": "0",
++   "read_only": 1,
++   "hidden": 1
+   }
+  ],
+  "grid_page_length": 50,
 diff --git a/central/tests/test_runway.py b/central/tests/test_runway.py
 new file mode 100644
-index 0000000..880e932
+index 0000000..b12dfb6
 --- /dev/null
 +++ b/central/tests/test_runway.py
 @@ -0,0 +1,444 @@
@@ -1731,6 +2102,314 @@ index 0000000..880e932
 +		with patch.object(regional, "client_for_pool", return_value=client):
 +			regional.remove_orphans(self.pool)
 +		client.vm_action.assert_called_once_with("orphan", "terminate")
+diff --git a/central/tests/test_runway_cache.py b/central/tests/test_runway_cache.py
+new file mode 100644
+index 0000000..2825f76
+--- /dev/null
++++ b/central/tests/test_runway_cache.py
+@@ -0,0 +1,302 @@
++import json
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++from unittest.mock import Mock, patch
++
++import frappe
++
++from central import runway as cache
++from central.tests import test_runway
++
++
++class TestRunwayCache(test_runway.TestRunway):
++	def setUp(self):
++		super().setUp()
++		self.addCleanup(lambda: setattr(frappe.local, "runway_cache_region", None))
++
++	def cleanup_records(self):
++		frappe.db.rollback()
++		frappe.db.delete("Team Service", {"team": self.team.name, "runway_cache": 1})
++		frappe.db.commit()
++		super().cleanup_records()
++
++	def authorize_cache(self):
++		frappe.local.runway_cache_region = self.region.name
++		frappe.set_user(cache.CACHE_USER)
++		frappe.local.response = frappe._dict()
++
++	def test_lease_exact_shape_and_unknown_attempt(self):
++		lease = self.reserve()
++		frappe.db.set_value(
++			"Runner Lease",
++			lease["id"],
++			{
++				"vm_id": "vm-1",
++				"mesh_address": "fdaa::1",
++				"phase": "running",
++				"job_id": "job-uuid",
++				"workflow_run_id": "12",
++				"run_attempt": "0",
++				"job_display_name": "build",
++				"job_workflow_ref": "example/ci/.github/workflows/x.yml@refs/heads/main",
++				"event_name": "push",
++				"started": 0,
++			},
++		)
++		self.authorize_cache()
++		cache.cache_lease("fdaa::1")
++		result = dict(frappe.response)
++		self.assertEqual(
++			set(result),
++			{
++				"http_status_code",
++				"lease",
++				"team",
++				"tenant_id",
++				"region",
++				"repository",
++				"vm_id",
++				"mesh_address",
++				"runner_id",
++				"runner_name",
++				"job",
++				"deadline",
++			},
++		)
++		self.assertEqual(
++			result["job"],
++			{
++				"job_id": "job-uuid",
++				"request_id": 0,
++				"run_id": 12,
++				"run_attempt": 0,
++				"display_name": "build",
++				"workflow_ref": "example/ci/.github/workflows/x.yml@refs/heads/main",
++				"event_name": "push",
++				"started": False,
++			},
++		)
++		from frappe.utils.response import build_response
++
++		wire = json.loads(build_response("json").get_data())
++		self.assertEqual(set(wire), set(result) - {"http_status_code"})
++		frappe.set_user("Administrator")
++		frappe.db.set_value(
++			"Runner Lease",
++			lease["id"],
++			{
++				"job_id": "",
++				"started": 0,
++				"workflow_run_id": "",
++				"job_display_name": "",
++				"job_workflow_ref": "",
++				"event_name": "",
++				"run_attempt": "",
++			},
++		)
++		self.authorize_cache()
++		cache.cache_lease("fdaa::1")
++		self.assertIsNone(frappe.response["job"])
++
++	def test_lease_missing_ambiguous_and_region(self):
++		lease = self.reserve()
++		frappe.db.set_value(
++			"Runner Lease", lease["id"], {"vm_id": "vm-1", "mesh_address": "fdaa::1", "phase": "running"}
++		)
++		self.authorize_cache()
++		cache.cache_lease("fdaa::2")
++		self.assertEqual(frappe.response["http_status_code"], 404)
++		frappe.local.runway_cache_region = "other-region"
++		cache.cache_lease("fdaa::1")
++		self.assertEqual(frappe.response["http_status_code"], 404)
++		frappe.local.runway_cache_region = self.region.name
++		with patch.object(
++			frappe, "get_all", return_value=[frappe._dict(name=lease["id"], pool=self.pool.name)] * 2
++		):
++			cache.cache_lease("fdaa::1")
++		self.assertEqual(frappe.response["http_status_code"], 409)
++
++	def test_auth_is_narrow(self):
++		region = Mock()
++		region.get_password.return_value = "right"
++		request = Mock(path="/api/method/central.runway.cache_lease", method="GET")
++		with (
++			patch.object(frappe, "get_request_header", return_value="token right"),
++			patch.object(frappe, "get_all", return_value=["region"]),
++			patch.object(frappe, "get_doc", return_value=region),
++			patch.object(frappe.local, "request", request, create=True),
++			patch.object(frappe.local, "form_dict", frappe._dict(address="fdaa::1"), create=True),
++		):
++			cache.authenticate_cache()
++			self.assertEqual(frappe.local.runway_cache_region, "region")
++			self.assertEqual(frappe.local.form_dict.address, "fdaa::1")
++			region.get_password.return_value = "wrong"
++			with self.assertRaises(frappe.AuthenticationError):
++				cache.authenticate_cache()
++			region.get_password.return_value = "right"
++			request.path = "/api/method/frappe.client.get"
++			with self.assertRaises(frappe.AuthenticationError):
++				cache.authenticate_cache()
++			request.path = "/api/method/central.runway.cache_lease"
++			request.method = "POST"
++			with self.assertRaises(frappe.AuthenticationError):
++				cache.authenticate_cache()
++		frappe.set_user("Administrator")
++		with self.assertRaises(frappe.AuthenticationError):
++			cache.cache_lease("fdaa::1")
++
++	def test_bucket_exact_shape_and_missing(self):
++		self.authorize_cache()
++		cache.cache_bucket(self.team.name)
++		self.assertEqual(frappe.response["http_status_code"], 404)
++		frappe.local.response = frappe._dict()
++		service = Mock(
++			bucket_name="bucket",
++			endpoint_url="https://s3.example.test",
++			region=self.region.name,
++			access_key="key",
++		)
++		service.get_password.return_value = "secret"
++		with (
++			patch.object(frappe.db, "exists", return_value="service"),
++			patch.object(frappe, "get_doc", return_value=service),
++		):
++			cache.cache_bucket(self.team.name)
++		self.assertEqual(
++			set(frappe.response),
++			{
++				"http_status_code",
++				"team",
++				"tenant_id",
++				"bucket",
++				"endpoint",
++				"region",
++				"access_key",
++				"secret_key",
++			},
++		)
++		self.assertEqual(frappe.response["secret_key"], "secret")
++
++	def test_enrolment_and_rotation(self):
++		self.region.cache_service_url = "https://cache.example.test"
++		self.region.save()
++		with (
++			patch(
++				"central.runway.requests.post",
++				return_value=Mock(status_code=200, json=lambda: {"configured": True}),
++			) as post,
++			patch("central.sso.mint_cargo_token", return_value="management-jwt"),
++		):
++			self.region.enroll_cache()
++			first = self.region.get_password("cache_service_credential")
++			self.region.enroll_cache()
++			second = self.region.get_password("cache_service_credential")
++			self.assertNotEqual(first, second)
++			self.assertEqual(
++				post.call_args.kwargs["json"],
++				{
++					"central_url": post.call_args.kwargs["json"]["central_url"],
++					"region": self.region.name,
++					"credential": second,
++				},
++			)
++			self.assertFalse(post.call_args.kwargs["allow_redirects"])
++		frappe.db.commit()
++		site = frappe.local.site
++
++		def http_reads():
++			from frappe.app import application
++			from werkzeug.test import Client
++
++			client = Client(application)
++			headers = {"X-Frappe-Site-Name": site, "Authorization": "token " + second}
++			missing = client.get("/api/method/central.runway.cache_lease?address=fdaa::1", headers=headers)
++			forbidden = client.get("/api/method/frappe.auth.get_logged_user", headers=headers)
++			headers["Authorization"] = "token " + first
++			old = client.get(
++				"/api/method/central.runway.cache_bucket?team=" + self.team.name, headers=headers
++			)
++			return missing.status_code, missing.json, forbidden.status_code, old.status_code
++
++		with ThreadPoolExecutor(max_workers=1) as executor:
++			status, body, forbidden, old = executor.submit(http_reads).result(timeout=30)
++		self.assertEqual((status, body), (404, {"error": "not_found"}))
++		self.assertEqual(forbidden, 401)
++		self.assertEqual(old, 401)
++
++	def test_saved_pool_flags_share_one_team_service(self):
++		from central.services.doctype.team_service.team_service import TeamService
++
++		storage = Mock()
++		storage.create_bucket.return_value = {
++			"credentials": {"access_key": "key", "secret_access_key": "secret"}
++		}
++		# External Cargo and the billing catalog are outside this lifecycle test.
++		# Leave the real Team Service insert, encrypted credentials and delete hooks in place.
++		root = "central.services.doctype.team_service.team_service."
++		with (
++			patch(root + "ObjectStorageClient.from_region", return_value=storage),
++			patch(root + "get_storage_plan", return_value="test-plan"),
++			patch(root + "get_storage_endpoint_url", return_value="https://s3.example.test"),
++			patch(root + "provision_service_subscription", return_value={"subscription": None}),
++			patch.object(TeamService, "validate"),
++			patch.object(TeamService, "_validate_links"),
++			patch("central.runway.BucketInteractions") as objects,
++		):
++			objects.return_value.client.get_paginator.return_value.paginate.return_value = []
++			self.pool.reload()
++			self.pool.regional_cache = 1
++			self.pool.save()
++			frappe.db.commit()
++			site, sites_path = frappe.local.site, frappe.local.sites_path
++			team, region = self.team.name, self.region.name
++			barrier = Barrier(2)
++
++			def reconcile():
++				frappe.init(site=site, sites_path=sites_path)
++				frappe.connect()
++				frappe.set_user("Administrator")
++				try:
++					barrier.wait(timeout=10)
++					cache.reconcile_cache_bucket(team, region)
++					frappe.db.commit()
++				finally:
++					frappe.destroy()
++
++			with ThreadPoolExecutor(max_workers=2) as executor:
++				list(executor.map(lambda _: reconcile(), range(2)))
++			filters = cache.bucket_filters(self.team.name, self.region.name)
++			service = frappe.db.exists("Team Service", filters)
++			self.assertTrue(service)
++			self.authorize_cache()
++			cache.cache_bucket(self.team.name)
++			self.assertEqual(frappe.response["secret_key"], "secret")
++			frappe.local.runway_cache_region = "another-region"
++			frappe.local.response = frappe._dict()
++			cache.cache_bucket(self.team.name)
++			self.assertEqual(frappe.response["http_status_code"], 404)
++			frappe.set_user("Administrator")
++			other = frappe.copy_doc(self.pool)
++			other.title = "second pool"
++			other.insert()
++			cache.reconcile_cache_bucket(self.team.name, self.region.name)
++			self.pool.regional_cache = 0
++			self.pool.save()
++			cache.reconcile_cache_bucket(self.team.name, self.region.name)
++			self.assertEqual(frappe.db.exists("Team Service", filters), service)
++			storage.create_bucket.assert_called_once()
++			other.delete()
++			objects.return_value.client.get_paginator.return_value.paginate.return_value = [
++				{"Contents": [{"Key": "cached-object"}]}
++			]
++			objects.return_value.client.delete_objects.return_value = {"Errors": [{"Key": "cached-object"}]}
++			with self.assertRaises(frappe.ValidationError):
++				cache.reconcile_cache_bucket(self.team.name, self.region.name)
++			self.assertTrue(frappe.db.exists("Team Service", filters))
++			objects.return_value.client.delete_objects.return_value = {}
++			cache.reconcile_cache_buckets()
++			self.assertFalse(frappe.db.exists("Team Service", filters))
++			storage.delete_bucket.assert_called_once_with(filters["bucket_name"])
++			self.pool.save()
++			cache.reconcile_cache_bucket(self.team.name, self.region.name)
++			storage.delete_bucket.assert_called_once()
 diff --git a/spec/README.md b/spec/README.md
 index f47455c..287a37b 100644
 --- a/spec/README.md
@@ -1746,10 +2425,10 @@ index f47455c..287a37b 100644
  - [IAM](IAM.md): Central identity and permission model.
 diff --git a/spec/RUNWAY.md b/spec/RUNWAY.md
 new file mode 100644
-index 0000000..4d7234d
+index 0000000..23765fc
 --- /dev/null
 +++ b/spec/RUNWAY.md
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,72 @@
 +# Runway internal runner pilot
 +
 +## Purpose
@@ -1797,3 +2476,28 @@ index 0000000..4d7234d
 +Runner Lease records repository, request labels, run attempt (when known), job display name, job workflow ref and event name from available, assigned, started and completed events. The assigned event enriches identity without advancing the lease phase. The started snapshot flag is set only by a started event. A direct assignment can have request ID zero and reveal job identity only after VM creation and runner registration. Missing evidence preserves earlier observations; conflicting nonempty runner, job, workflow, repository, labels or positive request IDs are refused. Started events require a running lease; the controller first resolves an interrupted bootstrap acknowledgment when needed.
 +
 +This recording contract does not establish repository/image compatibility before VM creation. The controller must continue provisioning from demand even when job identity has not arrived.
++
++## Regional cache
++
++Runner Pool `regional_cache` defaults off. The pool sweep reconciles one marked
++Team Service bucket per Team/region, named `<tenant>-<region>-runway-cache`.
++It drains and deletes it after the last Active flagged pool disappears. Team
++locking serializes reconciles; ordinary buckets are never adopted or drained.
++Use existing storage usage/quota/rotation and billing machinery. Lifecycle is
++eventual, outside document-save transactions, to avoid reversing lease locks.
++
++Region `cache_service_url` is HTTPS. Operator `enroll_cache` POSTs `/configure`
++using the regional `X-Cargo-Access-Token` management JWT (Cargo audience and trust
++rules). JSON has exactly `central_url`, `region`, `credential`; success is HTTP
++200 with exactly `{"configured": true}`. Re-enrolment rotates the read credential.
++The service must implement this contract; no Cargo modifications are required.
++
++`Authorization: token <credential>` permits only GET `central.runway.cache_lease`
++(address) and `central.runway.cache_bucket` (team). Raw JSON has no Frappe wrapper.
++Lease keys: lease, team, tenant_id, region, repository, vm_id, mesh_address,
++runner_id, runner_name, job, deadline. Job is null before assignment/start;
++otherwise keys are job_id, request_id, run_id, run_attempt, display_name,
++workflow_ref, event_name, started. Attempt zero is unknown, never inferred.
++Bucket keys: team, tenant_id, bucket, endpoint, region, access_key, secret_key.
++Reads are region-scoped; 404 means no result, 409 means ambiguous lease.
++Errors have exactly `error` (`not_found` or `ambiguous`).

@@ -23,3 +23,56 @@ For an existing pilot installation, update the Central code and migrate the new 
 JobAssigned evidence is attached only by an existing positive request ID or job UUID; the SDK message contains no runner name or ID. Ambiguous matches are refused and unmatched messages are ignored. Direct dispatch with request ID zero becomes attributable at JobStarted; a later JobAssigned can enrich that lease. No lease is selected merely because it is the only active lease.
 
 The Central patch adds immutable `run_attempt`, `job_display_name`, `job_workflow_ref`, and `event_name` fields to `update_lease` and snapshots, plus a monotonic `started` snapshot flag set only by JobStarted (bootstrap alone does not establish a job start). The pinned scale-set SDK exposes no run attempt, so it remains unset; no attempt is inferred. Missing evidence preserves prior values. Migrate Central before deploying this controller. Replayed assigned/started evidence produces no update when nothing changes.
+
+## Regional cache (issue 04)
+
+Runner Pool `regional_cache` defaults off. The existing ten-second pool sweep
+ensures one `<tenant>-<region>-runway-cache` Team Service per Team/region with an
+Active flagged pool. Team-row locks and current pool reads serialize concurrent
+reconciliation; two pools share a bucket. The hidden `Team Service.runway_cache`
+ownership marker prevents adoption or removal of ordinary user buckets. Quota,
+usage, billing and key rotation use the existing Team Service/storage API.
+
+After the last flagged pool is disabled or deleted, reconciliation drains only
+that marked cache bucket over S3, then uses Team Service's deletion hook. It also
+scans marked services so deleting the last pool cannot strand its bucket.
+Failures retain the record and keys for retry; Cargo's nonempty-bucket guard
+remains in force. Lifecycle is eventual, normally one scheduler tick, outside
+pool-save transactions to preserve the Team-before-Pool lease-admission lock
+order. An uncertain Cargo create receipt may require operator recovery;
+deterministic names prevent a second bucket or takeover.
+
+Save an HTTPS `cache_service_url` on Region, then invoke the operator-only
+`enroll_cache` document method. Repeat to rotate its credential. Central POSTs
+`/configure` with `X-Cargo-Access-Token`, using the existing regional management
+JWT trust, and exactly `{central_url, region, credential}`. Success is HTTP 200
+with exactly `{"configured": true}`; redirects are refused. The cache service
+must implement this contract; Cargo needs no change. A timeout or Central
+rollback after remote acceptance requires re-enrolment.
+
+The opaque read token permits only GET `central.runway.cache_lease` (address)
+and `central.runway.cache_bucket` (team), with raw JSON and no `message` envelope.
+A disabled, roleless service identity (`runway-cache@central.invalid`) exists
+solely for this restricted auth hook; it receives no Central role or team.
+Reads always check the credential's region. Job evidence preserves unknown
+`run_attempt: 0`; `job` is null before assignment/start. Missing reads return 404,
+ambiguous leases 409, with exactly an `error` key on these responses. See the
+patched `spec/RUNWAY.md` for response keys and configure details.
+
+Migrate Region, Runner Pool, Runner Lease and Team Service, then run both
+`central.tests.test_runway` and `central.tests.test_runway_cache` on a separate
+test site. Cache tests cover real database lifecycle and concurrent reconciles;
+Cargo/S3 and the billing catalog are mocked. No regional hosts are contacted.
+
+From the bench, the integration commands are:
+
+```sh
+bench --site central-runway-test.localhost run-tests --module central.tests.test_runway
+bench --site central-runway-test.localhost run-tests --module central.tests.test_runway_cache
+```
+
+For an isolated source copy, put the patched checkout first in `PYTHONPATH` and
+run the bench's Python with `-m frappe.utils.bench_helper frappe` from its `sites`
+directory. Reload the test-site DocTypes from that copy first; this avoids
+modifying the dirty pilot checkout. Use the vendored MariaDB 11.8.6 for the local
+bench data directory. The cache test module also inherits the pilot lease tests.
