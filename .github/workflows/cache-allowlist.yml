@@ -79,7 +79,7 @@ jobs:
           printf '\n## Evidence\n\nBefore: these major-tag targets were absent from the allowlist. After: candidate hashes pass the checks below.\n\nVerified with go vet, go test -race ./..., Python suites and pinned-client relay scenarios.\n\n' >> "$body"
           cat "$RUNNER_TEMP/client-results.txt" >> "$body"
           printf '\nWorkflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$body"
-          printf '\n## Merge Danger\n\n**Door:** two-way; revert added entries and rebuild the wrapper.\n\n**Blast Radius:** cache; newly pinned bundles become eligible for regional routing after deployment.\n' >> "$body"
+          printf '\n## Merge Danger\n\n**Door:** two-way; revert added entries and redeploy the controller.\n\n**Blast Radius:** cache; newly pinned bundles become eligible on fresh managed guests after the next controller deploy; no image rebuild is needed.\n' >> "$body"
           git switch -C "$BRANCH"
           git add cmd/cache-node/allowlist.json
           git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "feat(cache): allowlist verified action releases"

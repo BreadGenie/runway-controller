@@ -284,6 +284,21 @@ assert_exact_pinned_store() {
   printf '%s\n' "$expected_ids"
 }
 
+# A cache-capable image ships helpers but no clone-specific cache configuration.
+if grep -qs '^CACHE_NODE_VERSION=' /etc/runway-runner-image.txt; then
+  expected_cache_sha=$(awk -F= '$1 == "CACHE_NODE_SHA256" {print $2}' /etc/runway-runner-image.txt)
+  [[ $expected_cache_sha =~ ^[0-9a-f]{64}$ ]] || { echo 'Invalid cache-node manifest digest.' >&2; exit 1; }
+  for version in node20 node24; do
+    node=$runner/externals/$version/bin/node
+    [[ -f $node && ! -L $node && -x $node.real ]] || { echo 'Missing baked cache-node or node.real.' >&2; exit 1; }
+    printf '%s  %s\n' "$expected_cache_sha" "$node" | sha256sum --check --status
+    [[ $("$node" --runway-cache-version) == 'cache-node/v1 allowlist/v1' ]] || exit 1
+  done
+  [[ -x /opt/runway/bin/cache-relay && -f /etc/systemd/system/runway-cache-relay.service ]] || {
+    echo 'Missing baked cache relay or unit.' >&2; exit 1;
+  }
+fi
+
 # Docker client configuration is removed on both paths, alongside the SSH host keys
 # below: anything a job or the bake wrote there is not image content. On the
 # preserving path the removal happens only after the guard above has checked that
@@ -347,6 +362,11 @@ else
   rm -rf "$docker_data_root" /var/lib/containerd
 fi
 
+if grep -qs '^CACHE_NODE_VERSION=' /etc/runway-runner-image.txt; then
+  systemctl disable --now runway-cache-relay.service
+  rm -f /etc/runway/cache.json /etc/runway/cache-ca.pem /etc/runway/cache-allowlist.json
+  rm -rf /run/runway
+fi
 systemctl stop atlas-metadata.service
 # sshd has to be stopped before the host keys go, not merely after. sshd regenerates a
 # missing host key when it starts, so deleting the files while it is still running leaves

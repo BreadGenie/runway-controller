@@ -14,12 +14,31 @@ The tested builder uses one vCPU, 2 GiB RAM, and a 4 GiB disk. On a small Metal 
 
 Create a new VM through `scripts/atlas-vm.py`, using an explicit source image and a new creation journal. The builder must never receive JIT material or run a GitHub job. A used runner cannot become a shared image, even if its registration files are later removed.
 
-Copy the guest installer, the sealing script, and any profile script into the builder. Run these commands as root **inside that guest**:
+Build the static cache wrapper from the reviewed Runway checkout on the controller/build machine:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o cache-node ./cmd/cache-node
+```
+
+Copy `cache-node`, `integrations/actions-runner/cache-relay`, and
+`deploy/standalone-guest/runway-cache-relay.service` beside
+`guest/install-guest-runner.sh` in the builder, along with the sealing script
+and any profile script. The installer requires these inputs and checks the
+wrapper's version protocol before changing the guest. Run these commands as root **inside that guest**:
 
 ```sh
 bash install-guest-runner.sh --inside-disposable-guest
 bash seal-runner-image.sh --inside-unregistered-image-builder
 ```
+
+The installer preserves both external node20/node24 executables as `node.real`
+and installs root-owned 0755 cache-node wrappers over `node`. It installs the
+root-owned relay under `/opt/runway/bin/cache-relay` and its 0644 systemd unit,
+disabled and stopped. The image contains no service config, pinned CA or external
+allowlist; the relay stays inert until prepare opts in. The manifest
+`/etc/runway-runner-image.txt` records `CACHE_NODE_VERSION` (binary/schema protocol)
+and `CACHE_NODE_SHA256`. Sealing checks both wrappers against that digest and
+version, disables the relay, and removes any clone-specific cache configuration.
 
 The installer checks runner execution and Docker access. The sealing script refuses a registered runner, stops guest services, clears Docker state, SSH identities, cloud-init instance data, machine identity, logs, package caches, and user history. It leaves Docker enabled for a new clone's first boot.
 

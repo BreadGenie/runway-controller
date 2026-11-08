@@ -81,6 +81,11 @@ GUEST_PATHS = (
     '/var/lib/containerd',
     '/var/lib/docker',
     '/etc/runway-runner-image.txt',
+    '/etc/runway/cache.json',
+    '/etc/runway/cache-allowlist.json',
+    '/etc/runway/cache-ca.pem',
+    '/etc/systemd/system/runway-cache-relay.service',
+    '/run/runway',
     '/etc/runway-container-images.json',
     '/etc/runway-frappe-bench.json',
     '/etc/machine-id',
@@ -797,6 +802,39 @@ class PrepareRecipeTests(Harness):
 class SealTests(Harness):
     def seal(self, *extra, euid=0):
         return self.run_script(SEAL, [BUILDER_FLAG, *extra], euid=euid, name='seal.sh')
+
+    def cache_capable_guest(self):
+        self.fresh_guest()
+        wrapper = '#!/bin/sh\necho "cache-node/v1 allowlist/v1"\n'
+        for version in ('node20', 'node24'):
+            base = '/home/runner/actions-runner/externals/' + version + '/bin/'
+            self.touch(base + 'node', wrapper)
+            self.touch(base + 'node.real', '#!/bin/sh\nexit 0\n')
+            for name in ('node', 'node.real'):
+                Path(self.root + base + name).chmod(0o755)
+        self.touch('/opt/runway/bin/cache-relay', 'relay')
+        Path(self.root + '/opt/runway/bin/cache-relay').chmod(0o755)
+        self.touch('/etc/systemd/system/runway-cache-relay.service', 'unit')
+        with Path(self.root + '/etc/runway-runner-image.txt').open('a') as stream:
+            stream.write('CACHE_NODE_VERSION=cache-node/v1 allowlist/v1\nCACHE_NODE_SHA256='
+                         + hashlib.sha256(wrapper.encode()).hexdigest() + '\n')
+
+    def test_cache_capable_seal_disables_relay_and_removes_clone_config(self):
+        self.cache_capable_guest()
+        for name in ('cache.json', 'cache-ca.pem', 'cache-allowlist.json'):
+            self.touch('/etc/runway/' + name, 'clone configuration')
+        result = self.seal()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('systemctl disable --now runway-cache-relay.service', self.calls('systemctl'))
+        for name in ('cache.json', 'cache-ca.pem', 'cache-allowlist.json'):
+            self.assertFalse(Path(self.root + '/etc/runway/' + name).exists())
+        self.assertTrue(Path(self.root + '/opt/runway/bin/cache-relay').exists())
+
+    def test_cache_capable_seal_refuses_changed_wrapper(self):
+        self.cache_capable_guest()
+        self.touch('/home/runner/actions-runner/externals/node24/bin/node', '#!/bin/sh\nexit 1\n')
+        self.assertNotEqual(self.seal().returncode, 0)
+        self.assertNotIn('systemctl disable --now runway-cache-relay.service', self.calls('systemctl'))
 
     def test_default_seal_wipes_the_container_store(self):
         self.fresh_guest()

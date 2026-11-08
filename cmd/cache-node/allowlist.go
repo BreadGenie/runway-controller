@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -87,4 +88,27 @@ func loadAllowlist(data []byte) map[string]map[string]bool {
 		}
 	}
 	return result
+}
+
+const allowlistPath = "/etc/runway/cache-allowlist.json"
+
+// A present override is authoritative, including when it is unsafe or invalid.
+// Called only after candidate detection; ordinary Node invocations do no I/O.
+func loadGuestAllowlist(path string) map[string]map[string]bool {
+	return loadGuestAllowlistWith(path, trustedFile)
+}
+
+func loadGuestAllowlistWith(path string, read func(string) ([]byte, error)) map[string]map[string]bool {
+	data, err := read(path)
+	if os.IsNotExist(err) {
+		// A dangling symlink is present and unsafe, not an absent override.
+		if _, linkErr := os.Lstat(path); !os.IsNotExist(linkErr) {
+			return map[string]map[string]bool{}
+		}
+		return loadAllowlist(allowlistData)
+	}
+	if err != nil {
+		return map[string]map[string]bool{}
+	}
+	return loadAllowlist(data)
 }

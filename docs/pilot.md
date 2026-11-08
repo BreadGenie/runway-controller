@@ -91,31 +91,34 @@ After `controller_listening`, dispatch a trusted workflow using the dedicated `r
 
 ### Regional cache during prepare
 
-Build the current controller release's wrapper with
-`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /srv/runway/cache-node ./cmd/cache-node`.
+Build a cache-capable runner image using [the image recipe](image-building.md).
+The controller checkout supplies the current `cmd/cache-node/allowlist.json`;
+merged allowlist-bot PRs reach fresh managed guests with the next controller
+deploy, without rebuilding the image.
 Append these arguments to the controller's `transport_command`:
 
 ```json
 "--regional-cache", "internal-cache:443",
-"--regional-cache-ca", "/srv/runway/private/cache-ca.pem",
-"--regional-cache-node", "/srv/runway/cache-node"
+"--regional-cache-ca", "/srv/runway/private/cache-ca.pem"
 ```
 
-The CA PEM and wrapper paths are on the controller. The transport sends these
-files and its matching relay/systemd unit through the existing JSON-over-SSH
-stdin channel via Metal, only on `prepare`. Deploy the repository files together
-with the wrapper. No service credential or storage key reaches the guest.
+The CA PEM path is on the controller. Deploy the repository files together;
+the transport sends its current allowlist JSON and the pinned CA through the
+existing JSON-over-SSH stdin channel via Metal, only on `prepare`. No service
+credential or storage key reaches the guest.
 The service must resolve by its mesh `internal-` name, present a certificate for
 that name signed by the pinned CA, and expose setup and translator routes on
 that one TLS port.
 
 This is off by default and applies only to an unregistered fresh clone reporting
-`installed`. Preparation replaces externals node20/node24 while preserving
-`node.real`, installs the relay unit, writes root-owned `/etc/runway/cache.json`
-and `/etc/runway/cache-ca.pem`, and starts the relay. Failed installation restores
+`installed`. Preparation validates both baked wrappers against the shipped
+allowlist, writes root-owned `/etc/runway/cache-allowlist.json`,
+`/etc/runway/cache.json` and `/etc/runway/cache-ca.pem`, and starts the baked relay. Failed installation restores
 prior cache files/service state and returns `unknown`; the controller requests no
 JIT. Repeated preparation is safe. Later setup/network failures use GitHub's
-cache and persist that decision for the job. See the [integration guide](../integrations/actions-runner/regional-cache.md)
+cache and persist that decision for the job. `--regional-cache-node /path/to/cache-node`
+is an optional development override; production prepare uses the baked wrapper
+and fails before JIT if it is missing or cannot validate the shipped allowlist. See the [integration guide](../integrations/actions-runner/regional-cache.md)
 for the config schema, budgets and standalone mode.
 
 ### Sudo compatibility for trusted workflows
