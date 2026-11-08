@@ -23,21 +23,21 @@ import (
 	"github.com/BreadGenie/runway/cache/grant"
 )
 
-// Config bounds one service. Garage selects standalone mode; Buckets and
-// ManagedPrefix select managed mode. StorageBudget is optional.
+// Config bounds one service. Garage selects standalone mode; Buckets selects
+// managed mode. StorageBudget is optional.
 type Config struct {
-	PublicOrigin    string // fixed HTTPS origin; the grant audience
-	Verifier        *grant.Verifier
-	Clock           func(context.Context) (grant.Clock, error)
-	StateDir        string
-	Disk            DiskConfig
-	Buckets         BucketProvider // nil selects standalone storage
-	ManagedPrefix   string         // stable service-owned prefix: managed/<identifier>/
-	Garage          GarageConfig
-	StorageBudget   *StorageBudget // nil selects DefaultStorageBudget
-	QuotaBytes      int64          // per repository
-	TotalBytes      int64
-	MaxArchiveBytes int64
+	PublicOrigin      string // fixed HTTPS origin; the grant audience
+	Verifier          *grant.Verifier
+	Clock             func(context.Context) (grant.Clock, error)
+	StateDir          string
+	Disk              DiskConfig
+	Buckets           BucketProvider // nil selects standalone storage
+	CleanupStaleAfter time.Duration  // zero defaults to 24 hours; must exceed two hours
+	Garage            GarageConfig
+	StorageBudget     *StorageBudget // nil selects DefaultStorageBudget
+	QuotaBytes        int64          // per repository
+	TotalBytes        int64
+	MaxArchiveBytes   int64
 }
 
 // DiskConfig is the private staging directory and its physical byte budget.
@@ -67,9 +67,8 @@ func (config Config) validate() error {
 		return errors.New("invalid cache store configuration")
 	}
 	if config.Buckets != nil {
-		part := strings.TrimSuffix(strings.TrimPrefix(config.ManagedPrefix, "managed/"), "/")
-		if strings.Trim(part, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" || part == "" || strings.ContainsAny(part, "/\\") || config.ManagedPrefix != "managed/"+part+"/" || len(part) > 128 {
-			return errors.New("invalid managed prefix")
+		if config.CleanupStaleAfter != 0 && config.CleanupStaleAfter <= 2*time.Hour {
+			return errors.New("cleanup threshold must exceed two hours")
 		}
 	} else if err := config.Garage.validate(); err != nil {
 		return err
@@ -150,7 +149,7 @@ func New(config Config) (*Server, error) {
 		return nil, errors.New("cache time observation unavailable")
 	}
 	if config.Buckets != nil {
-		s.store = &garageStore{provider: config.Buckets, prefix: config.ManagedPrefix, budget: budget}
+		s.store = &garageStore{provider: config.Buckets, budget: budget, staleAfter: config.CleanupStaleAfter, maintenance: make(map[string]time.Time), maintenanceRunning: make(map[string]bool)}
 	} else {
 		s.store = newGarageStore(config.Garage, budget)
 	}

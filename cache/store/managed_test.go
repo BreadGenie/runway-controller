@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net/http/httptest"
@@ -20,13 +21,6 @@ import (
 
 type buckets map[int64]store.GarageConfig
 
-func (b buckets) Tenants(context.Context) ([]int64, error) {
-	ids := []int64{}
-	for id := range b {
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
 func (b buckets) Bucket(_ context.Context, id int64) (store.GarageConfig, error) { return b[id], nil }
 
 func teamGarage(t *testing.T) (*storetest.Garage, store.GarageConfig) {
@@ -39,7 +33,7 @@ func teamGarage(t *testing.T) (*storetest.Garage, store.GarageConfig) {
 	return g, c
 }
 
-func TestManagedBucketsNamespaceAndColdReset(t *testing.T) {
+func TestManagedBucketsNamespaceAndRecreation(t *testing.T) {
 	a, ac := teamGarage(t)
 	b, bc := teamGarage(t)
 	const prefix = "managed/region-cache/"
@@ -48,14 +42,7 @@ func TestManagedBucketsNamespaceAndColdReset(t *testing.T) {
 		g.Objects["/cache/foreign/1"] = []byte("foreign")
 		g.Objects["/cache/managed/other/1"] = []byte("other service")
 	}
-	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: ac, 2: bc}; c.ManagedPrefix = prefix })
-	for _, g := range []*storetest.Garage{a, b} {
-		g.Mu.Lock()
-		if len(g.Objects) != 2 {
-			t.Error("cold reset did not preserve exactly foreign objects", g.Objects)
-		}
-		g.Mu.Unlock()
-	}
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: ac, 2: bc} })
 	main := service.Signer.Grant(t, storetest.Job{TenantID: 1, Write: "refs/heads/main"})
 	other := service.Signer.Grant(t, storetest.Job{TenantID: 2, Write: "refs/heads/main"})
 	service.Save(t, main, "deps-linux-1", "team-a")
@@ -81,22 +68,35 @@ func TestManagedBucketsNamespaceAndColdReset(t *testing.T) {
 	if status, _ := service.Do(t, "GET", "/_apis/artifactcache/cache?version=v2&keys=deps-linux", main, "", nil); status != 204 {
 		t.Fatal("version crossed", status)
 	}
+	beforeRestart, err := os.ReadFile(filepath.Join(service.Config.StateDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before struct{ Namespace string }
+	if err := json.Unmarshal(beforeRestart, &before); err != nil {
+		t.Fatal(err)
+	}
 	service.Restart(t)
+	afterRestart, _ := os.ReadFile(filepath.Join(service.Config.StateDir, "state.json"))
+	var after struct{ Namespace string }
+	if err := json.Unmarshal(afterRestart, &after); err != nil {
+		t.Fatal(err)
+	}
+	if before.Namespace != after.Namespace {
+		t.Fatal("restart changed service id")
+	}
 	if _, data := service.Restore(t, main, "deps-linux-1"); data != "team-a" {
 		t.Fatal("journal recovery", data)
 	}
 	if _, data := service.Restore(t, other, "deps-linux-1"); data != "team-b" {
 		t.Fatal("bucket routing", data)
 	}
-	for id, g := range map[string]*storetest.Garage{"1": a, "2": b} {
-		g.Mu.Lock()
-		for key := range g.Objects {
-			if strings.HasPrefix(key, "/cache/"+prefix) && !strings.HasPrefix(key, "/cache/"+prefix+id+"/") {
-				t.Error("wrong tenant bucket", key)
-			}
-		}
-		g.Mu.Unlock()
+	oldJournal, err := os.ReadFile(filepath.Join(service.Config.StateDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	var old struct{ Namespace string }
+	json.Unmarshal(oldJournal, &old)
 	if err := service.Server.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +108,13 @@ func TestManagedBucketsNamespaceAndColdReset(t *testing.T) {
 	if status, _ := service.Lookup(t, main, "deps"); status != 204 {
 		t.Fatal("recreated service adopted objects", status)
 	}
-	for _, g := range []*storetest.Garage{a, b} {
-		g.Mu.Lock()
-		if len(g.Objects) != 2 {
-			t.Error("reset left objects", g.Objects)
-		}
-		g.Mu.Unlock()
+	newJournal, _ := os.ReadFile(filepath.Join(service.Config.StateDir, "state.json"))
+	var fresh struct{ Namespace string }
+	json.Unmarshal(newJournal, &fresh)
+	if old.Namespace == fresh.Namespace || !strings.HasPrefix(fresh.Namespace, "managed/") {
+		t.Fatal("recreation reused namespace")
 	}
+
 }
 
 func TestGarageTLSConfigurationRefusals(t *testing.T) {
@@ -144,39 +144,9 @@ func TestGarageTLSConfigurationRefusals(t *testing.T) {
 	}
 }
 
-func TestManagedResetFailureLeavesNoJournal(t *testing.T) {
-	g, c := teamGarage(t)
-	baseline := storetest.Start(t)
-	config := baseline.Config
-	config.Buckets = buckets{1: c}
-	config.ManagedPrefix = "managed/test/"
-	config.Disk.Directory = filepath.Join(t.TempDir(), "spools")
-	config.StateDir = filepath.Join(t.TempDir(), "state")
-	if err := os.Mkdir(config.StateDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	g.Mu.Lock()
-	g.Fail = true
-	g.Mu.Unlock()
-	if s, err := store.New(config); err == nil {
-		s.Close(context.Background())
-		t.Fatal("reset failure served")
-	}
-	if _, err := os.Stat(filepath.Join(config.StateDir, "state.json")); !os.IsNotExist(err) {
-		t.Fatal("failed reset wrote journal", err)
-	}
-	g.Mu.Lock()
-	g.Fail = false
-	g.Mu.Unlock()
-	s, err := store.New(config)
-	if err != nil {
-		t.Fatal("reset did not retry", err)
-	}
-	s.Close(context.Background())
-}
-
 func TestManagedTLSRejectsUntrustedServer(t *testing.T) {
-	_, c := teamGarage(t)
+	_, config := teamGarage(t)
+	// Use a distinct CA rather than the httptest certificate shared by servers.
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -186,18 +156,14 @@ func TestManagedTLSRejectsUntrustedServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.CAPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
-	baseline := storetest.Start(t)
-	config := baseline.Config
-	config.Buckets = buckets{1: c}
-	config.ManagedPrefix = "managed/test/"
-	config.Disk.Directory = filepath.Join(t.TempDir(), "spools")
-	config.StateDir = filepath.Join(t.TempDir(), "state")
-	if err := os.Mkdir(config.StateDir, 0700); err != nil {
-		t.Fatal(err)
+	config.CAPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: config} })
+	token := service.Signer.Grant(t, storetest.Job{TenantID: 1, Write: "refs/heads/main"})
+	status, id := service.Reserve(t, token, "deps", 7)
+	if status != 201 {
+		t.Fatal("reserve", status)
 	}
-	if s, err := store.New(config); err == nil {
-		s.Close(context.Background())
-		t.Fatal("untrusted TLS server accepted")
+	if status := service.Upload(t, token, id, "archive"); status != 503 {
+		t.Fatal("untrusted storage accepted", status)
 	}
 }

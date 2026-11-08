@@ -114,20 +114,19 @@ scope keys are canonical JSON tuples: `["managed","<tenant>","<repository>"]`
 versus the unchanged `["standalone","<region>","<repository>"]`. Ref priority,
 restore keys, versions and per-repository quota semantics are unchanged.
 
-The store's `BucketProvider` enumerates known tenants and supplies each tenant's
-current bucket/credentials. Managed mode requires HTTPS with an explicitly
+The store's `BucketProvider` resolves each signed tenant's current bucket and
+credentials on demand. Managed mode requires HTTPS with an explicitly
 pinned PEM CA, normal hostname verification and finite transport/storage
 deadlines; there is no skip-verification option. Standalone still accepts
 literal-loopback HTTP. Credentials are absent from grants and journals.
 
-A managed service configures a stable, exclusively owned
-`managed/<service-id>/` prefix (service ID: letters, digits, hyphen, underscore).
-Objects use `<prefix><tenant>/<entry-id>` within each team's bucket. On a fresh
-journal, startup enumerates all known tenant buckets and deletes only that
-service prefix before persisting an empty index or serving. Enumeration must be
-complete; failures refuse startup and retry the reset next time. Other service
-prefixes and standalone `prototype/` objects remain untouched. An existing
-journal verifies only indexed objects and never adopts unknown objects.
+A managed service generates a random 128-bit service id with its first journal.
+Objects use `managed/<service-id>/<tenant>/<entry-id>` within each team's bucket.
+The id survives in-place restarts and migrations with the journal. Recreation
+without a journal gets a new id, never reads older objects and requires no
+pre-serve reset. Background marker refresh and lazy cleanup reclaim stale other
+instances as described below; standalone `prototype/` objects remain untouched.
+An existing journal verifies only indexed objects and never adopts unknown objects.
 The provider must honor deadlines and support concurrent credential lookups,
 including rotation. The Central provider and process configuration are described below. The CLI's
 standalone Garage config accepts optional `ca_pem` for HTTPS; managed service
@@ -220,37 +219,35 @@ with this required `managed` object (the two cannot coexist):
     "central_url": "https://central.example.com",
     "central_token_file": "/etc/runway/central-region-token",
     "storage_ca_file": "/etc/runway/garage-ca.crt",
-    "prefix": "managed/blr-cache/",
-    "teams": {"2": "internal-team", "3": "another-team"}
+    "cleanup_stale_hours": 24
   }
 }
 ```
 
 The example above is the replacement fragment, not a complete configuration.
-`teams` is a nonempty, durable, authoritative tenant-to-Central-team registry
-for this service prefix. Deployment must enroll each team here **before**
-enabling its pool and retain retired teams while their bucket may contain this
-prefix. Back up this configuration independently of the journal and restore it
-on VM recreation. Never rebuild it from active leases or currently enabled
-pools: those omit idle and retired tenants. Never prune it merely because
-Central returns 404. A deleted bucket requires explicit operator reconciliation
-of the registry after verifying its objects are gone. Central's current contract
-has no enumeration method; adding one and automating this registry is future
-Central provisioning work, not an invented read API.
+Managed objects live under `managed/<service-id>/<tenant>/…`. The random
+service id is created with the first journal and has the same durability and
+custody: upgrades and migrations retain it, while VM recreation without a
+journal gets a new id and never reads or adopts older objects. Startup needs no
+reset or tenant enumeration. Enabling a pool in Central is sufficient; no team
+registry or service configuration change is needed.
 
-At cold start the provider enumerates the complete registry and freshly resolves
-**every** team through `cache_bucket`. The store also validates every resolved
-storage configuration before deleting anything. A missing team, malformed
-response, bad credentials or enumeration error refuses startup and writes no
-new journal. A storage error during deletion may leave a partly cleared
-*unindexed* prefix; serving still never starts, and the next startup retries.
-Existing journals never run the cold reset, so reset cannot delete objects
-that a retained journal references. Reset deletes only this service prefix
-and preserves other prefixes in every bucket.
+On bucket use, background maintenance writes a secret-free timestamp marker at
+`managed/<service-id>/.owner`, at most hourly per remembered bucket, and checks
+other instance prefixes hourly. `cleanup_stale_hours` defaults to 24 and must
+exceed two hours (maximum 8760). Only other prefixes with an old marker, or no
+marker and exclusively old objects, qualify. Unknown timestamps and errors
+preserve objects. Maintenance rechecks the marker before each batch, deletes
+at most 100 objects per batch and 1000 per pass, and has a one-minute deadline.
+It never blocks requests, touches the current prefix, `prototype/`, or keys
+outside `managed/`; logs contain deletion counts only. Fresh instances preserve
+each other's objects. Idle retired prefixes are reclaimed when a bucket is
+next used. Keep the journal during in-place upgrades and migrations.
 
 Central responses use the same bounded HTTPS token client and exact JSON
-contract as leases; redirects are refused. Tenant identity must match the
-registry. Each tenant's endpoint, region, bucket and credentials are cached for
+contract as leases; redirects are refused. Signed positive `tenant_id` selects
+`cache_bucket?tenant_id=…`; the response tenant must match.
+Each tenant's endpoint, region, bucket and credentials are cached for
 at most 30 seconds, with no stale-on-error behavior. Storage 401/403 or S3
 authentication errors invalidate that tenant's credentials, causing a re-read
 on the next operation. Failed writes are not automatically replayed. Explicit

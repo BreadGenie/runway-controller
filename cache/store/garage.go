@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -57,12 +58,19 @@ func (config GarageConfig) validate() error {
 }
 
 type garageStore struct {
-	provider  BucketProvider
-	prefix    string
-	budget    StorageBudget
-	client    *s3.Client
-	bucket    string
-	transport *http.Transport
+	maintenanceRunning map[string]bool
+	maintenanceMu      sync.Mutex
+	maintenanceWG      sync.WaitGroup
+	maintenance        map[string]time.Time
+	maintenanceClosed  bool
+	maintenanceActive  int
+	staleAfter         time.Duration
+	provider           BucketProvider
+	prefix             string
+	budget             StorageBudget
+	client             *s3.Client
+	bucket             string
+	transport          *http.Transport
 }
 
 func newGarageStore(config GarageConfig, budget StorageBudget) *garageStore {
@@ -92,6 +100,10 @@ func newGarageStore(config GarageConfig, budget StorageBudget) *garageStore {
 }
 
 func (store *garageStore) close() {
+	store.maintenanceMu.Lock()
+	store.maintenanceClosed = true
+	store.maintenanceMu.Unlock()
+	store.maintenanceWG.Wait()
 	if store.transport != nil {
 		store.transport.CloseIdleConnections()
 	}

@@ -54,7 +54,7 @@ func ticketKey(token string) string {
 
 func (s *Server) storage() diskStorage {
 	if s.config.Buckets != nil {
-		return diskStorage{Endpoint: "managed", Bucket: s.config.ManagedPrefix}
+		return diskStorage{Endpoint: "managed", Bucket: "managed/"}
 	}
 	return diskStorage{Endpoint: s.config.Garage.Endpoint, Region: s.config.Garage.Region, Bucket: s.config.Garage.Bucket}
 }
@@ -88,20 +88,17 @@ func (s *Server) openState() error {
 func (s *Server) recover() error {
 	f, err := openStateFile(s.stateDir, "state.json", syscall.O_RDONLY)
 	if os.IsNotExist(err) {
-		if s.config.Buckets != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.budget.RecoveryMaxSeconds)*time.Second)
-			defer cancel()
-			if err := s.store.reset(ctx); err != nil {
-				return err
-			}
-			s.namespace = s.config.ManagedPrefix
-			return s.persist()
-		}
+
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
 			return err
 		}
-		s.namespace = objectPrefix + hex.EncodeToString(random) + "/"
+		prefix := objectPrefix
+		if s.config.Buckets != nil {
+			prefix = "managed/"
+		}
+		s.namespace = prefix + hex.EncodeToString(random) + "/"
+		s.store.prefix = s.namespace
 		return s.persist()
 	}
 	if err != nil {
@@ -114,13 +111,16 @@ func (s *Server) recover() error {
 	_, hexErr := hex.DecodeString(hexPart)
 	validNamespace := hexErr == nil && len(hexPart) == 32 && d.Namespace == objectPrefix+hexPart+"/"
 	if s.config.Buckets != nil {
-		validNamespace = d.Namespace == s.config.ManagedPrefix
+		part := strings.TrimSuffix(strings.TrimPrefix(d.Namespace, "managed/"), "/")
+		_, err := hex.DecodeString(part)
+		validNamespace = err == nil && len(part) == 32 && d.Namespace == "managed/"+part+"/"
 	}
 	if err != nil || !validNamespace ||
 		d.Version != 1 || d.Storage != s.storage() || d.PublicOrigin != s.config.PublicOrigin || len(d.Entries) > maxEntries || len(d.Tickets) > maxTickets || d.NextID < 0 {
 		return errors.New("invalid cache state")
 	}
 	s.namespace, s.nextID = d.Namespace, d.NextID
+	s.store.prefix = s.namespace
 	objects, bytes := 0, int64(0)
 	for _, v := range d.Entries {
 		if s.objectKey(v.Repository, v.ID) == "" || v.ID <= 0 || v.ID > d.NextID || s.entries[v.ID] != nil || v.Size <= 0 || v.Size > s.config.MaxArchiveBytes || v.Repository == "" || v.Ref == "" || v.Subject == "" || !validKey(v.Key) || v.Version == "" || v.Created.IsZero() || v.Accessed.IsZero() || v.Object != "" && v.Object != s.objectKey(v.Repository, v.ID) || v.Published && v.Object == "" {

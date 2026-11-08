@@ -1,10 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -12,10 +15,9 @@ import (
 )
 
 // BucketProvider supplies current bucket credentials without putting them in
-// grants or journals. Tenants enumerates every bucket to reset on a cold start.
+// grants or journals. Only signed tenant identities select buckets.
 // Implementations must be safe for concurrent calls and honor context deadlines.
 type BucketProvider interface {
-	Tenants(context.Context) ([]int64, error)
 	Bucket(context.Context, int64) (GarageConfig, error)
 }
 
@@ -32,67 +34,8 @@ func (store *garageStore) route(ctx context.Context, key string) (*garageStore, 
 	if config.validate() != nil || !strings.HasPrefix(config.Endpoint, "https://") {
 		return nil, errors.New("invalid team bucket configuration")
 	}
+	store.touch(config, key)
 	return newGarageStore(config, store.budget), nil
-}
-
-// reset deletes only the configured service prefix, including abandoned uploads.
-// It completes before the first journal is written; a failed reset is retried
-// on the next startup. Listing is paginated and every returned key is checked.
-func (store *garageStore) reset(ctx context.Context) error {
-	tenants, err := store.provider.Tenants(ctx)
-	if err != nil {
-		return errors.New("team bucket enumeration unavailable")
-	}
-	targets := []*garageStore{}
-	defer func() {
-		for _, target := range targets {
-			target.close()
-		}
-	}()
-	seen := map[int64]bool{}
-	for _, tenant := range tenants {
-		if seen[tenant] {
-			continue
-		}
-		seen[tenant] = true
-		target, err := store.route(ctx, store.prefix+strconv.FormatInt(tenant, 10)+"/0")
-		if err != nil {
-			return err
-		}
-		targets = append(targets, target)
-	}
-	for _, target := range targets {
-		err = target.clearPrefix(ctx, store.prefix)
-		if err != nil {
-			return errors.New("managed cache reset failed")
-		}
-	}
-	return nil
-}
-
-func (store *garageStore) clearPrefix(ctx context.Context, prefix string) error {
-	var token *string
-	for {
-		page, err := store.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &store.bucket, Prefix: &prefix, ContinuationToken: token, MaxKeys: aws.Int32(1000)})
-		if err != nil {
-			return err
-		}
-		for _, object := range page.Contents {
-			if object.Key == nil || !strings.HasPrefix(*object.Key, prefix) {
-				return errors.New("storage returned a foreign prefix")
-			}
-			if err := store.delete(ctx, *object.Key); err != nil {
-				return err
-			}
-		}
-		if !aws.ToBool(page.IsTruncated) {
-			return nil
-		}
-		if page.NextContinuationToken == nil || aws.ToString(page.NextContinuationToken) == aws.ToString(token) {
-			return errors.New("invalid storage pagination")
-		}
-		token = page.NextContinuationToken
-	}
 }
 
 // Auth failures never use stale credentials on the next operation. Failed PUTs
@@ -115,4 +58,148 @@ func (store *garageStore) invalidateAuth(key string, err error) {
 		tenant, _ := strconv.ParseInt(part, 10, 64)
 		provider.Invalidate(tenant)
 	}
+}
+
+// Maintenance is bounded independently of request latency. A
+// process only remembers a bounded set of buckets; eviction merely retries work.
+func (store *garageStore) touch(config GarageConfig, objectKey string) {
+	store.maintenanceMu.Lock()
+	defer store.maintenanceMu.Unlock()
+	now := time.Now()
+	key := config.Endpoint + "/" + config.Bucket
+	if store.maintenanceClosed || store.maintenanceActive >= 256 || store.maintenanceRunning[key] || now.Before(store.maintenance[key]) {
+		return
+	}
+	if len(store.maintenance) >= 256 {
+		for k := range store.maintenance {
+			if !store.maintenanceRunning[k] {
+				delete(store.maintenance, k)
+			}
+		}
+	}
+	store.maintenance[key] = now.Add(time.Hour)
+	store.maintenanceRunning[key] = true
+	store.maintenanceActive++
+	store.maintenanceWG.Add(1)
+	go func() {
+		defer store.maintenanceWG.Done()
+		defer func() {
+			store.maintenanceMu.Lock()
+			store.maintenanceActive--
+			delete(store.maintenanceRunning, key)
+			store.maintenanceMu.Unlock()
+		}()
+		target := newGarageStore(config, store.budget)
+		defer target.close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		marker := store.prefix + ".owner"
+		// Object timestamps also bound writes after local cache eviction.
+		owner, err := target.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &target.bucket, Key: &marker})
+		if err != nil && !lostArchive(err) {
+			store.invalidateAuth(objectKey, err)
+			return
+		}
+		if err != nil || owner.LastModified == nil || !owner.LastModified.After(now.Add(-time.Hour)) {
+			_, err = target.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &target.bucket, Key: &marker, Body: bytes.NewReader([]byte(now.UTC().Format(time.RFC3339)))})
+			if err != nil {
+				store.invalidateAuth(objectKey, err)
+				return
+			}
+		}
+
+		stale := store.staleAfter
+		if stale == 0 {
+			stale = 24 * time.Hour
+		}
+		count, err := target.cleanup(ctx, store.prefix, now.Add(-stale))
+		store.invalidateAuth(objectKey, err)
+		if err == nil && count > 0 {
+			log.Printf("managed cache cleanup deleted %d objects", count)
+		}
+	}()
+}
+
+// Limit each pass to 1000 deletions, in batches of at most 100. Unknown or
+// incomplete timestamps fail closed. Recheck the owner before each batch.
+func (store *garageStore) cleanup(ctx context.Context, current string, cutoff time.Time) (int, error) {
+	root, delimiter := "managed/", "/"
+	var token *string
+	count := 0
+	for {
+		page, err := store.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &store.bucket, Prefix: &root, Delimiter: &delimiter, ContinuationToken: token, MaxKeys: aws.Int32(100)})
+		if err != nil {
+			return count, err
+		}
+		for _, group := range page.CommonPrefixes {
+			prefix := aws.ToString(group.Prefix)
+			id := strings.TrimSuffix(strings.TrimPrefix(prefix, root), "/")
+			if prefix == current || id == "" || strings.Contains(id, "/") || prefix != root+id+"/" {
+				continue
+			}
+			n, err := store.cleanupPrefix(ctx, prefix, cutoff, 1000-count)
+			count += n
+			if err != nil || count >= 1000 {
+				return count, err
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			return count, nil
+		}
+		if page.NextContinuationToken == nil || aws.ToString(page.NextContinuationToken) == aws.ToString(token) {
+			return count, errors.New("invalid storage pagination")
+		}
+		token = page.NextContinuationToken
+	}
+}
+
+func (store *garageStore) cleanupPrefix(ctx context.Context, prefix string, cutoff time.Time, limit int) (int, error) {
+	count := 0
+	for count < limit {
+		// List a bounded batch first, including the marker if present. With no
+		// marker, every object in the prefix must be old, across every page.
+		var token *string
+		keys := []string{}
+		for {
+			page, err := store.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &store.bucket, Prefix: &prefix, ContinuationToken: token, MaxKeys: aws.Int32(100)})
+			if err != nil {
+				return count, err
+			}
+			for _, object := range page.Contents {
+				key := aws.ToString(object.Key)
+				if !strings.HasPrefix(key, prefix) || object.LastModified == nil || !object.LastModified.Before(cutoff) {
+					return count, nil
+				}
+				if len(keys) < 100 && len(keys) < limit-count {
+					keys = append(keys, key)
+				}
+			}
+			if !aws.ToBool(page.IsTruncated) {
+				break
+			}
+			if page.NextContinuationToken == nil || aws.ToString(page.NextContinuationToken) == aws.ToString(token) {
+				return count, errors.New("invalid storage pagination")
+			}
+			token = page.NextContinuationToken
+		}
+		if len(keys) == 0 {
+			return count, nil
+		}
+		marker := prefix + ".owner"
+		owner, err := store.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &store.bucket, Key: &marker})
+		if err == nil {
+			if owner.LastModified == nil || !owner.LastModified.Before(cutoff) {
+				return count, nil
+			}
+		} else if !lostArchive(err) {
+			return count, err
+		}
+		for _, key := range keys {
+			if err := store.delete(ctx, key); err != nil {
+				return count, err
+			}
+			count++
+		}
+	}
+	return count, nil
 }

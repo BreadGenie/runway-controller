@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -56,7 +54,7 @@ func TestCentralManagedBuckets(t *testing.T) {
 			w.WriteHeader(503)
 			return
 		}
-		team := r.URL.Query().Get("team")
+		team := map[string]string{"1": "a", "2": "b", "3": "c"}[r.URL.Query().Get("tenant_id")]
 		c, ok := configs[team]
 		if !ok {
 			w.WriteHeader(503)
@@ -66,11 +64,24 @@ func TestCentralManagedBuckets(t *testing.T) {
 		if team == "b" {
 			id = 2
 		}
+		if team == "c" {
+			id = 3
+		}
 		json.NewEncoder(w).Encode(map[string]any{"team": team, "tenant_id": id, "bucket": c.Bucket, "endpoint": c.Endpoint, "region": c.Region, "access_key": access, "secret_key": c.SecretKey})
 	}))
 	defer central.Close()
-	p := &cacheBucketProvider{central: cacheCentralHTTPS{origin: central.URL, token: "regional", client: central.Client()}, teams: map[int64]string{1: "a", 2: "b"}, ca: configs["a"].CAPEM + configs["b"].CAPEM}
-	service := storetest.Start(t, func(c *store.Config) { c.Buckets = p; c.ManagedPrefix = "managed/regional/" })
+	p := &cacheBucketProvider{central: cacheCentralHTTPS{origin: central.URL, token: "regional", client: central.Client()}, ca: configs["a"].CAPEM + configs["b"].CAPEM}
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = p })
+	// Central can enable a new team after startup without service configuration.
+	mu.Lock()
+	configs["c"] = configs["a"]
+	mu.Unlock()
+	c := service.Signer.Grant(t, storetest.Job{TenantID: 3, Write: "refs/heads/main"})
+	service.Save(t, c, "new-team", "team-c")
+	if _, data := service.Restore(t, c, "new-team"); data != "team-c" {
+		t.Fatal("new team unavailable", data)
+	}
+
 	a := service.Signer.Grant(t, storetest.Job{TenantID: 1, Write: "refs/heads/main"})
 	b := service.Signer.Grant(t, storetest.Job{TenantID: 2, Write: "refs/heads/main"})
 	service.Save(t, a, "same", "team-a")
@@ -102,40 +113,10 @@ func TestCentralManagedBuckets(t *testing.T) {
 	if status, _ := service.Lookup(t, a, "same"); status != 401 {
 		t.Fatal("Central failure opened request", status)
 	}
-	if _, err := p.Bucket(context.Background(), 3); err == nil {
+	if _, err := p.Bucket(context.Background(), 4); err == nil {
 		t.Fatal("unknown tenant accepted")
 	}
 
-	// Cold reset refuses the entire enumeration before touching any bucket.
-	service.Server.Close(context.Background())
-	service.Server = nil
-	config := service.Config
-	config.StateDir = filepath.Join(t.TempDir(), "state")
-	config.Disk.Directory = filepath.Join(t.TempDir(), "spool")
-	if err := os.Mkdir(config.StateDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	fail = false
-	mu.Unlock()
-	// Force the last registry entry to fail after the first succeeds.
-	p.teams[2] = "absent"
-	// Return an invalid bucket for that team.
-	if s, err := store.New(config); err == nil {
-		s.Close(context.Background())
-		t.Fatal("incomplete enumeration served")
-	}
-	for team, g := range garages {
-		g.Mu.Lock()
-		n := len(g.Objects)
-		g.Mu.Unlock()
-		if n != 2 {
-			t.Errorf("failed reset touched %s: %d", team, n)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(config.StateDir, "state.json")); !os.IsNotExist(err) {
-		t.Fatal("failed reset wrote journal", err)
-	}
 }
 
 func TestCentralBucketExactContractAndExpiry(t *testing.T) {
@@ -143,7 +124,7 @@ func TestCentralBucketExactContractAndExpiry(t *testing.T) {
 	body := valid
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
 	defer server.Close()
-	p := &cacheBucketProvider{central: cacheCentralHTTPS{origin: server.URL, token: "regional", client: server.Client()}, teams: map[int64]string{1: "a"}}
+	p := &cacheBucketProvider{central: cacheCentralHTTPS{origin: server.URL, token: "regional", client: server.Client()}}
 	if _, err := p.Bucket(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +155,7 @@ func TestManagedDataConfiguration(t *testing.T) {
 	var fields map[string]any
 	json.Unmarshal(data, &fields)
 	delete(fields, "garage")
-	fields["managed"] = map[string]any{"central_url": "https://central.example", "central_token_file": "/etc/token", "storage_ca_file": "/etc/ca", "prefix": "managed/regional/", "teams": map[string]string{"1": "a", "2": "b"}}
+	fields["managed"] = map[string]any{"central_url": "https://central.example", "central_token_file": "/etc/token", "storage_ca_file": "/etc/ca"}
 	data, _ = json.Marshal(fields)
 	if _, _, err := decodeCacheDataServiceConfig(data); err != nil {
 		t.Fatal("managed config refused", err)
@@ -186,13 +167,12 @@ func TestManagedDataConfiguration(t *testing.T) {
 	}
 	delete(fields, "garage")
 	m := fields["managed"].(map[string]any)
-	for _, teams := range []map[string]string{{"0": "a"}, {"01": "a"}, {"1": "a", "2": "a"}, {}} {
-		m["teams"] = teams
-		data, _ = json.Marshal(fields)
-		if _, _, err := decodeCacheDataServiceConfig(data); err == nil {
-			t.Fatal("invalid registry accepted", teams)
-		}
+	m["teams"] = map[string]string{"1": "a"}
+	data, _ = json.Marshal(fields)
+	if _, _, err := decodeCacheDataServiceConfig(data); err == nil {
+		t.Fatal("registry accepted")
 	}
+
 }
 
 func TestCacheServiceBucketFailureDisablesSetup(t *testing.T) {

@@ -71,7 +71,7 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 		required = append(required, "storage_budget")
 	}
 	if raw, ok := fields["managed"]; ok {
-		if readCacheObject(raw, []string{"central_url", "central_token_file", "storage_ca_file", "prefix", "teams"}) != nil {
+		if readCacheObject(raw, managedConfigFields(raw)) != nil {
 			return config, store.Config{}, grant.ErrInvalid
 		}
 	}
@@ -95,32 +95,10 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 		return config, store.Config{}, grant.ErrInvalid
 	}
 	if m := config.Managed; m != nil {
-		if !cacheHTTPSOrigin(m.CentralURL) || !filepath.IsAbs(m.CentralTokenFile) || !filepath.IsAbs(m.StorageCAFile) || len(m.Teams) == 0 {
+		if !cacheHTTPSOrigin(m.CentralURL) || !filepath.IsAbs(m.CentralTokenFile) || !filepath.IsAbs(m.StorageCAFile) || m.CleanupStaleHours < 0 || m.CleanupStaleHours > 8760 || m.CleanupStaleHours > 0 && m.CleanupStaleHours <= 2 {
 			return config, store.Config{}, grant.ErrInvalid
 		}
-		var rawManaged map[string]json.RawMessage
-		var rawTeams map[string]json.RawMessage
-		if json.Unmarshal(fields["managed"], &rawManaged) != nil || json.Unmarshal(rawManaged["teams"], &rawTeams) != nil {
-			return config, store.Config{}, grant.ErrInvalid
-		}
-		names := make([]string, 0, len(rawTeams))
-		for name := range rawTeams {
-			id, err := strconv.ParseInt(name, 10, 64)
-			if err != nil || strconv.FormatInt(id, 10) != name {
-				return config, store.Config{}, grant.ErrInvalid
-			}
-			names = append(names, name)
-		}
-		if readCacheObject(rawManaged["teams"], names) != nil {
-			return config, store.Config{}, grant.ErrInvalid
-		}
-		seen := map[string]bool{}
-		for id, team := range m.Teams {
-			if id <= 0 || id > 4294967295 || team == "" || seen[team] {
-				return config, store.Config{}, grant.ErrInvalid
-			}
-			seen[team] = true
-		}
+
 	}
 	host, port, err := net.SplitHostPort(config.Listen)
 	address := net.ParseIP(host)
@@ -168,10 +146,10 @@ func runCacheDataService(configPath string) error {
 		if !roots.AppendCertsFromPEM(ca) {
 			return grant.ErrInvalid
 		}
-		core.ManagedPrefix = m.Prefix
+		core.CleanupStaleAfter = time.Duration(m.CleanupStaleHours) * time.Hour
 		core.Buckets = &cacheBucketProvider{
 			central: cacheCentralHTTPS{origin: m.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}},
-			teams:   m.Teams, ca: string(ca),
+			ca:      string(ca),
 		}
 	}
 	certificate, certErr := readProtectedCacheFile(config.CertificateFile, false)
@@ -310,4 +288,14 @@ func serveCacheDataService(parent context.Context, server *http.Server, listener
 		return nil
 	}
 	return errors.New("cache data service stopped")
+}
+
+func managedConfigFields(raw json.RawMessage) []string {
+	fields := []string{"central_url", "central_token_file", "storage_ca_file"}
+	var obj map[string]json.RawMessage
+	json.Unmarshal(raw, &obj)
+	if _, ok := obj["cleanup_stale_hours"]; ok {
+		fields = append(fields, "cleanup_stale_hours")
+	}
+	return fields
 }

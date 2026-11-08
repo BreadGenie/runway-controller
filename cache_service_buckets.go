@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"net/netip"
-	"sort"
 	"sync"
 	"time"
 
@@ -11,14 +10,11 @@ import (
 	"github.com/BreadGenie/runway/cache/store"
 )
 
-// This durable registry is authoritative for this service prefix, including
-// retired teams. No tenant is discovered from guest input or an unsigned grant.
 type cacheManagedConfig struct {
-	CentralURL       string           `json:"central_url"`
-	CentralTokenFile string           `json:"central_token_file"`
-	StorageCAFile    string           `json:"storage_ca_file"`
-	Prefix           string           `json:"prefix"`
-	Teams            map[int64]string `json:"teams"`
+	CentralURL        string `json:"central_url"`
+	CentralTokenFile  string `json:"central_token_file"`
+	StorageCAFile     string `json:"storage_ca_file"`
+	CleanupStaleHours int    `json:"cleanup_stale_hours,omitempty"`
 }
 
 type cacheBucketEntry struct {
@@ -27,36 +23,33 @@ type cacheBucketEntry struct {
 }
 
 type cacheBucketProvider struct {
-	central     cacheCentralHTTPS
-	teams       map[int64]string
-	ca          string
-	mu          sync.Mutex
-	entries     map[int64]cacheBucketEntry
-	generations map[int64]uint64
+	central    cacheCentralHTTPS
+	ca         string
+	mu         sync.Mutex
+	entries    map[int64]cacheBucketEntry
+	generation uint64
 }
 
 func (p *cacheBucketProvider) Bucket(ctx context.Context, tenant int64) (store.GarageConfig, error) {
 	p.mu.Lock()
-	team, ok := p.teams[tenant]
-	if !ok {
-		p.mu.Unlock()
-		return store.GarageConfig{}, grant.ErrInvalid
-	}
 	if entry, ok := p.entries[tenant]; ok && time.Now().Before(entry.until) {
 		p.mu.Unlock()
 		return entry.config, nil
 	}
-	generation := p.generations[tenant]
+	generation := p.generation
 	p.mu.Unlock()
-	config, err := p.central.bucket(ctx, team, tenant, p.ca)
+	config, err := p.central.bucket(ctx, "", tenant, p.ca)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err != nil || p.generations[tenant] != generation {
+	if err != nil || p.generation != generation {
 		delete(p.entries, tenant)
 		return store.GarageConfig{}, grant.ErrInvalid
 	}
 	if p.entries == nil {
 		p.entries = map[int64]cacheBucketEntry{}
+	}
+	if len(p.entries) >= 256 {
+		clear(p.entries)
 	}
 	p.entries[tenant] = cacheBucketEntry{config, time.Now().Add(30 * time.Second)}
 	return config, nil
@@ -67,27 +60,7 @@ func (p *cacheBucketProvider) Invalidate(tenant int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.entries, tenant)
-	if p.generations == nil {
-		p.generations = map[int64]uint64{}
-	}
-	p.generations[tenant]++
-}
-
-func (p *cacheBucketProvider) Tenants(ctx context.Context) ([]int64, error) {
-	ids := make([]int64, 0, len(p.teams))
-	for id := range p.teams {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	// Force a fresh Central resolution for the entire registry before reset.
-	// No deletion can happen if even the final tenant fails enumeration.
-	for _, id := range ids {
-		p.Invalidate(id)
-		if _, err := p.Bucket(ctx, id); err != nil {
-			return nil, grant.ErrInvalid
-		}
-	}
-	return ids, nil
+	p.generation++
 }
 
 // The service gates setup and renewals on bucket availability as well as the

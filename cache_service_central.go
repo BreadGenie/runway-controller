@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -128,12 +129,16 @@ func (central cacheCentralHTTPS) bucket(ctx context.Context, team string, tenant
 		AccessKey string `json:"access_key"`
 		SecretKey string `json:"secret_key"`
 	}
-	data, err := central.read(ctx, "cache_bucket", url.Values{"team": {team}})
+	query := url.Values{"tenant_id": {strconv.FormatInt(tenant, 10)}}
+	if team != "" {
+		query = url.Values{"team": {team}}
+	}
+	data, err := central.read(ctx, "cache_bucket", query)
 	if err != nil {
 		return store.GarageConfig{}, err
 	}
 	if readCacheObject(data, []string{"team", "tenant_id", "bucket", "endpoint", "region", "access_key", "secret_key"}) != nil || json.Unmarshal(data, &answer) != nil ||
-		answer.Team != team || answer.TenantID != tenant || tenant <= 0 || tenant > 4294967295 ||
+		answer.Team == "" || team != "" && answer.Team != team || answer.TenantID != tenant || tenant <= 0 || tenant > 4294967295 ||
 		!cacheHTTPSOrigin(answer.Endpoint) || answer.Bucket == "" || strings.ContainsAny(answer.Bucket, "/\\") || answer.Region == "" || answer.AccessKey == "" || answer.SecretKey == "" {
 		return store.GarageConfig{}, grant.ErrInvalid
 	}
