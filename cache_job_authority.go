@@ -16,6 +16,11 @@ import (
 	"github.com/BreadGenie/runway/cache/grant"
 )
 
+type cacheJobAuthority interface {
+	resolve(context.Context, cacheGuestBinding, int64) (cacheJobRelease, error)
+	authorize(context.Context, cacheGuestBinding, cacheJobRelease, grant.SetupRequest) (cacheJobGrant, error)
+}
+
 // cacheJobGrant is verified input to grant.IssueSetup.
 type cacheJobGrant struct {
 	Authorization grant.Authorization
@@ -25,6 +30,8 @@ type cacheJobGrant struct {
 // cacheGuestBinding is written only by the trusted root launcher after it
 // registers the guest's JIT runner. The guest never supplies or reads it.
 type cacheGuestBinding struct {
+	service        bool
+	TenantID       uint32    `json:"-"`
 	Version        int       `json:"version"`
 	VMID           string    `json:"vm_id"`
 	VsockUDS       string    `json:"vsock_uds"`
@@ -41,6 +48,13 @@ type cacheGuestBinding struct {
 var cacheVMIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 func (binding cacheGuestBinding) validate() error {
+	if binding.service {
+		parts := strings.Split(binding.Repository, "/")
+		if binding.TenantID == 0 || binding.VMID == "" || binding.RunnerID <= 0 || binding.RunnerName == "" || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
+			return grant.ErrInvalid
+		}
+		return nil
+	}
 	parts := strings.Split(binding.Repository, "/")
 	if binding.Version != 2 || !cacheVMIDPattern.MatchString(binding.VMID) || !filepath.IsAbs(binding.VsockUDS) || filepath.Clean(binding.VsockUDS) != binding.VsockUDS || binding.FirecrackerPID <= 1 || binding.GuestCID < 3 || binding.RunnerID <= 0 || binding.RunnerName == "" || len(binding.RunnerName) > 255 || strings.ContainsAny(binding.RunnerName, "\x00\r\n\t ") || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
 		return grant.ErrInvalid
@@ -299,7 +313,7 @@ func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding 
 		deadline = binding.ExpiresAt
 	}
 	authorization := grant.Authorization{
-		RegionID: authority.regionID, JobID: release.JobID, RequestID: release.RequestID,
+		TenantID: int64(binding.TenantID), RegionID: authority.regionID, JobID: release.JobID, RequestID: release.RequestID,
 		RunID: runID, RunAttempt: attempt, Deadline: deadline,
 	}
 	return cacheJobGrant{Authorization: authorization, Policy: policy}, nil

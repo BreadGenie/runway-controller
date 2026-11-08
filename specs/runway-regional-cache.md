@@ -134,3 +134,63 @@ standalone Garage config accepts optional `ca_pem` for HTTPS; managed service
 wiring supplies the provider through `store.Config`. Old standalone journals
 and object keys require no migration. A store instance selects one mode and
 refuses grants from the other mode.
+
+## Service mode
+
+`runway --action cache-service --config /etc/runway/cache-service.json` serves
+one direct mesh TLS listener. `POST /setup` carries the existing newline-framed
+setup wire v2 request and response; cache v1 `/_apis/artifactcache/...` and
+`/download/...` retain their paths on the same listener. The future guest relay
+must map its setup exchange to `/setup` and proxy translator paths unchanged.
+The response still names the fixed local relay, never a credential.
+
+Configuration is a version-1 JSON object with exactly these required keys:
+
+```json
+{
+  "version": 1,
+  "region_id": "blr-1",
+  "mesh_region_id": 1,
+  "listen": "[fdaa:1::10]:8443",
+  "audience": "https://cache-data.example.internal:8444",
+  "certificate_file": "/etc/runway/service.crt",
+  "private_key_file": "/etc/runway/service.key",
+  "signing_key_file": "/var/lib/runway-cache/signing.key",
+  "cache_data_ca_file": "/etc/runway/cache-data-ca.crt",
+  "github_token_file": "/etc/runway/github-token",
+  "central_url": "https://central.example.com",
+  "central_token_file": "/etc/runway/central-region-token",
+  "archive_bytes": 1073741824
+}
+```
+
+`mesh_region_id` is the numeric 16-bit mesh region; `region_id` is Central's
+region name and the grant region. `listen` must be a literal mesh IPv6 address
+in that numeric region with a nonzero port. All file paths are absolute and
+clean. Config, keys and tokens are root-owned private single-link regular files;
+certificates and CA files may be readable but cannot be group/world writable.
+The signing key is generated locally on first start in an existing root-owned
+private directory and atomically published without replacing an existing key.
+Only its public key belongs in cache-data's trusted issuers; no private key or
+Central token goes to a guest. Central HTTPS uses system trust roots and token
+authentication; redirects are refused. TLS ingress requires TLS 1.3.
+
+Caller identity comes exclusively from the direct connection's IPv6 peer,
+never forwarding headers. The layout is `fdaa | region (16) | tenant (32) |
+padding (48) | VM (16)`; other prefixes, regions, IPv4 and tenant zero are
+refused. Central must return that exact address, tenant and configured region,
+an unexpired lease and job evidence. Missing, ambiguous, malformed or failed
+lookups disable setup. GitHub REST then confirms the runner's in-progress job,
+display name, run and attempt, followed by the existing repository, event,
+branch, SHA, same-repository head and workflow-ref checks. Renewal rechecks
+Central identity and GitHub job liveness. One enabled setup and nonce replay
+fences remain per lease until its deadline; requests and live session counts
+are bounded. A service restart clears in-memory setup fences, as standalone
+host restart does. Setup work shares the existing 2.5-second budget.
+
+This first service issue retains existing grant/store scope. Tenant identity is
+carried into `grant.Authorization` as the namespace seam for issue 02; it is
+not yet a signed claim or a storage isolation boundary. Do not share this mode
+across mutually untrusted teams before that namespace change. Remote Garage,
+controller evidence recording, Central provisioning, Atlas deployment and the
+guest TLS relay are subsequent issues; no live service is qualified here.
