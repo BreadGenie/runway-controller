@@ -533,7 +533,8 @@ func (host *cacheHost) issue(ctx context.Context, binding cacheGuestBinding, rel
 	// Stop using the grant slightly before cache-data would refuse it.
 	expires = time.Unix(expires.Unix(), 0).Add(-5 * time.Second)
 	handler, err = transport.New(host.ctx, transport.Config{
-		Grant: transport.Grant{Bearer: bearer, Expires: expires}, Origin: host.audience, Roots: host.roots,
+		BindTickets: binding.service,
+		Grant:       transport.Grant{Bearer: bearer, Expires: expires}, Origin: host.audience, Roots: host.roots,
 		Limits: transport.Limits{RequestBytes: 64 << 10, ChunkBytes: 64 << 20, ResponseBytes: 64 << 10, HeaderBytes: 16384, ArchiveBytes: host.archiveBytes, URLBytes: 4096, Concurrent: 8, Timeout: cacheHostRequestLimit},
 	})
 	if err != nil {

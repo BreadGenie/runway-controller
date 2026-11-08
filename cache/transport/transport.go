@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,10 +38,12 @@ type Limits struct {
 
 // Config names the cache-data origin and the CA that signs its certificate.
 type Config struct {
-	Grant  Grant
-	Origin string
-	Roots  *x509.CertPool // copied
-	Limits Limits
+	// BindTickets confines managed archive reads to this authenticated session.
+	BindTickets bool
+	Grant       Grant
+	Origin      string
+	Roots       *x509.CertPool // copied
+	Limits      Limits
 }
 
 // Handler is scoped to one job's grant. Lookups are rewritten to the fixed
@@ -54,6 +57,8 @@ type Handler struct {
 	cancel    context.CancelFunc
 	transport *http.Transport
 	slots     chan struct{}
+	ticketsMu sync.Mutex
+	tickets   map[string]time.Time
 }
 
 func New(parent context.Context, c Config) (*Handler, error) {
@@ -64,6 +69,9 @@ func New(parent context.Context, c Config) (*Handler, error) {
 	}
 	ctx, cancel := context.WithDeadline(parent, c.Grant.Expires)
 	h := &Handler{grant: c.Grant, origin: *u, limits: l, ctx: ctx, cancel: cancel, slots: make(chan struct{}, l.Concurrent)}
+	if c.BindTickets {
+		h.tickets = map[string]time.Time{}
+	}
 	h.transport = &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: l.Timeout}).DialContext, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: c.Roots.Clone()}, TLSHandshakeTimeout: l.Timeout, ResponseHeaderTimeout: l.Timeout, MaxResponseHeaderBytes: l.HeaderBytes, MaxConnsPerHost: l.Concurrent, MaxIdleConnsPerHost: l.Concurrent, IdleConnTimeout: l.Timeout, DisableCompression: true}
 	return h, nil
 }
@@ -126,6 +134,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL == nil || len(r.RequestURI) > h.limits.URLBytes || len(r.URL.String()) > h.limits.URLBytes || (!download && !allowed(r)) {
 		fail(w, 400)
 		return
+	}
+	if download && h.tickets != nil {
+		h.ticketsMu.Lock()
+		until, ok := h.tickets[r.URL.String()]
+		h.ticketsMu.Unlock()
+		if !ok || !time.Now().Before(until) {
+			fail(w, http.StatusForbidden)
+			return
+		}
 	}
 	if download && (len(r.Header.Values("Range")) != 0 || len(r.Header.Values("If-Range")) != 0) {
 		fail(w, 400)
@@ -331,6 +348,21 @@ func (h *Handler) rewriteLookup(data []byte) ([]byte, error) {
 	if len(local) > h.limits.URLBytes {
 		return nil, errors.New("archive relay URL exceeds limit")
 	}
+	if h.tickets != nil {
+		h.ticketsMu.Lock()
+		now := time.Now()
+		for ticket, until := range h.tickets {
+			if !now.Before(until) {
+				delete(h.tickets, ticket)
+			}
+		}
+		if len(h.tickets) >= 1024 {
+			h.ticketsMu.Unlock()
+			return nil, errors.New("archive ticket limit")
+		}
+		h.tickets[u.String()] = minTime(now.Add(time.Minute), h.grant.Expires)
+		h.ticketsMu.Unlock()
+	}
 	fields["archiveLocation"], err = json.Marshal(local)
 	if err != nil {
 		return nil, err
@@ -367,4 +399,11 @@ func (h *Handler) streamArchive(w http.ResponseWriter, r *http.Request, resp *ht
 		// A local HTTP error here would become part of the downloaded archive.
 		panic(http.ErrAbortHandler)
 	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
