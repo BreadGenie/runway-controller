@@ -44,20 +44,37 @@ func candidate(script string) string {
 	return ""
 }
 
-func supported(script, name string) bool {
+// supported returns the script's sha256 ("" when unreadable) and whether it is
+// a pinned bundle.
+func supported(script, name string) (string, bool) {
 	f, err := os.OpenFile(script, os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return false
+		return "", false
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return false
+		return "", false
 	}
 	h := sha256.New()
 	// Pinned bundles are below 16 MiB. Bound reads of unexpected files.
 	n, err := io.Copy(h, io.LimitReader(f, 16<<20+1))
-	return err == nil && n <= 16<<20 && bundles[name][hex.EncodeToString(h.Sum(nil))]
+	if err != nil || n > 16<<20 {
+		return "", false
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+	return digest, bundles[name][digest]
+}
+
+// unpinned says, in the step's own log, that a cache action fell back to
+// GitHub's cache because its bundle is not allowlisted (e.g. a moved @v6 tag).
+func unpinned(name, script, digest string) string {
+	if digest == "" {
+		digest = "unreadable"
+	} else {
+		digest = "sha256:" + digest[:12]
+	}
+	return fmt.Sprintf("runway-cache: actions/%s bundle %s (%s) is not on the regional-cache allowlist; this step uses GitHub's cache", name, digest, filepath.Base(script))
 }
 
 func routed(env []string) []string {
@@ -70,12 +87,16 @@ func routed(env []string) []string {
 	return append(result, "ACTIONS_CACHE_URL="+route)
 }
 
-func environment(args, env []string, selectRoute func() bool) []string {
+func environment(args, env []string, selectRoute func() bool, notify func(string)) []string {
 	if len(args) < 2 {
 		return env
 	}
 	name := candidate(args[1])
-	if name == "" || !supported(args[1], name) {
+	if name == "" {
+		return env
+	}
+	if digest, ok := supported(args[1], name); !ok {
+		notify(unpinned(name, args[1], digest))
 		return env
 	}
 	if selectRoute() {
@@ -259,7 +280,7 @@ func minDeadline(a, b time.Time) time.Time {
 }
 
 func main() {
-	env := environment(os.Args, os.Environ(), func() bool { return selectRoute("/run/runway", os.Getenv, setup) })
+	env := environment(os.Args, os.Environ(), func() bool { return selectRoute("/run/runway", os.Getenv, setup) }, func(line string) { fmt.Fprintln(os.Stderr, line) })
 	// The non-candidate path performs no filesystem reads before exec.
 	real := filepath.Join(filepath.Dir(os.Args[0]), "node.real")
 	if err := syscall.Exec(real, os.Args, env); err != nil {
