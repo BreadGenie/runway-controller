@@ -38,3 +38,9 @@ runway-standalone-guest prepare-image regional-cache-node-v2 \
 ```
 
 Set RUNWAY_GUEST_IMAGE to select another prepared image.
+
+Guests boot with `clocksource=tsc` by default. On a nested-KVM host such as
+blr-1, kvm-clock has no stable flag, so every `clock_gettime` in the guest is a
+syscall (about 4x slower). The guest keeps its TSC watchdog. Set
+`RUNWAY_GUEST_CLOCKSOURCE=kvm-clock` to opt out, or set it empty to leave the
+choice to the guest kernel.
