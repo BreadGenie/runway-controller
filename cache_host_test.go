@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,8 +69,12 @@ func startCacheHostFixture(t *testing.T, test *authorityCase, configure ...func(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
 	uds := filepath.Join(dir, "v.sock")
 	test.binding.VsockUDS, test.binding.FirecrackerPID = uds, os.Getpid()
+	test.binding.JailUID, test.binding.JailGID = uint32(os.Getuid()), uint32(os.Getgid())
 	authority, github := test.authority(t)
 	_, private, _ := ed25519.GenerateKey(rand.Reader)
 	logs, logMu := &strings.Builder{}, &sync.Mutex{}
@@ -80,7 +86,7 @@ func startCacheHostFixture(t *testing.T, test *authorityCase, configure ...func(
 			return grant.Clock{Earliest: now.Add(-300 * time.Millisecond), Latest: now.Add(300 * time.Millisecond)}, nil
 		},
 		key: private, audience: data.URL, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, archiveBytes: 1 << 20,
-		peer: cacheUnixPeerPID,
+		peer: cacheUnixPeerCredentials, directoryGroup: cacheTestSocketGroup,
 		log: func(fields map[string]any) {
 			encoded, _ := json.Marshal(fields)
 			logMu.Lock()
@@ -311,7 +317,7 @@ func TestCacheHostAnswersSetupWhenItIsUnavailable(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	config := cacheHostConfig{Version: 1, RegionID: "blr-1", Audience: "https://127.0.0.1:18445", CacheDataCAFile: "/nonexistent/ca.pem", SigningKeyFile: "/nonexistent/key.pem", GitHubTokenFile: "/nonexistent/token", BindingDir: "/nonexistent", VMDir: dir, AssignmentDir: "/nonexistent", ArchiveBytes: 1 << 20}
-	if err := os.Mkdir(filepath.Join(dir, test.binding.VMID), 0700); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, test.binding.VMID), 0750); err != nil {
 		t.Fatal(err)
 	}
 	logs := &strings.Builder{}
@@ -324,8 +330,10 @@ func TestCacheHostAnswersSetupWhenItIsUnavailable(t *testing.T) {
 	})
 	bindings := &fakeBindings{}
 	host.bindings = bindings
+	host.directoryGroup = cacheTestSocketGroup
 	binding := test.binding
 	binding.VsockUDS, binding.FirecrackerPID = host.uds, os.Getpid()
+	binding.JailUID, binding.JailGID = uint32(os.Getuid()), uint32(os.Getgid())
 	bindings.set(&binding)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -425,5 +433,73 @@ func TestCacheHostSharesResolutionAndBoundsConnections(t *testing.T) {
 	}
 	for _, conn := range append(held, extra) {
 		conn.Close()
+	}
+}
+
+func TestCacheHostRejectsPeerIdentityMismatch(t *testing.T) {
+	for _, field := range []string{"uid", "gid"} {
+		t.Run(field, func(t *testing.T) {
+			test := newAuthorityCase(t)
+			host := startCacheHostFixture(t, test)
+			binding := test.binding
+			switch field {
+			case "uid":
+				binding.JailUID++
+			case "gid":
+				binding.JailGID++
+			}
+			host.bindings.set(&binding)
+			if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("peer_mismatch") {
+				t.Fatal("foreign identity accepted", outcome, host.logsText())
+			}
+		})
+	}
+}
+
+func TestCacheSocketDirectoryPermissions(t *testing.T) {
+	dir := t.TempDir()
+	for _, mode := range []os.FileMode{0700, 0755, 0770, 0750} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		_, err := cacheSocketDirectoryGroup(dir)
+		if (err == nil) != (mode == 0750 && os.Getuid() == 0) {
+			t.Fatalf("mode %o: %v", mode, err)
+		}
+	}
+	if os.Getuid() != 0 {
+		return
+	}
+	if err := os.Chown(dir, 1, os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cacheSocketDirectoryGroup(dir); err == nil {
+		t.Fatal("non-root directory accepted")
+	}
+}
+
+// Socket fixtures run as the test user; production requires root ownership.
+func cacheTestSocketGroup(dir string) (uint32, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return 0, err
+	}
+	return info.Sys().(*syscall.Stat_t).Gid, nil
+}
+
+func TestCacheHostRejectsWrongDirectoryGroup(t *testing.T) {
+	test := newAuthorityCase(t)
+	binding := test.binding
+	binding.JailUID, binding.JailGID = 1001, 1001
+	bindings := &fakeBindings{}
+	bindings.set(&binding)
+	host := &cacheHost{vmID: binding.VMID, uds: binding.VsockUDS, bindings: bindings,
+		peer: func(net.Conn) (*unix.Ucred, error) {
+			return &unix.Ucred{Pid: int32(binding.FirecrackerPID), Uid: binding.JailUID, Gid: binding.JailGID}, nil
+		},
+		directoryGroup: func(string) (uint32, error) { return binding.JailGID + 1, nil },
+	}
+	if _, reason := host.authenticate(nil); reason != "peer_mismatch" {
+		t.Fatal("wrong directory group accepted", reason)
 	}
 }

@@ -29,6 +29,8 @@ type cacheGuestBinding struct {
 	VMID           string    `json:"vm_id"`
 	VsockUDS       string    `json:"vsock_uds"`
 	FirecrackerPID int       `json:"firecracker_pid"`
+	JailUID        uint32    `json:"jail_uid"`
+	JailGID        uint32    `json:"jail_gid"`
 	GuestCID       uint32    `json:"guest_cid"`
 	RunnerID       int64     `json:"runner_id"`
 	RunnerName     string    `json:"runner_name"`
@@ -40,7 +42,7 @@ var cacheVMIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 func (binding cacheGuestBinding) validate() error {
 	parts := strings.Split(binding.Repository, "/")
-	if binding.Version != 1 || !cacheVMIDPattern.MatchString(binding.VMID) || !filepath.IsAbs(binding.VsockUDS) || filepath.Clean(binding.VsockUDS) != binding.VsockUDS || binding.FirecrackerPID <= 1 || binding.GuestCID < 3 || binding.RunnerID <= 0 || binding.RunnerName == "" || len(binding.RunnerName) > 255 || strings.ContainsAny(binding.RunnerName, "\x00\r\n\t ") || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
+	if binding.Version != 2 || !cacheVMIDPattern.MatchString(binding.VMID) || !filepath.IsAbs(binding.VsockUDS) || filepath.Clean(binding.VsockUDS) != binding.VsockUDS || binding.FirecrackerPID <= 1 || binding.GuestCID < 3 || binding.RunnerID <= 0 || binding.RunnerName == "" || len(binding.RunnerName) > 255 || strings.ContainsAny(binding.RunnerName, "\x00\r\n\t ") || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
 		return grant.ErrInvalid
 	}
 	return nil
@@ -48,7 +50,7 @@ func (binding cacheGuestBinding) validate() error {
 
 func decodeCacheGuestBinding(data []byte) (cacheGuestBinding, error) {
 	var binding cacheGuestBinding
-	if readCacheObject(data, []string{"version", "vm_id", "vsock_uds", "firecracker_pid", "guest_cid", "runner_id", "runner_name", "repository", "expires_at"}) != nil || json.Unmarshal(data, &binding) != nil || binding.validate() != nil {
+	if readCacheObject(data, []string{"version", "vm_id", "vsock_uds", "firecracker_pid", "jail_uid", "jail_gid", "guest_cid", "runner_id", "runner_name", "repository", "expires_at"}) != nil || json.Unmarshal(data, &binding) != nil || binding.validate() != nil {
 		return cacheGuestBinding{}, grant.ErrInvalid
 	}
 	return binding, nil
