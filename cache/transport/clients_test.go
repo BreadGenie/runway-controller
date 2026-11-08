@@ -20,6 +20,21 @@ func TestPinnedClientsThroughRelay(t *testing.T) {
 	if os.Getenv("RUNWAY_CACHE_CLIENT_TEST") != "1" {
 		t.Skip("set RUNWAY_CACHE_CLIENT_TEST=1 for offline pinned Node/Yarn integration")
 	}
+	list := exec.Command("python3", "../../integrations/actions-cache/test_relay_clients.py", "--list-clients")
+	output, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list pinned clients: %v\n%s", err, output)
+	}
+	clients := strings.Fields(string(output))
+	if len(clients) == 0 {
+		t.Fatal("no pinned clients")
+	}
+	for _, client := range clients {
+		t.Run(client, func(t *testing.T) { testPinnedClientThroughRelay(t, client) })
+	}
+}
+
+func testPinnedClientThroughRelay(t *testing.T, client string) {
 	service := storetest.Start(t, func(c *store.Config) {
 		c.QuotaBytes, c.TotalBytes, c.MaxArchiveBytes, c.Disk.PhysicalBytes = 8<<20, 8<<20, 4<<20, 32<<20
 	})
@@ -53,16 +68,20 @@ func TestPinnedClientsThroughRelay(t *testing.T) {
 	origin, _ := url.Parse(front.URL)
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "python3", "../../integrations/actions-cache/test_relay_clients.py", "--transport-port", origin.Port())
+	command := exec.CommandContext(ctx, "python3", "../../integrations/actions-cache/test_relay_clients.py", "--transport-port", origin.Port(), "--client", client)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("pinned relay client regression failed: %v\n%s", err, output)
 	}
-	if downloads.Load() != 3 {
-		t.Fatalf("relay archive reads=%d, want 3", downloads.Load())
+	wantDownloads := int32(1)
+	if strings.HasPrefix(client, "cache/") {
+		wantDownloads = 2
 	}
-	if chunks.Load() < 8 {
-		t.Fatalf("upload chunks=%d, want at least 8", chunks.Load())
+	if downloads.Load() != wantDownloads {
+		t.Fatalf("relay archive reads=%d, want %d", downloads.Load(), wantDownloads)
 	}
-	t.Log(string(output))
+	if chunks.Load() < 4 {
+		t.Fatalf("upload chunks=%d, want at least 4", chunks.Load())
+	}
+	t.Logf("%supload chunks=%d; archive reads=%d", output, chunks.Load(), downloads.Load())
 }

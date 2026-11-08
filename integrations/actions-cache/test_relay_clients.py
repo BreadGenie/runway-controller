@@ -27,13 +27,19 @@ def require(condition, message):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--transport-port", type=int, required=True)
+    parser.add_argument("--transport-port", type=int)
+    parser.add_argument("--client")
+    parser.add_argument("--list-clients", action="store_true")
     args = parser.parse_args()
+    if args.list_clients:
+        print("\n".join(case[0] for case in cache.client_cases()))
+        return
+    require(args.transport_port is not None, "--transport-port is required")
     node = os.environ.get("NODE_BIN", cache.NODE_DEFAULT)
     require(not cache.check_tools(node), "Node/tar/zstd prerequisite missing")
     require(bool(setup.YARN_BIN), "Yarn prerequisite missing")
-    cache_bundles = cache.fetch_bundles("cache")
-    setup_bundles = setup.fetch_bundles("setup-node")
+    selected = [case for case in cache.client_cases() if case[0] == args.client]
+    require(len(selected) == 1, "unknown pinned client: " + args.client)
     relay_path = Path(__file__).parents[1] / "actions-runner" / "cache-relay"
     loader = importlib.machinery.SourceFileLoader("cache_relay", str(relay_path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -75,7 +81,8 @@ tls.connect = function() {
             for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
                 os.environ.pop(variable, None)
             os.environ["NO_PROXY"] = "127.0.0.1"
-            for kind, bundles in (("cache", cache_bundles), ("setup-node", setup_bundles)):
+            for label, kind, version, mode in selected:
+                bundles = cache.fetch_bundles(version)
                 workspace = root / kind / "workspace"
                 workspace.mkdir(parents=True)
                 client = cache.Client(bundles, node, "http://127.0.0.1:18080/")
@@ -84,7 +91,7 @@ tls.connect = function() {
                     content = workspace / "content"
                     content.mkdir()
                     inputs = {"path": str(content), "key": "relay-cache-key", "upload-chunk-size": "524288"}
-                    restore, save = "restore", "save"
+                    restore, save = ("restore", "save") if mode == "main-post" else ("restore-only", "save-only")
                 else:
                     (workspace / "package.json").write_text('{"name":"relay-fixture","private":true}')
                     (workspace / "yarn.lock").write_text('# yarn lockfile v1\n')
@@ -96,7 +103,7 @@ tls.connect = function() {
                 (content / "archive.bin").write_bytes(os.urandom(2 * 1024 * 1024))
                 expected = cache.file_tree_hashes(str(content))
                 rc, output, outputs, state = client.run_action(restore, inputs, "github-secret", str(workspace), extra_env=extra, timeout=30)
-                require(rc == 0 and outputs.get("cache-hit") != "true" and state.get("CACHE_KEY"), kind + " miss failed: " + output)
+                require(rc == 0 and outputs.get("cache-hit") != "true" and (state.get("CACHE_KEY") or mode == "only"), kind + " miss failed: " + output)
                 post = dict(extra, **{"STATE_" + key: value for key, value in state.items()})
                 rc, output, _, _ = client.run_action(save, inputs, "github-secret", str(workspace), extra_env=post, timeout=30)
                 require(rc == 0 and "Cache saved with" in output, kind + " save failed: " + output)
@@ -112,7 +119,7 @@ tls.connect = function() {
                     rc, output, outputs, _ = client.run_action(restore, fallback, "github-secret", str(workspace), extra_env=extra, timeout=30)
                     require(rc == 0 and outputs.get("cache-hit") == "false", "restore-key did not report a partial hit: " + output)
                     require(cache.file_tree_hashes(str(content)) == expected, "restore-key bytes changed")
-                print(kind + ": miss, save, relay restore and byte equality passed", flush=True)
+                print(label + ": miss, save, exact hit, " + ("restore-key hit, " if kind == "cache" else "") + "byte equality passed", flush=True)
             connections = audit.read_text().splitlines()
             require(connections and set(connections) == {"relay"}, "client attempted a direct service connection")
             print("client connections reached only the fixed guest relay", flush=True)

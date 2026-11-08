@@ -1,7 +1,10 @@
 # Regional Actions cache
 
-Standalone deployment on blr-1 for actions/cache@0057852b (v4.3.0) and
-setup-node@24997072 (v6.5.0), cache protocol v1. Other traffic keeps its route.
+Standalone deployment on blr-1 supports actions/cache v4.3.0 (`0057852bfaa89a56745cba8c7296529d2fc39830`),
+v5.1.0 (`caa296126883cff596d87d8935842f9db880ef25`), v6.1.0 (`55cc8345863c7cc4c66a329aec7e433d2d1c52a9`),
+and actions/setup-node v6.5.0 (`249970729cb0ef3589644e2896645e5dc5ba9c38`),
+v7.1.0 (`949feb2413d6458794dcd2491c4babbbce0c15c1`), using cache protocol v1.
+Other traffic keeps its route.
 Only same-repository branch pushes and workflow_dispatch qualify; PRs, forks,
 tags, container jobs and unsupported revisions retain GitHub caching.
 A static external-Node wrapper hashes only supported action candidates and lazily
