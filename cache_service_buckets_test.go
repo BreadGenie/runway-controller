@@ -203,3 +203,24 @@ func TestCacheServiceBucketFailureDisablesSetup(t *testing.T) {
 		})
 	}
 }
+
+func TestManagedBucketReloadsCentralCredential(t *testing.T) {
+	current := "first"
+	central := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "token "+current {
+			w.WriteHeader(401)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"team": "a", "tenant_id": 1, "bucket": "a", "endpoint": "https://storage.example", "region": "garage", "access_key": "key", "secret_key": "secret"})
+	}))
+	defer central.Close()
+	p := &cacheBucketProvider{central: cacheCentralHTTPS{origin: central.URL, token: "stale", client: central.Client()}, credential: func() (string, error) { return current, nil }}
+	if _, err := p.Bucket(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	current = "second"
+	p.Invalidate(1)
+	if _, err := p.Bucket(t.Context(), 1); err != nil {
+		t.Fatal("did not reload rotated credential", err)
+	}
+}

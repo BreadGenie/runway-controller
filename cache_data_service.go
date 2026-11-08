@@ -148,8 +148,12 @@ func runCacheDataService(configPath string) error {
 		}
 		core.CleanupStaleAfter = time.Duration(m.CleanupStaleHours) * time.Hour
 		core.Buckets = &cacheBucketProvider{
-			central: cacheCentralHTTPS{origin: m.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}},
+			central: cacheCentralHTTPS{origin: m.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}},
 			ca:      string(ca),
+			credential: func() (string, error) {
+				token, err := readProtectedCacheFile(m.CentralTokenFile, true)
+				return strings.TrimSpace(string(token)), err
+			},
 		}
 	}
 	certificate, certErr := readProtectedCacheFile(config.CertificateFile, false)

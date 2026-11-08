@@ -24,6 +24,7 @@ type cacheBucketEntry struct {
 
 type cacheBucketProvider struct {
 	central    cacheCentralHTTPS
+	credential func() (string, error)
 	ca         string
 	mu         sync.Mutex
 	entries    map[int64]cacheBucketEntry
@@ -38,7 +39,15 @@ func (p *cacheBucketProvider) Bucket(ctx context.Context, tenant int64) (store.G
 	}
 	generation := p.generation
 	p.mu.Unlock()
-	config, err := p.central.bucket(ctx, "", tenant, p.ca)
+	central := p.central
+	if p.credential != nil {
+		token, err := p.credential()
+		if err != nil {
+			return store.GarageConfig{}, grant.ErrInvalid
+		}
+		central.token = token
+	}
+	config, err := central.bucket(ctx, "", tenant, p.ca)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err != nil || p.generation != generation {
