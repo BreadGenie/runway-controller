@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -267,5 +268,83 @@ func TestMalformedOfferIsNotAcquired(t *testing.T) {
 	err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 77, OwnerName: "owner"}}}})
 	if err == nil || !strings.Contains(err.Error(), "repository") {
 		t.Fatalf("malformed repository accepted: %v", err)
+	}
+}
+
+func TestAssignedEvidenceOrderingAndRestart(t *testing.T) {
+	for _, request := range []int64{0, 77} {
+		for _, assignedFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("request=%d/assignedFirst=%v", request, assignedFirst), func(t *testing.T) {
+				s := newPilotStore()
+				lease := prepareVM(t, s)
+				lease.Phase = "running"
+				lease.RunnerID = 42
+				lease.RequestID = request
+				e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+				useCentralContract(t, e, s, "")
+				store := e.store
+				job := scaleset.JobMessageBase{JobID: "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e", RunnerRequestID: request, WorkflowRunID: 4242, JobDisplayName: "test", JobWorkflowRef: "owner/repo/.github/workflows/ci.yml@refs/heads/main", EventName: "push"}
+				assigned := &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: job}}}
+				started := &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{RunnerName: lease.RunnerName, RunnerID: 42, JobMessageBase: job}}}
+				if request > 0 {
+					started.JobStartedMessages[0].JobDisplayName = ""
+					started.JobStartedMessages[0].JobWorkflowRef = ""
+					started.JobStartedMessages[0].EventName = ""
+				}
+				messages := []*scaleset.RunnerScaleSetMessage{started, assigned}
+				if assignedFirst {
+					messages = []*scaleset.RunnerScaleSetMessage{assigned, started}
+				}
+				for _, m := range messages {
+					if err := e.Handle(context.Background(), m); err != nil {
+						t.Fatal(err)
+					}
+				}
+				got := *s.find(lease.ID)
+				if got.JobDisplayName != job.JobDisplayName || got.JobWorkflowRef != job.JobWorkflowRef || got.EventName != "push" || !got.Started || got.WorkflowRunID != "4242" || got.RunAttempt != "" {
+					t.Fatalf("lost evidence: %+v", got)
+				}
+				count := len(s.events)
+				e = newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+				e.store = store
+				for _, m := range messages {
+					if err := e.Handle(context.Background(), m); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if len(s.events) != count {
+					t.Fatal("restart replay wrote evidence")
+				}
+				for _, field := range []string{"name", "ref", "run"} {
+					conflict := job
+					switch field {
+					case "name":
+						conflict.JobDisplayName = "other"
+					case "ref":
+						conflict.JobWorkflowRef = "other"
+					case "run":
+						conflict.WorkflowRunID = 999
+					}
+					if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: conflict}}}); err == nil {
+						t.Fatal("accepted conflicting", field)
+					}
+				}
+				if len(s.events) != count {
+					t.Fatal("conflict wrote evidence")
+				}
+			})
+		}
+	}
+}
+
+func TestUnmatchedAssignmentIgnored(t *testing.T) {
+	s := newPilotStore()
+	prepareVM(t, s)
+	e := newPilotEngine(s, &fakePilotGitHub{store: s}, &fakeGuestTransport{})
+	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 99}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.events) != 0 {
+		t.Fatal("unmatched assignment changed lease")
 	}
 }

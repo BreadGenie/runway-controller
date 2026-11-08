@@ -198,3 +198,7 @@ Keep `scripts/metal-guest-transport.py`, `guest/guest_agent.py`, and
 `guest/guest-runner.sh` in their repository layout when installing the transport.
 The transport reads the guest agent and runner wrapper beside the scripts directory
 and delivers them over SSH; the guest agent needs only Python's standard library.
+
+JobAssigned evidence is attached only by an existing positive request ID or job UUID; the SDK message contains no runner name or ID. Ambiguous matches are refused and unmatched messages are ignored. Direct dispatch with request ID zero becomes attributable at JobStarted; a later JobAssigned can enrich that lease. No lease is selected merely because it is the only active lease.
+
+The Central patch adds immutable `run_attempt`, `job_display_name`, `job_workflow_ref`, and `event_name` fields to `update_lease` and snapshots, plus a monotonic `started` snapshot flag set only by JobStarted (bootstrap alone does not establish a job start). The pinned scale-set SDK exposes no run attempt, so it remains unset; no attempt is inferred. Missing evidence preserves prior values. Migrate Central before deploying this controller. Replayed assigned/started evidence produces no update when nothing changes.

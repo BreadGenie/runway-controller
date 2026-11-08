@@ -17,7 +17,7 @@ new file mode 100644
 index 0000000..09909cc
 --- /dev/null
 +++ b/central/api/runway.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,56 @@
 +import frappe
 +
 +from central.infrastructure import runway
@@ -54,10 +54,15 @@ index 0000000..09909cc
 +	request_id: int = 0,
 +	repository: str = "",
 +	request_labels: str = "",
++	run_attempt: str = "",
++	job_display_name: str = "",
++	job_workflow_ref: str = "",
++	event_name: str = "",
 +) -> dict:
 +	return runway.update_lease(
 +		pool, owner_id, fence, lease_id, event, runner_id, job_id, workflow_run_id,
 +		result, error, request_id, repository, request_labels,
++		run_attempt, job_display_name, job_workflow_ref, event_name,
 +	)
 +
 +
@@ -145,7 +150,7 @@ new file mode 100644
 index 0000000..8589a47
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,269 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Lease",
@@ -179,7 +184,12 @@ index 0000000..8589a47
 +  "request_id",
 +  "acquire_state",
 +  "repository",
-+  "request_labels"
++  "request_labels",
++  "run_attempt",
++  "job_display_name",
++  "job_workflow_ref",
++  "event_name",
++  "started"
 + ],
 + "fields": [
 +  {
@@ -356,6 +366,36 @@ index 0000000..8589a47
 +   "fieldname": "request_labels",
 +   "label": "Request Labels",
 +   "fieldtype": "Small Text",
++   "read_only": 1
++  },
++  {
++   "fieldname": "run_attempt",
++   "label": "Run Attempt",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "job_display_name",
++   "label": "Job Display Name",
++   "fieldtype": "Small Text",
++   "read_only": 1
++  },
++  {
++   "fieldname": "job_workflow_ref",
++   "label": "Job Workflow Ref",
++   "fieldtype": "Small Text",
++   "read_only": 1
++  },
++  {
++   "fieldname": "event_name",
++   "label": "Event Name",
++   "fieldtype": "Data",
++   "read_only": 1
++  },
++  {
++   "fieldname": "started",
++   "label": "Started",
++   "fieldtype": "Check",
 +   "read_only": 1
 +  }
 + ],
@@ -713,7 +753,7 @@ new file mode 100644
 index 0000000..3327522
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,301 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -791,6 +831,10 @@ index 0000000..3327522
 +		"runner_id",
 +		"job_id",
 +		"workflow_run_id",
++		"run_attempt",
++		"job_display_name",
++		"job_workflow_ref",
++		"event_name",
 +		"vm_id",
 +		"vm_state",
 +		"mesh_address",
@@ -806,6 +850,7 @@ index 0000000..3327522
 +		"id": lease.name,
 +		**result,
 +		"request_id": int(lease.request_id or 0),
++		"started": bool(lease.started),
 +		"deadline": iso_utc(lease.deadline),
 +	}
 +
@@ -933,6 +978,10 @@ index 0000000..3327522
 +	request_id: int = 0,
 +	repository: str = "",
 +	request_labels: str = "",
++	run_attempt: str = "",
++	job_display_name: str = "",
++	job_workflow_ref: str = "",
++	event_name: str = "",
 +) -> dict:
 +	_pool, lease = fenced_lease(pool, owner_id, fence, lease_id)
 +	# Missing evidence leaves earlier observations intact, including direct dispatch
@@ -945,6 +994,10 @@ index 0000000..3327522
 +		("runner_id", runner_id),
 +		("job_id", job_id),
 +		("workflow_run_id", workflow_run_id),
++		("run_attempt", run_attempt),
++		("job_display_name", job_display_name),
++		("job_workflow_ref", job_workflow_ref),
++		("event_name", event_name),
 +		("repository", repository),
 +		("request_labels", request_labels),
 +	)
@@ -958,6 +1011,9 @@ index 0000000..3327522
 +			frappe.throw(_("A retiring runner cannot acquire work."))
 +		lease.request_id = str(request_id)
 +		lease.acquire_state = "pending" if lease.acquire_state != "acquired" else "acquired"
++	elif event == "assigned":
++		if lease.phase in ("deleting", "deleted"):
++			frappe.throw(_("A retiring runner cannot receive assignment evidence."))
 +	elif event == "acquired":
 +		if not lease.request_id or lease.acquire_state not in ("pending", "acquired"):
 +			frappe.throw(_("Persist job acquisition intent first."))
@@ -984,6 +1040,8 @@ index 0000000..3327522
 +		lease.phase = after
 +		if event in ("jit_requested", "jit_ready"):
 +			lease.jit_state = "pending" if event == "jit_requested" else "ready"
++		if event == "started":
++			lease.started = 1
 +		if event in ("started", "bootstrapped"):
 +			lease.started_at = lease.started_at or now_datetime()
 +	for field, value in identities:
@@ -1228,7 +1286,7 @@ new file mode 100644
 index 0000000..880e932
 --- /dev/null
 +++ b/central/tests/test_runway.py
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,444 @@
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
 +from types import SimpleNamespace
@@ -1316,10 +1374,12 @@ index 0000000..880e932
 +		evidence = {
 +			"runner_id": 42, "job_id": str(uuid4()), "workflow_run_id": "4242",
 +			"repository": "example/ci", "request_labels": "self-hosted\nrunway-dogfood",
++			"job_display_name": "test", "job_workflow_ref": "example/ci/.github/workflows/ci.yml@refs/heads/main",
++			"event_name": "push", "run_attempt": "2",
 +		}
-+		for _attempt in range(2):
++		for event in ("assigned", "started", "assigned", "started"):
 +			result = update_lease(
-+				self.pool.name, self.owner, self.fence, lease["id"], "started", **evidence
++				self.pool.name, self.owner, self.fence, lease["id"], event, **evidence
 +			)
 +			self.assertEqual(result["request_id"], 0)
 +			for field, value in evidence.items():
@@ -1335,11 +1395,13 @@ index 0000000..880e932
 +		values = {
 +			"phase": "running", "runner_id": 42, "request_id": "77", "job_id": str(uuid4()),
 +			"workflow_run_id": "4242", "repository": "example/ci", "request_labels": "runway-dogfood",
++			"job_display_name": "test", "job_workflow_ref": "workflow", "event_name": "push", "run_attempt": "2",
 +		}
 +		frappe.db.set_value("Runner Lease", lease["id"], dict(values))
 +		for field, value in {
 +			"runner_id": 99, "request_id": 88, "job_id": str(uuid4()), "workflow_run_id": "999",
 +			"repository": "other/repo", "request_labels": "other-label",
++			"job_display_name": "other", "job_workflow_ref": "other", "event_name": "pull_request", "run_attempt": "3",
 +		}.items():
 +			with self.subTest(field=field), self.assertRaises(frappe.ValidationError):
 +				runway.update_lease(
@@ -1732,6 +1794,6 @@ index 0000000..4d7234d
 +
 +### Job evidence
 +
-+Runner Lease records repository and request labels from available, started and completed events. A direct assignment can have request ID zero and reveal job identity only after VM creation and runner registration. Missing evidence preserves earlier observations; conflicting nonempty runner, job, workflow, repository, labels or positive request IDs are refused. Started events require a running lease; the controller first resolves an interrupted bootstrap acknowledgment when needed.
++Runner Lease records repository, request labels, run attempt (when known), job display name, job workflow ref and event name from available, assigned, started and completed events. The assigned event enriches identity without advancing the lease phase. The started snapshot flag is set only by a started event. A direct assignment can have request ID zero and reveal job identity only after VM creation and runner registration. Missing evidence preserves earlier observations; conflicting nonempty runner, job, workflow, repository, labels or positive request IDs are refused. Started events require a running lease; the controller first resolves an interrupted bootstrap acknowledgment when needed.
 +
 +This recording contract does not establish repository/image compatibility before VM creation. The controller must continue provisioning from demand even when job identity has not arrived.
