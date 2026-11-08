@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -40,11 +41,12 @@ func runController(path string) error {
 	// retry policy. Uncertain JIT outcomes are represented by Central phases.
 	adminHTTP := retryablehttp.NewClient()
 	adminHTTP.RetryMax = 0
-	github, err := authenticatedClient(ctx, snapshot.Pool.RepositoryURL, scaleset.WithRetryableHTTPClint(adminHTTP), scaleset.WithTimeout(20*time.Second))
+	var rest *http.Client
+	github, err := authenticatedControllerClient(ctx, snapshot.Pool.RepositoryURL, &rest, scaleset.WithRetryableHTTPClint(adminHTTP), scaleset.WithTimeout(20*time.Second))
 	if err != nil {
 		return err
 	}
-	engine := &pilotEngine{store: central, github: github, guest: commandTransport{command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
+	engine := &pilotEngine{store: central, github: github, assignmentREST: rest, guest: commandTransport{command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
 	json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_claimed", "pool": cfg.Pool, "owner_id": cfg.OwnerID, "fence": snapshot.Fence})
 	lifecycle := controllerLifecycle{
 		engine: engine,

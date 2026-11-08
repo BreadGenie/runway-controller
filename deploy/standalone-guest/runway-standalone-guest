@@ -162,6 +162,11 @@ launch() {
 	for unit in atlas-metadata.service runway-initialize.service; do ln -sf /dev/null "$root/etc/systemd/system/$unit"; done
 	# This branch's guest cache helpers (install.sh stages them), not the image's.
 	install -m 0755 "$guest_files/cache-relay" "$root/opt/runway/bin/"
+	# Explicit standalone transport, even when cloning a service-prepared image.
+	install -d -m 0755 "$root/etc/runway"
+	printf '{"version":1,"mode":"vsock"}\n' > "$root/etc/runway/cache.json"
+	chmod 0644 "$root/etc/runway/cache.json"
+	chown root:root "$root/etc/runway/cache.json"
 	# The guest's /run is tmpfs: systemd-tmpfiles creates the route directory at boot.
 	mkdir -p "$root/etc/tmpfiles.d"
 	printf 'd /run/runway 0700 runner runner -\n' > "$root/etc/tmpfiles.d/runway-cache.conf"

@@ -319,3 +319,23 @@ func TestDownloadSlowReaderDeadline(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedDownloadRequiresSessionLookup(t *testing.T) {
+	var origin string
+	_, front := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/download/") {
+			io.WriteString(w, "abc")
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"archiveLocation": origin + ticketPath})
+	}, func(c *Config) { downloads(c); c.BindTickets = true; origin = c.Origin })
+	if status, _ := send(t, front, "GET", ticketPath, ""); status != 403 {
+		t.Fatal("unissued ticket accepted", status)
+	}
+	if status, _ := send(t, front, "GET", "/_apis/artifactcache/cache?keys=k&version=v", ""); status != 200 {
+		t.Fatal("lookup", status)
+	}
+	if status, _ := send(t, front, "GET", ticketPath, ""); status != 200 {
+		t.Fatal("issued ticket refused", status)
+	}
+}

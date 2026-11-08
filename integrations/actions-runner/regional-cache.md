@@ -114,3 +114,48 @@ job and uses the automatic GITHUB_TOKEN; no additional secret is required.
 Organization policy must permit these permissions. PRs created with GITHUB_TOKEN
 do not trigger ordinary pull_request workflows; the bot runs its checks before
 creating the PR. Required external checks may need a human-triggered run.
+
+Controller guests opt in during `prepare` (see [pilot](../../docs/pilot.md)):
+`--regional-cache internal-cache:443 --regional-cache-ca /controller/cache-ca.pem
+--regional-cache-node /controller/cache-node`. Both paths are local to the
+controller. The adapter reads the CA, current static wrapper, repository relay
+and unit, base64 encodes them in `regional_cache` in the existing JSON payload,
+and carries them over SSH stdin through Metal to the guest. No new host file
+staging, download endpoint, credentials or vsock is needed. The adapter carries
+these bytes only for prepare; status/bootstrap/collect/stop ignore the flags.
+
+The root-owned, non-writable-by-runner `/etc/runway/cache.json` schema is:
+
+```json
+{"version":1,"mode":"service","service":"internal-cache:443","ca_file":"/etc/runway/cache-ca.pem"}
+```
+
+`service` must be an `internal-` DNS name with a port (1–65535). The CA path is
+fixed; the PEM and config are root-owned 0644 regular files, with no group/world
+write permission or symlinks. The relay verifies TLS using only that CA and the
+service name; there is no HTTP fallback. It accepts IPv4 loopback clients and
+opens IPv4 or IPv6 mesh connections. Its connection, buffering and idle limits
+are unchanged. TLS carries HTTP request framing; a local half-close does not
+truncate the upstream TLS stream before its response arrives.
+
+Only an allowlisted candidate reads the mode/config. In service mode the wrapper
+POSTs the unchanged setup v2 JSON line to `https://<service>/setup`, using the
+same pinned CA and name checks. Proxies and redirects are disabled. The relay
+probe (200 ms), TCP connect (1 s), setup exchange (3 s) and total including lock
+wait (4 s) remain bounded. Disabled, timeout, malformed response, bad TLS and
+unsafe configuration all persist the ordinary disabled decision for the job.
+No tokens are logged or placed in the config.
+
+Preparation requires both external node20/node24 binaries on an unregistered
+clone reporting `installed`. It preserves each `node.real`, atomically installs
+root-owned helpers/config/CA/unit and creates the runner-owned 0700 decision
+directory `/run/runway` (also recreated through tmpfiles on boot), then reloads,
+enables and starts the relay. Repeated preparation preserves the original Nodes.
+Any installation/service error restores prior files and service state and fails
+prepare, so the controller requests no JIT. Registered guests are refused.
+
+The standalone launcher explicitly writes `{"version":1,"mode":"vsock"}`;
+absent config also preserves legacy standalone behavior (setup vsock 1026,
+translator vsock 1027). Invalid existing config fails closed rather than choosing
+vsock. Controller releases must carry a rebuilt `cache-node` so allowlist updates
+ship with the controller, alongside the matching relay and unit.

@@ -5,8 +5,12 @@ The SSH adapter ships this standalone file unchanged. Tests call execute with a
 private filesystem layout; paths supplied over the wire are never accepted.
 """
 
+import base64
 import json
 import os
+import pwd
+import re
+import ssl
 import shutil
 import socket
 import stat
@@ -21,6 +25,7 @@ from typing import NamedTuple
 
 class _Paths(NamedTuple):
     """Internal filesystem adapter: baked guest defaults or private test files."""
+    system_root: Path = Path('/')
     marker: Path = Path('/var/lib/runway/bootstrap.json')
     runner: Path = Path('/home/runner/actions-runner')
     cache: Path = Path('/home/runner/.cache')
@@ -31,6 +36,154 @@ class _Paths(NamedTuple):
     manifest: Path = Path('/etc/runway-frappe-bench.json')
     secret: Path = Path('/home/runner/runway.jit')
     wrapper: Path = Path('/usr/local/bin/runway-guest-runner')
+
+
+def install_regional_cache(bundle, paths, call):
+    """Transactional fresh-clone install; payload contains bytes, never guest paths."""
+    root = paths.system_root
+    changed = []
+    created = []
+    unit = 'runway-cache-relay.service'
+    active = enabled = False
+    started = False
+    service_touched = False
+
+    def safe_directory(directory):
+        if directory == directory.parent:
+            return
+        safe_directory(directory.parent)
+        try:
+            entry = directory.lstat()
+        except FileNotFoundError:
+            directory.mkdir(mode=0o755)
+            created.append(directory)
+            return
+        if not stat.S_ISDIR(entry.st_mode):
+            raise ValueError('unsafe install directory')
+        relative = directory.relative_to(root) if directory.is_relative_to(root) else None
+        if (relative and relative.parts and relative.parts[0] in ('etc', 'opt')
+                and (entry.st_uid != 0 or entry.st_mode & 0o022)):
+            raise ValueError('untrusted install directory')
+
+    def replace(path, data, mode):
+        safe_directory(path.parent)
+        try:
+            entry = path.lstat()
+            if not stat.S_ISREG(entry.st_mode):
+                raise ValueError('unsafe install target')
+            previous = (path.read_bytes(), stat.S_IMODE(entry.st_mode), entry.st_uid, entry.st_gid)
+        except FileNotFoundError:
+            previous = None
+        if previous == (data, mode, 0, 0):
+            return
+        changed.append((path, previous))
+        write(path, data, mode, 0, 0)
+
+    def write(path, data, mode, uid, gid):
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.runway-')
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchown(stream.fileno(), uid, gid)
+                os.fchmod(stream.fileno(), mode)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def require(argv):
+        if call(argv).returncode:
+            raise ValueError('cache service installation failed')
+
+    try:
+        if set(bundle) != {'service', 'ca', 'node', 'relay', 'unit'}:
+            raise ValueError('invalid cache bundle')
+        service = bundle['service']
+        if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', service):
+            raise ValueError('invalid service name')
+        if not 1 <= int(service.rsplit(':', 1)[1]) <= 65535:
+            raise ValueError('invalid service port')
+        files = {key: base64.b64decode(bundle[key], validate=True) for key in ('ca', 'node', 'relay', 'unit')}
+        if not files['node'].startswith(b'\x7fELF') or not files['relay'] or not files['unit']:
+            raise ValueError('invalid cache helpers')
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cadata=files['ca'].decode('ascii'))
+        active = call(['systemctl', 'is-active', '--quiet', unit]).returncode == 0
+        enabled = call(['systemctl', 'is-enabled', '--quiet', unit]).returncode == 0
+        # Do not disturb a working relay while validating or staging input.
+        nodes = [paths.runner / 'externals' / version / 'bin/node' for version in ('node20', 'node24')]
+        for node in nodes:
+            if not node.is_file() or node.is_symlink():
+                raise ValueError('missing runner node')
+            real = node.with_name('node.real')
+            if not real.exists():
+                replace(real, node.read_bytes(), stat.S_IMODE(node.stat().st_mode))
+            elif not real.is_file() or real.is_symlink():
+                raise ValueError('unsafe real node')
+            replace(node, files['node'], 0o755)
+        replace(root / 'opt/runway/bin/cache-relay', files['relay'], 0o755)
+        replace(root / 'etc/systemd/system' / unit, files['unit'], 0o644)
+        replace(root / 'etc/runway/cache-ca.pem', files['ca'], 0o644)
+        config = {'version': 1, 'mode': 'service', 'service': service, 'ca_file': '/etc/runway/cache-ca.pem'}
+        replace(root / 'etc/runway/cache.json', (json.dumps(config) + '\n').encode(), 0o644)
+        # /run is tmpfs: recreate the runner-owned decision directory each boot.
+        replace(root / 'etc/tmpfiles.d/runway-cache.conf', b'd /run/runway 0700 runner runner -\n', 0o644)
+        runtime = root / 'run/runway'
+        safe_directory(runtime)
+        account = pwd.getpwnam('runner')
+        if runtime in created:
+            descriptor = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fchown(descriptor, account.pw_uid, account.pw_gid)
+                os.fchmod(descriptor, 0o700)
+            finally:
+                os.close(descriptor)
+        else:
+            entry = runtime.lstat()
+            if entry.st_uid != account.pw_uid or entry.st_gid != account.pw_gid or stat.S_IMODE(entry.st_mode) != 0o700:
+                raise ValueError('unsafe decision directory')
+        require(['systemd-tmpfiles', '--create', str(root / 'etc/tmpfiles.d/runway-cache.conf')])
+        require(['systemctl', 'daemon-reload'])
+        service_touched = True
+        require(['systemctl', 'enable', unit])
+        started = True
+        require(['systemctl', 'restart', unit])
+        # Type=exec proves execve, not Python's successful bind/config load.
+        # Require the local listener before the controller may request a JIT.
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                with socket.create_connection(('127.0.0.1', 18080), timeout=0.2):
+                    break
+            except OSError:
+                require(['systemctl', 'is-active', '--quiet', unit])
+                if time.monotonic() >= deadline:
+                    raise ValueError('cache relay not listening')
+                time.sleep(0.05)
+        require(['systemctl', 'is-active', '--quiet', unit])
+        return True
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        if started:
+            call(['systemctl', 'stop', unit])
+        if service_touched and not enabled:
+            call(['systemctl', 'disable', unit])
+        for path, previous in reversed(changed):
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                write(path, *previous)
+        if changed:
+            call(['systemctl', 'daemon-reload'])
+        if active and (changed or started):
+            call(['systemctl', 'start', unit])
+        for directory in reversed(created):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        return False
 
 
 def execute(payload, *, _paths=None):
@@ -700,6 +853,10 @@ def execute(payload, *, _paths=None):
                         int(payload['workspace_tmpfs_mib'])):
                     report('unknown')
                     return 1, response or None
+            if payload.get('regional_cache') and not timed(
+                    'regional_cache', install_regional_cache, payload['regional_cache'], paths, call):
+                report('unknown')
+                return 1, response or None
         report(current)
         return (0 if action == 'status' or current == 'installed' else 1), response or None
     if action == 'collect':

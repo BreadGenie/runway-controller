@@ -15,7 +15,7 @@ import (
 // Central remains authoritative; these checks prevent conflicting evidence from
 // triggering diagnostics or bootstrap recovery before Central can reject it.
 func jobEvidence(lease pilotLease, job scaleset.JobMessageBase) (leaseEvent, error) {
-	fields := leaseEvent{JobID: job.JobID, RequestID: job.RunnerRequestID,
+	fields := leaseEvent{JobDisplayName: job.JobDisplayName, JobWorkflowRef: job.JobWorkflowRef, EventName: job.EventName, JobID: job.JobID, RequestID: job.RunnerRequestID,
 		RequestLabels: strings.Join(job.RequestLabels, "\n")}
 	if job.OwnerName != "" || job.RepositoryName != "" {
 		if job.OwnerName == "" || job.RepositoryName == "" {
@@ -29,7 +29,7 @@ func jobEvidence(lease pilotLease, job scaleset.JobMessageBase) (leaseEvent, err
 	if fields.RequestID < 0 || (fields.RequestID > 0 && lease.RequestID > 0 && fields.RequestID != lease.RequestID) {
 		return leaseEvent{}, errors.New("job request ID conflicts with durable lease")
 	}
-	for _, identity := range [][2]string{{lease.JobID, fields.JobID}, {lease.WorkflowRunID, fields.WorkflowRunID}, {lease.Repository, fields.Repository}, {lease.RequestLabels, fields.RequestLabels}} {
+	for _, identity := range [][2]string{{lease.JobDisplayName, fields.JobDisplayName}, {lease.JobWorkflowRef, fields.JobWorkflowRef}, {lease.EventName, fields.EventName}, {lease.JobID, fields.JobID}, {lease.WorkflowRunID, fields.WorkflowRunID}, {lease.Repository, fields.Repository}, {lease.RequestLabels, fields.RequestLabels}} {
 		if identity[0] != "" && identity[1] != "" && identity[0] != identity[1] {
 			return leaseEvent{}, errors.New("job evidence conflicts with durable lease")
 		}
@@ -38,6 +38,35 @@ func jobEvidence(lease pilotLease, job scaleset.JobMessageBase) (leaseEvent, err
 }
 
 func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
+	for _, job := range message.JobAssignedMessages {
+		var matched *pilotLease
+		for _, lease := range e.snapshot.Leases {
+			if lease.Phase == "deleted" || lease.Phase == "deleting" {
+				continue
+			}
+			if (job.RunnerRequestID > 0 && lease.RequestID == job.RunnerRequestID) || (lease.JobID != "" && lease.JobID == job.JobID) {
+				if matched != nil {
+					return errors.New("ambiguous job assignment")
+				}
+				copy := lease
+				matched = &copy
+			}
+		}
+		if matched == nil {
+			e.rememberAssignment(job.JobMessageBase)
+			continue
+		}
+		if _, err := uuid.Parse(job.JobID); err != nil {
+			return errors.New("assignment requires stable job UUID")
+		}
+		fields, err := jobEvidence(*matched, job.JobMessageBase)
+		if err != nil {
+			return err
+		}
+		if err := e.persistJobEvidence(ctx, *matched, "assigned", fields); err != nil {
+			return err
+		}
+	}
 	for _, job := range message.JobStartedMessages {
 		for _, lease := range e.snapshot.Leases {
 			if lease.RunnerName != job.RunnerName {
@@ -63,7 +92,7 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 				}
 				lease = updated
 			}
-			if _, err := e.update(ctx, lease, "started", fields); err != nil {
+			if err := e.persistJobEvidence(ctx, lease, "started", fields); err != nil {
 				return err
 			}
 		}
@@ -167,4 +196,18 @@ func (e *pilotEngine) acquire(ctx context.Context, lease pilotLease) error {
 	}
 	// Empty responses do not resolve an earlier uncertain request.
 	return nil
+}
+
+// Skip durable replays, including after a restart; omitted evidence never erases a value.
+func (e *pilotEngine) persistJobEvidence(ctx context.Context, lease pilotLease, event string, fields leaseEvent) error {
+	changed := event == "started" && !lease.Started
+	for _, pair := range [][2]string{{lease.JobID, fields.JobID}, {lease.WorkflowRunID, fields.WorkflowRunID}, {lease.Repository, fields.Repository}, {lease.RequestLabels, fields.RequestLabels}, {lease.JobDisplayName, fields.JobDisplayName}, {lease.JobWorkflowRef, fields.JobWorkflowRef}, {lease.EventName, fields.EventName}, {lease.RunAttempt, fields.RunAttempt}} {
+		changed = changed || (pair[1] != "" && pair[0] != pair[1])
+	}
+	changed = changed || (fields.RequestID > 0 && fields.RequestID != lease.RequestID) || (fields.RunnerID > 0 && fields.RunnerID != lease.RunnerID)
+	if !changed {
+		return nil
+	}
+	_, err := e.update(ctx, lease, event, fields)
+	return err
 }

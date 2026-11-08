@@ -9,6 +9,7 @@ import (
 // not a wire schema and must never be decoded from guest input. IssueSetup
 // fills RepositoryID and the refs from the repository policy.
 type Authorization struct {
+	TenantID          int64 // zero is standalone; positive is a Central team
 	RegionID          string
 	JobID             string
 	RequestID         int64
@@ -30,7 +31,7 @@ func Issue(key ed25519.PrivateKey, audience string, a Authorization, clock Clock
 		expires = cap
 	}
 	claims := Claims{
-		Version: 1, KeyID: KeyID(key.Public().(ed25519.PublicKey)), Audience: audience, RegionID: a.RegionID,
+		TenantID: a.TenantID, Version: 1, KeyID: KeyID(key.Public().(ed25519.PublicKey)), Audience: audience, RegionID: a.RegionID,
 		JobID: a.JobID, RequestID: a.RequestID, RunID: a.RunID, RunAttempt: a.RunAttempt, RepositoryID: a.RepositoryID,
 		ReadRefs: append([]string(nil), a.ReadRefs...), WriteRef: a.WriteRef,
 		IssuedAt: clock.Earliest.Unix(), ExpiresAt: expires.Unix(),

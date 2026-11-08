@@ -37,22 +37,27 @@ type pilotPool struct {
 }
 
 type pilotLease struct {
-	ID            string    `json:"id"`
-	Phase         string    `json:"phase"`
-	RunnerName    string    `json:"runner_name"`
-	RunnerID      int       `json:"runner_id"`
-	JobID         string    `json:"job_id"`
-	WorkflowRunID string    `json:"workflow_run_id"`
-	VMID          string    `json:"vm_id"`
-	VMState       string    `json:"vm_state"`
-	MeshAddress   string    `json:"mesh_address"`
-	Deadline      time.Time `json:"deadline"`
-	LastError     string    `json:"last_error"`
-	JITState      string    `json:"jit_state"`
-	RequestID     int64     `json:"request_id"`
-	AcquireState  string    `json:"acquire_state"`
-	Repository    string    `json:"repository"`
-	RequestLabels string    `json:"request_labels"`
+	RunAttempt     string    `json:"run_attempt,omitempty"`
+	JobDisplayName string    `json:"job_display_name,omitempty"`
+	JobWorkflowRef string    `json:"job_workflow_ref,omitempty"`
+	EventName      string    `json:"event_name,omitempty"`
+	Started        bool      `json:"started,omitempty"`
+	ID             string    `json:"id"`
+	Phase          string    `json:"phase"`
+	RunnerName     string    `json:"runner_name"`
+	RunnerID       int       `json:"runner_id"`
+	JobID          string    `json:"job_id"`
+	WorkflowRunID  string    `json:"workflow_run_id"`
+	VMID           string    `json:"vm_id"`
+	VMState        string    `json:"vm_state"`
+	MeshAddress    string    `json:"mesh_address"`
+	Deadline       time.Time `json:"deadline"`
+	LastError      string    `json:"last_error"`
+	JITState       string    `json:"jit_state"`
+	RequestID      int64     `json:"request_id"`
+	AcquireState   string    `json:"acquire_state"`
+	Repository     string    `json:"repository"`
+	RequestLabels  string    `json:"request_labels"`
 }
 
 type pilotSnapshot struct {
@@ -62,13 +67,18 @@ type pilotSnapshot struct {
 }
 
 type leaseEvent struct {
-	RunnerID      int    `json:"runner_id,omitempty"`
-	JobID         string `json:"job_id,omitempty"`
-	WorkflowRunID string `json:"workflow_run_id,omitempty"`
-	RequestID     int64  `json:"request_id,omitempty"`
-	Result        string `json:"result,omitempty"`
-	Error         string `json:"error,omitempty"`
-	Repository    string `json:"repository,omitempty"`
+	RunAttempt     string `json:"run_attempt,omitempty"`
+	JobDisplayName string `json:"job_display_name,omitempty"`
+	JobWorkflowRef string `json:"job_workflow_ref,omitempty"`
+	EventName      string `json:"event_name,omitempty"`
+	Started        bool   `json:"started,omitempty"`
+	RunnerID       int    `json:"runner_id,omitempty"`
+	JobID          string `json:"job_id,omitempty"`
+	WorkflowRunID  string `json:"workflow_run_id,omitempty"`
+	RequestID      int64  `json:"request_id,omitempty"`
+	Result         string `json:"result,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Repository     string `json:"repository,omitempty"`
 	// RequestLabels travels as one label per line, which is how the lease stores it. It is
 	// a string rather than a slice so that encoding this struct carries the labels: a
 	// `json:"-"` slice looked correct and meant any encoding of an event silently lost them.
@@ -245,7 +255,7 @@ func (c *centralRPC) Reserve(ctx context.Context, id string) (pilotLease, error)
 }
 func (c *centralRPC) Update(ctx context.Context, id, event string, fields leaseEvent) (pilotLease, error) {
 	var result pilotLease
-	values := map[string]any{"lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": fields.RequestLabels}
+	values := map[string]any{"run_attempt": fields.RunAttempt, "job_display_name": fields.JobDisplayName, "job_workflow_ref": fields.JobWorkflowRef, "event_name": fields.EventName, "lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": fields.RequestLabels}
 	err := c.call(ctx, "update_lease", values, &result)
 	return result, err
 }

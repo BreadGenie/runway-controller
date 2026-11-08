@@ -31,6 +31,7 @@ var ErrInvalid = errors.New("cache grant refused")
 // GitHub's stable numeric ID. Ref order is lookup priority. WriteRef empty
 // means read-only. No claim grants access to Garage directly.
 type Claims struct {
+	TenantID     int64    `json:"tenant_id,omitempty"`
 	Version      int      `json:"version"`
 	KeyID        string   `json:"key_id"`
 	Audience     string   `json:"audience"`
@@ -137,7 +138,7 @@ func (v *Verifier) Verify(token string, clock Clock) (Claims, error) {
 }
 
 func (c Claims) valid(clock Clock) bool {
-	if !clock.Valid() || c.Version != 1 || len(c.KeyID) != 64 || !validAudience(c.Audience) || !identifier(c.RegionID) || !canonicalUUID(c.JobID) || c.RequestID < 0 || c.RunID <= 0 || c.RunAttempt <= 0 || c.RepositoryID <= 0 || c.IssuedAt <= 0 || c.ExpiresAt <= c.IssuedAt || c.ExpiresAt-c.IssuedAt > int64(maxLifetime/time.Second) {
+	if c.TenantID < 0 || c.TenantID > 4294967295 || !clock.Valid() || c.Version != 1 || len(c.KeyID) != 64 || !validAudience(c.Audience) || !identifier(c.RegionID) || !canonicalUUID(c.JobID) || c.RequestID < 0 || c.RunID <= 0 || c.RunAttempt <= 0 || c.RepositoryID <= 0 || c.IssuedAt <= 0 || c.ExpiresAt <= c.IssuedAt || c.ExpiresAt-c.IssuedAt > int64(maxLifetime/time.Second) {
 		return false
 	}
 	if clock.Earliest.Before(time.Unix(c.IssuedAt, 0)) || !clock.Latest.Before(time.Unix(c.ExpiresAt, 0)) || len(c.ReadRefs) > 8 || len(c.ReadRefs) == 0 && c.WriteRef == "" {

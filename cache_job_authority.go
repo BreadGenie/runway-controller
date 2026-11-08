@@ -16,6 +16,11 @@ import (
 	"github.com/BreadGenie/runway/cache/grant"
 )
 
+type cacheJobAuthority interface {
+	resolve(context.Context, cacheGuestBinding, int64) (cacheJobRelease, error)
+	authorize(context.Context, cacheGuestBinding, cacheJobRelease, grant.SetupRequest) (cacheJobGrant, error)
+}
+
 // cacheJobGrant is verified input to grant.IssueSetup.
 type cacheJobGrant struct {
 	Authorization grant.Authorization
@@ -25,6 +30,8 @@ type cacheJobGrant struct {
 // cacheGuestBinding is written only by the trusted root launcher after it
 // registers the guest's JIT runner. The guest never supplies or reads it.
 type cacheGuestBinding struct {
+	service        bool
+	TenantID       uint32    `json:"-"`
 	Version        int       `json:"version"`
 	VMID           string    `json:"vm_id"`
 	VsockUDS       string    `json:"vsock_uds"`
@@ -41,6 +48,13 @@ type cacheGuestBinding struct {
 var cacheVMIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 func (binding cacheGuestBinding) validate() error {
+	if binding.service {
+		parts := strings.Split(binding.Repository, "/")
+		if binding.TenantID == 0 || binding.VMID == "" || binding.RunnerID <= 0 || binding.RunnerName == "" || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
+			return grant.ErrInvalid
+		}
+		return nil
+	}
 	parts := strings.Split(binding.Repository, "/")
 	if binding.Version != 2 || !cacheVMIDPattern.MatchString(binding.VMID) || !filepath.IsAbs(binding.VsockUDS) || filepath.Clean(binding.VsockUDS) != binding.VsockUDS || binding.FirecrackerPID <= 1 || binding.GuestCID < 3 || binding.RunnerID <= 0 || binding.RunnerName == "" || len(binding.RunnerName) > 255 || strings.ContainsAny(binding.RunnerName, "\x00\r\n\t ") || len(parts) != 2 || !validCacheGitHubPart(parts[0]) || !validCacheGitHubPart(parts[1]) || binding.ExpiresAt.IsZero() {
 		return grant.ErrInvalid
@@ -224,7 +238,7 @@ func (authority githubCacheJobAuthority) resolveREST(ctx context.Context, bindin
 
 // confirmREST looks for the bound runner's in-progress job in the run's current
 // attempt. A missing or still-queued job is errCacheJobNotFound (keep polling).
-func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64) (cacheJobConfirmation, cacheGitHubJob, error) {
+func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64, matchName ...bool) (cacheJobConfirmation, cacheGitHubJob, error) {
 	if *attempt == 0 {
 		data, err := readCacheGitHubMetadata(ctx, authority.client, "/repos/"+binding.Repository+"/actions/runs/"+strconv.FormatInt(runID, 10))
 		if err != nil {
@@ -238,7 +252,11 @@ func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, bindin
 		}
 		*attempt = run.RunAttempt
 	}
-	job, err := readCacheBoundJob(ctx, authority.client, binding.Repository, runID, *attempt, binding.RunnerID)
+	var names []string
+	if len(matchName) > 0 && matchName[0] {
+		names = []string{binding.RunnerName}
+	}
+	job, err := readCacheBoundJob(ctx, authority.client, binding.Repository, runID, *attempt, binding.RunnerID, names...)
 	switch {
 	case errors.Is(err, errCacheJobNotFound), errors.Is(err, errCacheJobMismatch):
 		return cacheJobConfirmation{}, cacheGitHubJob{}, err
@@ -299,7 +317,7 @@ func (authority githubCacheJobAuthority) authorize(ctx context.Context, binding 
 		deadline = binding.ExpiresAt
 	}
 	authorization := grant.Authorization{
-		RegionID: authority.regionID, JobID: release.JobID, RequestID: release.RequestID,
+		TenantID: int64(binding.TenantID), RegionID: authority.regionID, JobID: release.JobID, RequestID: release.RequestID,
 		RunID: runID, RunAttempt: attempt, Deadline: deadline,
 	}
 	return cacheJobGrant{Authorization: authorization, Policy: policy}, nil
@@ -399,7 +417,7 @@ func cacheJobPending(status string) bool {
 
 // readCacheBoundJob pages through one attempt's jobs (at most 1000) and returns
 // the single job assigned to runnerID, or errCacheJobNotFound.
-func readCacheBoundJob(ctx context.Context, client *http.Client, repository string, runID, attempt, runnerID int64) (cacheGitHubJob, error) {
+func readCacheBoundJob(ctx context.Context, client *http.Client, repository string, runID, attempt, runnerID int64, runnerName ...string) (cacheGitHubJob, error) {
 	var found []cacheGitHubJob
 	seen := 0
 	for page := 1; page <= 10; page++ {
@@ -413,7 +431,11 @@ func readCacheBoundJob(ctx context.Context, client *http.Client, repository stri
 			return cacheGitHubJob{}, err
 		}
 		for _, job := range jobs {
-			if job.RunnerID == runnerID {
+			matches := job.RunnerID == runnerID
+			if len(runnerName) > 0 {
+				matches = job.Status == "in_progress" && job.RunnerName == runnerName[0] && (job.RunnerID == 0 || job.RunnerID == runnerID)
+			}
+			if matches {
 				found = append(found, job)
 			}
 		}

@@ -2,6 +2,7 @@
 """Bootstrap one disposable Metal guest over an operator's SSH channel."""
 
 import argparse
+import base64
 from datetime import UTC, datetime
 import json
 import os
@@ -180,6 +181,9 @@ def main() -> int:
     # only on an unregistered fresh clone. The passwordless sudo it grants is the
     # disposable Firecracker guest's own root: it reaches no Metal host path, no
     # network namespace and no control-plane or GitHub credential.
+    parser.add_argument('--regional-cache', help='Pinned TLS cache internal-name:port (prepare only)')
+    parser.add_argument('--regional-cache-ca', type=Path, help='CA PEM on the controller')
+    parser.add_argument('--regional-cache-node', type=Path, help='Current cache-node binary on the controller')
     parser.add_argument('--allow-guest-sudo', action='store_true',
                         help='Give a fresh guest runner account passwordless sudo inside that guest')
     # Explicit operator opt-in to select the guest kernel's tsc clocksource during
@@ -229,6 +233,11 @@ def main() -> int:
     parser.add_argument('--deadline', help='Absolute RFC3339 deadline for bootstrap')
     parser.add_argument('--diagnostics-dir', type=Path, help='Private local directory for collect')
     args = parser.parse_args()
+    if any((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
+        if not all((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
+            parser.error('Regional cache requires --regional-cache, --regional-cache-ca and --regional-cache-node')
+        if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
+            parser.error('Regional cache requires internal-name:port')
     if not re.fullmatch(r'vm-[0-9]+', args.vm_id):
         parser.error('Expected an Atlas vm-<digits> identifier')
     if not re.fullmatch(r'runway-[a-z0-9-]{1,56}', args.runner_name):
@@ -267,6 +276,17 @@ def main() -> int:
                    prefer_tsc_clocksource=args.prefer_guest_tsc,
                    kernel_publish=args.kernel_published_ports,
                    guest_program=GUEST_PROGRAM)
+    if args.regional_cache and args.action == 'prepare':
+        repo = Path(__file__).resolve().parents[1]
+        sources = {'ca': args.regional_cache_ca, 'node': args.regional_cache_node,
+                   'relay': repo / 'integrations/actions-runner/cache-relay',
+                   'unit': repo / 'deploy/standalone-guest/runway-cache-relay.service'}
+        try:
+            bundle = {key: base64.b64encode(path.read_bytes()).decode('ascii') for key, path in sources.items()}
+        except OSError:
+            parser.error('Cannot read regional cache files')
+        bundle['service'] = args.regional_cache
+        payload['regional_cache'] = bundle
     if args.registry_mirror_port:
         payload['mirror_port'] = args.registry_mirror_port
         # One private control directory per VM, beside the known-hosts prefix the

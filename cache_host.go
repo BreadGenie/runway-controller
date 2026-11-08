@@ -154,19 +154,20 @@ func newCacheHost(config cacheHostConfig, vmID string, log func(map[string]any))
 }
 
 type cacheHost struct {
-	vmID, uds      string
-	bindings       cacheBindingSource
-	authority      *githubCacheJobAuthority // nil when unavailable is set
-	unavailable    string                   // why setup is disabled for this whole VM
-	clock          func(context.Context) (grant.Clock, error)
-	key            ed25519.PrivateKey
-	audience       string
-	roots          *x509.CertPool
-	archiveBytes   int64
-	peer           func(net.Conn) (*unix.Ucred, error)
-	directoryGroup func(string) (uint32, error)
-	log            func(map[string]any)
-	renewWindow    time.Duration // renew this long before expiry; zero is cacheHostRenewWindow
+	authenticateService func() (cacheGuestBinding, string)
+	vmID, uds           string
+	bindings            cacheBindingSource
+	authority           cacheJobAuthority // nil when unavailable is set
+	unavailable         string            // why setup is disabled for this whole VM
+	clock               func(context.Context) (grant.Clock, error)
+	key                 ed25519.PrivateKey
+	audience            string
+	roots               *x509.CertPool
+	archiveBytes        int64
+	peer                func(net.Conn) (*unix.Ucred, error)
+	directoryGroup      func(string) (uint32, error)
+	log                 func(map[string]any)
+	renewWindow         time.Duration // renew this long before expiry; zero is cacheHostRenewWindow
 
 	ctx        context.Context
 	mu         sync.Mutex
@@ -221,6 +222,9 @@ func cacheUnixPeerCredentials(conn net.Conn) (*unix.Ucred, error) {
 
 // authenticate binds a connection to this VM's launcher binding by peer PID, uid and gid.
 func (host *cacheHost) authenticate(conn net.Conn) (cacheGuestBinding, string) {
+	if host.authenticateService != nil {
+		return host.authenticateService()
+	}
 	peer, err := host.peer(conn)
 	if err != nil {
 		return cacheGuestBinding{}, "peer_unknown"
@@ -400,6 +404,10 @@ func (host *cacheHost) serveSetup(conn net.Conn) {
 // job gets at most one enabled setup; refused attempts cost the guest a
 // connection slot and share one resolution.
 func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string {
+	return host.enableWithin(host.ctx, conn, request)
+}
+
+func (host *cacheHost) enableWithin(parent context.Context, conn net.Conn, request grant.SetupRequest) string {
 	binding, reason := host.authenticate(conn)
 	if reason != "" {
 		return reason
@@ -409,6 +417,10 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 	}
 	host.mu.Lock()
 	enabled, replay := host.setup != nil, host.nonces[request.Nonce]
+	if host.authenticateService != nil && len(host.nonces) >= 4096 {
+		host.mu.Unlock()
+		return "nonce_limit"
+	}
 	if !replay && !enabled {
 		host.nonces[request.Nonce] = true
 	}
@@ -419,7 +431,7 @@ func (host *cacheHost) enable(conn net.Conn, request grant.SetupRequest) string 
 	case replay:
 		return "nonce_replayed"
 	}
-	ctx, cancel := context.WithTimeout(host.ctx, cacheHostSetupBudget)
+	ctx, cancel := context.WithTimeout(parent, cacheHostSetupBudget)
 	defer cancel()
 	release := host.resolveWithin(ctx, binding, cacheRunHint(request))
 	if release == nil {
@@ -521,7 +533,8 @@ func (host *cacheHost) issue(ctx context.Context, binding cacheGuestBinding, rel
 	// Stop using the grant slightly before cache-data would refuse it.
 	expires = time.Unix(expires.Unix(), 0).Add(-5 * time.Second)
 	handler, err = transport.New(host.ctx, transport.Config{
-		Grant: transport.Grant{Bearer: bearer, Expires: expires}, Origin: host.audience, Roots: host.roots,
+		BindTickets: binding.service,
+		Grant:       transport.Grant{Bearer: bearer, Expires: expires}, Origin: host.audience, Roots: host.roots,
 		Limits: transport.Limits{RequestBytes: 64 << 10, ChunkBytes: 64 << 20, ResponseBytes: 64 << 10, HeaderBytes: 16384, ArchiveBytes: host.archiveBytes, URLBytes: 4096, Concurrent: 8, Timeout: cacheHostRequestLimit},
 	})
 	if err != nil {

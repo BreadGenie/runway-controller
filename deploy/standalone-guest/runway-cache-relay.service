@@ -22,7 +22,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_VSOCK
+RestrictAddressFamilies=AF_INET AF_INET6 AF_VSOCK
 
 [Install]
 WantedBy=multi-user.target

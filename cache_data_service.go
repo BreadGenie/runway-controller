@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,7 @@ type cacheDataServiceConfig struct {
 	MaxArchiveBytes int64                `json:"max_archive_bytes"`
 	Disk            store.DiskConfig     `json:"disk"`
 	StorageBudget   *store.StorageBudget `json:"storage_budget,omitempty"`
+	Managed         *cacheManagedConfig  `json:"managed,omitempty"`
 	Garage          store.GarageConfig   `json:"garage"`
 }
 
@@ -59,20 +61,44 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 	if len(data) > 4096 || json.Unmarshal(data, &fields) != nil {
 		return config, store.Config{}, grant.ErrInvalid
 	}
-	required := []string{"version", "listen", "public_origin", "certificate_file", "private_key_file", "public_keys", "region_id", "state_dir", "quota_bytes", "total_bytes", "max_archive_bytes", "disk", "garage"}
+	required := []string{"version", "listen", "public_origin", "certificate_file", "private_key_file", "public_keys", "region_id", "state_dir", "quota_bytes", "total_bytes", "max_archive_bytes", "disk"}
+	if _, ok := fields["managed"]; ok {
+		required = append(required, "managed")
+	} else {
+		required = append(required, "garage")
+	}
 	if _, ok := fields["storage_budget"]; ok {
 		required = append(required, "storage_budget")
+	}
+	if raw, ok := fields["managed"]; ok {
+		if readCacheObject(raw, managedConfigFields(raw)) != nil {
+			return config, store.Config{}, grant.ErrInvalid
+		}
 	}
 	if readCacheObject(data, required) != nil {
 		return config, store.Config{}, grant.ErrInvalid
 	}
 	for name, names := range cacheDataNestedFields {
+		if name == "garage" {
+			var garageFields map[string]json.RawMessage
+			if json.Unmarshal(fields[name], &garageFields) == nil {
+				if _, ok := garageFields["ca_pem"]; ok {
+					names = append(append([]string(nil), names...), "ca_pem")
+				}
+			}
+		}
 		if raw, ok := fields[name]; ok && readCacheObject(raw, names) != nil {
 			return config, store.Config{}, grant.ErrInvalid
 		}
 	}
 	if json.Unmarshal(data, &config) != nil {
 		return config, store.Config{}, grant.ErrInvalid
+	}
+	if m := config.Managed; m != nil {
+		if !cacheHTTPSOrigin(m.CentralURL) || !filepath.IsAbs(m.CentralTokenFile) || !filepath.IsAbs(m.StorageCAFile) || m.CleanupStaleHours < 0 || m.CleanupStaleHours > 8760 || m.CleanupStaleHours > 0 && m.CleanupStaleHours <= 2 {
+			return config, store.Config{}, grant.ErrInvalid
+		}
+
 	}
 	host, port, err := net.SplitHostPort(config.Listen)
 	address := net.ParseIP(host)
@@ -106,6 +132,29 @@ func runCacheDataService(configPath string) error {
 	config, core, err := decodeCacheDataServiceConfig(data)
 	if err != nil {
 		return grant.ErrInvalid
+	}
+	if m := config.Managed; m != nil {
+		token, err := readProtectedCacheFile(m.CentralTokenFile, true)
+		if err != nil {
+			return grant.ErrInvalid
+		}
+		ca, err := readProtectedCacheFile(m.StorageCAFile, false)
+		if err != nil {
+			return grant.ErrInvalid
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(ca) {
+			return grant.ErrInvalid
+		}
+		core.CleanupStaleAfter = time.Duration(m.CleanupStaleHours) * time.Hour
+		core.Buckets = &cacheBucketProvider{
+			central: cacheCentralHTTPS{origin: m.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}},
+			ca:      string(ca),
+			credential: func() (string, error) {
+				token, err := readProtectedCacheFile(m.CentralTokenFile, true)
+				return strings.TrimSpace(string(token)), err
+			},
+		}
 	}
 	certificate, certErr := readProtectedCacheFile(config.CertificateFile, false)
 	privateKey, keyErr := readProtectedCacheFile(config.PrivateKeyFile, true)
@@ -243,4 +292,14 @@ func serveCacheDataService(parent context.Context, server *http.Server, listener
 		return nil
 	}
 	return errors.New("cache data service stopped")
+}
+
+func managedConfigFields(raw json.RawMessage) []string {
+	fields := []string{"central_url", "central_token_file", "storage_ca_file"}
+	var obj map[string]json.RawMessage
+	json.Unmarshal(raw, &obj)
+	if _, ok := obj["cleanup_stale_hours"]; ok {
+		fields = append(fields, "cleanup_stale_hours")
+	}
+	return fields
 }

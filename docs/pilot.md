@@ -89,6 +89,35 @@ Leave `owner_id` unset so each process gets a fresh identity. Only one process o
 
 After `controller_listening`, dispatch a trusted workflow using the dedicated `runs-on` label. Start with the [Docker smoke workflow](../examples/smoke-workflow.yml). Inspect Central's Runner Lease, the GitHub run, controller health output, and collected diagnostics. GitHub remains the authority for job success; a stopped guest service does not prove success.
 
+### Regional cache during prepare
+
+Build the current controller release's wrapper with
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /srv/runway/cache-node ./cmd/cache-node`.
+Append these arguments to the controller's `transport_command`:
+
+```json
+"--regional-cache", "internal-cache:443",
+"--regional-cache-ca", "/srv/runway/private/cache-ca.pem",
+"--regional-cache-node", "/srv/runway/cache-node"
+```
+
+The CA PEM and wrapper paths are on the controller. The transport sends these
+files and its matching relay/systemd unit through the existing JSON-over-SSH
+stdin channel via Metal, only on `prepare`. Deploy the repository files together
+with the wrapper. No service credential or storage key reaches the guest.
+The service must resolve by its mesh `internal-` name, present a certificate for
+that name signed by the pinned CA, and expose setup and translator routes on
+that one TLS port.
+
+This is off by default and applies only to an unregistered fresh clone reporting
+`installed`. Preparation replaces externals node20/node24 while preserving
+`node.real`, installs the relay unit, writes root-owned `/etc/runway/cache.json`
+and `/etc/runway/cache-ca.pem`, and starts the relay. Failed installation restores
+prior cache files/service state and returns `unknown`; the controller requests no
+JIT. Repeated preparation is safe. Later setup/network failures use GitHub's
+cache and persist that decision for the job. See the [integration guide](../integrations/actions-runner/regional-cache.md)
+for the config schema, budgets and standalone mode.
+
 ### Sudo compatibility for trusted workflows
 
 Some trusted GitHub Actions workflows expect a passwordless `sudo`. Preparation can grant it to the guest's `runner` account, but only when an operator asks for it. Append `--allow-guest-sudo` to `transport_command`:
@@ -198,3 +227,7 @@ Keep `scripts/metal-guest-transport.py`, `guest/guest_agent.py`, and
 `guest/guest-runner.sh` in their repository layout when installing the transport.
 The transport reads the guest agent and runner wrapper beside the scripts directory
 and delivers them over SSH; the guest agent needs only Python's standard library.
+
+JobAssigned evidence attaches directly by an existing positive request ID or job UUID. For request ID zero, the controller retains unmatched assignments by repository and workflow run, then asynchronously reads the current run attempt and its jobs using the controller’s GitHub credential. Only the single in-progress job matching the registered runner name (and runner ID when present), with exactly one matching JobAssigned display name, supplies assigned evidence before JobStarted. Duplicate display names refuse resolution; JobStarted still rejects conflicting evidence. Hints live only in memory for three minutes, with a 256-entry cap; saturation disables this fallback for three minutes rather than risk hiding an ambiguous sibling. These re-derivable hints need no Central state. One REST worker makes at most ten attempts per run, at least three seconds apart on reconciliation, stopping when job evidence arrives or the lease ends. Each attempt reads run metadata once and up to ten job pages (100 jobs per page); transient REST failures consume the same bounded retry budget, with no automatic HTTP retries. GitHub App installation tokens are cached until near expiry. Restart replay uses durable evidence without rewriting it; lost hints fall back to JobStarted until replayed. No lease is selected merely because it is the only active lease.
+
+The Central patch adds immutable `run_attempt`, `job_display_name`, `job_workflow_ref`, and `event_name` fields to `update_lease` and snapshots, plus a monotonic `started` snapshot flag set only by JobStarted (bootstrap alone does not establish a job start). The pinned scale-set SDK exposes no run attempt, so it remains unset; no attempt is inferred. Missing evidence preserves prior values. Migrate Central before deploying this controller. Replayed assigned/started evidence produces no update when nothing changes.

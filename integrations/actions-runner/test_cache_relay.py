@@ -3,6 +3,9 @@ import importlib.util
 import http.server
 from pathlib import Path
 import socket
+import ssl
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -15,6 +18,75 @@ loader.exec_module(relay)
 
 
 class RelayTests(unittest.TestCase):
+    def test_pinned_tls_and_refusals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key, cert = root / 'key', root / 'cert'
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                            '-keyout', str(key), '-out', str(cert), '-days', '1',
+                            '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            for mode in ('enabled', 'wrong-name', 'wrong-ca', 'plain'):
+                with self.subTest(mode=mode), socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    listener.listen()
+                    port = listener.getsockname()[1]
+                    errors = []
+                    payload = bytes(range(256)) * 1024
+
+                    def server():
+                        with listener.accept()[0] as raw:
+                            try:
+                                if mode == 'plain':
+                                    raw.sendall(b'HTTP/1.1 200 OK\r\n\r\n')
+                                    return
+                                with context.wrap_socket(raw, server_side=True) as stream:
+                                    if mode == 'enabled':
+                                        received = bytearray()
+                                        while len(received) < len(payload):
+                                            received.extend(stream.recv(min(8192, len(payload) - len(received))))
+                                        self.assertEqual(received, payload)
+                                        stream.sendall(payload[::-1])
+                            except OSError as error:
+                                errors.append(error)
+                    worker = threading.Thread(target=server)
+                    worker.start()
+                    ca = cert.read_bytes()
+                    if mode == 'wrong-ca':
+                        ca = Path('/etc/ssl/certs/ca-certificates.crt').read_bytes()
+                    connect = relay.tls_connector('127.0.0.1' if mode == 'wrong-name' else 'localhost', port, ca)
+                    try:
+                        if mode == 'enabled':
+                            local = socket.socket()
+                            local.bind(('127.0.0.1', 0))
+                            local.listen()
+                            stop = threading.Event()
+                            forwarding = threading.Thread(target=relay.serve, args=(local, stop, connect))
+                            forwarding.start()
+                            try:
+                                with socket.create_connection(local.getsockname(), timeout=2) as stream:
+                                    stream.sendall(payload)
+                                    stream.shutdown(socket.SHUT_WR)
+                                    received = bytearray()
+                                    while True:
+                                        chunk = stream.recv(7777)
+                                        if not chunk:
+                                            break
+                                        received.extend(chunk)
+                                    self.assertEqual(received, payload[::-1])
+                            finally:
+                                stop.set()
+                                forwarding.join(2)
+                            self.assertFalse(forwarding.is_alive())
+                        else:
+                            with self.assertRaises((ssl.SSLError, OSError)):
+                                connect()
+                    finally:
+                        worker.join(6)
+                    self.assertFalse(worker.is_alive())
+
     def test_idle_clients_release_all_slots_after_first_byte_deadline(self):
         stop = threading.Event()
         listener = socket.socket()

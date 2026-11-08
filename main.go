@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,8 +36,8 @@ func main() {
 }
 
 func run() error {
-	action := flag.String("action", "", "create, lookup, jit, listen, controller, cache-data, cache-host, cache-assignments, or delete (all except lookup and cache-* modify GitHub)")
-	config := flag.String("config", "", "private configuration JSON for controller, cache-data, cache-host, or cache-assignments")
+	action := flag.String("action", "", "create, lookup, jit, listen, controller, cache-data, cache-service, cache-host, cache-assignments, or delete (all except lookup and cache-* modify GitHub)")
+	config := flag.String("config", "", "private configuration JSON for controller, cache-data, cache-service, cache-host, or cache-assignments")
 	vmID := flag.String("vm-id", "", "standalone VM whose vsock sockets cache-host serves")
 	url := flag.String("url", "", "https://github.com/OWNER/REPO; repository scope only")
 	name := flag.String("name", "", "runway-prefixed scale-set name for create/lookup; runner name for jit/listen")
@@ -45,6 +46,12 @@ func run() error {
 	journal := flag.String("journal", "", "durable single-job journal for listen; parent directory must be private")
 	timeout := flag.Duration("timeout", 20*time.Minute, "maximum listener duration")
 	flag.Parse()
+	if *action == "cache-service" {
+		if *config == "" || flag.NArg() != 0 {
+			return errors.New("cache-service requires --config and no positional arguments")
+		}
+		return runCacheService(*config)
+	}
 	if *action == "cache-data" {
 		if *config == "" || flag.NArg() != 0 {
 			return errors.New("cache-data requires --config and no positional arguments")
@@ -166,6 +173,10 @@ func writeSecret(file *os.File, secret string) error {
 }
 
 func authenticatedClient(ctx context.Context, url string, options ...scaleset.HTTPOption) (*scaleset.Client, error) {
+	return authenticatedControllerClient(ctx, url, nil, options...)
+}
+
+func authenticatedControllerClient(ctx context.Context, url string, rest **http.Client, options ...scaleset.HTTPOption) (*scaleset.Client, error) {
 	appID := os.Getenv("RUNWAY_GITHUB_APP_CLIENT_ID")
 	keyFile := os.Getenv("RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE")
 	installation := os.Getenv("RUNWAY_GITHUB_APP_INSTALLATION_ID")
@@ -174,6 +185,13 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 	if tokenFile := os.Getenv("RUNWAY_GITHUB_TOKEN_FILE"); tokenFile != "" {
 		if hasApp {
 			return nil, errors.New("select one GitHub credential source")
+		}
+		if rest != nil {
+			client, err := newCacheRepositoryClient(tokenFile)
+			if err != nil {
+				return nil, err
+			}
+			*rest = client
 		}
 		return cacheGitHubClient(url, tokenFile, options...)
 	}
@@ -186,6 +204,13 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 		if err != nil {
 			return nil, errors.New("cannot read GitHub App private key file")
 		}
+		if rest != nil {
+			client, err := newControllerAppREST(appID, id, key)
+			if err != nil {
+				return nil, err
+			}
+			*rest = client
+		}
 		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
 			GitHubConfigURL: url,
 			GitHubAppAuth:   scaleset.GitHubAppAuth{ClientID: appID, InstallationID: id, PrivateKey: string(key)},
@@ -195,6 +220,9 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 	token, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
 	if err != nil {
 		return nil, errors.New("gh authentication unavailable; configure gh or RUNWAY_GITHUB_APP_* variables")
+	}
+	if rest != nil {
+		*rest = &http.Client{Transport: cacheRepositoryCredential{token: strings.TrimSpace(string(token)), transport: http.DefaultTransport}}
 	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 		GitHubConfigURL: url, PersonalAccessToken: strings.TrimSpace(string(token)),

@@ -10,6 +10,8 @@ import argparse
 import importlib.machinery
 import importlib.util
 import os
+import json
+import contextlib
 from pathlib import Path
 import shutil
 import socket
@@ -29,6 +31,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport-port", type=int)
     parser.add_argument("--client")
+    parser.add_argument("--fallback-url", help="expect cache-node to retain this GitHub cache substitute")
+    parser.add_argument("--artifacts", help="retain guest-visible files for parent secret audit")
+    parser.add_argument("--managed-context", help="setup context for the cache-node subprocess")
+    parser.add_argument("--node-wrapper", help="test cache-node executable shim")
+    parser.add_argument("--tls-ca", help="use the real mesh TLS connector with this test CA")
     parser.add_argument("--list-clients", action="store_true")
     args = parser.parse_args()
     if args.list_clients:
@@ -50,11 +57,14 @@ def main():
     listener.bind(relay.ADDRESS)
     listener.listen(relay.CONNECTIONS)
     stop = threading.Event()
-    worker = threading.Thread(target=relay.serve, args=(
-        listener, stop, lambda: socket.create_connection(("127.0.0.1", args.transport_port), timeout=2)))
+    connect = (relay.tls_connector("127.0.0.1", args.transport_port, Path(args.tls_ca).read_bytes())
+               if args.tls_ca else
+               lambda: socket.create_connection(("127.0.0.1", args.transport_port), timeout=2))
+    worker = threading.Thread(target=relay.serve, args=(listener, stop, connect))
     worker.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="runway-relay-clients-") as directory:
+        with (contextlib.nullcontext(args.artifacts) if args.artifacts else
+              tempfile.TemporaryDirectory(prefix="runway-relay-clients-")) as directory:
             root = Path(directory)
             # Enforce the client's network boundary without changing bundle bytes.
             guard = root / "network-guard.cjs"
@@ -65,7 +75,7 @@ const connect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function(...args) {
   const options = Array.isArray(args[0]) ? args[0][0] : args[0];
   const allowed = options && typeof options === 'object' &&
-    options.host === '127.0.0.1' && Number(options.port) === 18080;
+    options.host === '127.0.0.1' && Number(options.port) === Number(process.env.RUNWAY_ALLOWED_PORT || 18080);
   fs.appendFileSync(process.env.RUNWAY_NETWORK_AUDIT, allowed ? 'relay\\n' : 'blocked\\n');
   if (!allowed) throw new Error('client connection outside guest relay');
   return connect.apply(this, args);
@@ -78,15 +88,34 @@ tls.connect = function() {
             audit = root / "network-audit"
             os.environ["NODE_OPTIONS"] = "--require=" + str(guard)
             os.environ["RUNWAY_NETWORK_AUDIT"] = str(audit)
+            if args.fallback_url:
+                from urllib.parse import urlparse
+                os.environ["RUNWAY_ALLOWED_PORT"] = str(urlparse(args.fallback_url).port)
             for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
                 os.environ.pop(variable, None)
             os.environ["NO_PROXY"] = "127.0.0.1"
             for label, kind, version, mode in selected:
                 bundles = cache.fetch_bundles(version)
+                if args.node_wrapper:
+                    # Runner-shaped paths are part of the wrapper allowlist gate.
+                    action_root = root / "_actions" / "actions" / kind / version["commit"]
+                    action_root.mkdir(parents=True)
+                    copies = {}
+                    for bundle, source in bundles.items():
+                        target = action_root / bundle / "index.js"
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(source, target)
+                        copies[bundle] = str(target)
+                    bundles = copies
                 workspace = root / kind / "workspace"
                 workspace.mkdir(parents=True)
-                client = cache.Client(bundles, node, "http://127.0.0.1:18080/")
+                upstream = args.fallback_url or ("http://github-cache.invalid/" if args.node_wrapper
+                                                 else "http://127.0.0.1:18080/")
+                client = cache.Client(bundles, args.node_wrapper or node, upstream)
                 extra = {"RUNNER_OS": "Linux", "CACHE_UPLOAD_CONCURRENCY": "1", "CACHE_UPLOAD_CHUNK_SIZE": "0.5"}
+                if args.managed_context:
+                    extra.update(json.loads(Path(args.managed_context).read_text()))
+                    extra["GITHUB_JOB"] = "managed-e2e"
                 if kind == "cache":
                     content = workspace / "content"
                     content.mkdir()
@@ -104,6 +133,9 @@ tls.connect = function() {
                 expected = cache.file_tree_hashes(str(content))
                 rc, output, outputs, state = client.run_action(restore, inputs, "github-secret", str(workspace), extra_env=extra, timeout=30)
                 require(rc == 0 and outputs.get("cache-hit") != "true" and (state.get("CACHE_KEY") or mode == "only"), kind + " miss failed: " + output)
+                if args.fallback_url:
+                    print(label + ": stopped service fell back; pinned action exited successfully", flush=True)
+                    continue
                 post = dict(extra, **{"STATE_" + key: value for key, value in state.items()})
                 rc, output, _, _ = client.run_action(save, inputs, "github-secret", str(workspace), extra_env=post, timeout=30)
                 require(rc == 0 and "Cache saved with" in output, kind + " save failed: " + output)

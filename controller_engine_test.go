@@ -73,6 +73,10 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		if l.AcquireState != "acquired" {
 			l.AcquireState = "pending"
 		}
+	case "assigned":
+		if l.Phase == "deleted" || l.Phase == "deleting" {
+			return pilotLease{}, errors.New("retiring lease")
+		}
 	case "acquired":
 		if l.RequestID <= 0 || (l.AcquireState != "pending" && l.AcquireState != "acquired") {
 			return pilotLease{}, errors.New("missing acquisition intent")
@@ -101,6 +105,20 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		}
 		if event == "jit_ready" {
 			l.JITState = "ready"
+		}
+	}
+	if event == "started" {
+		l.Started = true
+	}
+	for _, pair := range []struct {
+		target *string
+		value  string
+	}{{&l.JobDisplayName, fields.JobDisplayName}, {&l.JobWorkflowRef, fields.JobWorkflowRef}, {&l.EventName, fields.EventName}, {&l.RunAttempt, fields.RunAttempt}} {
+		if pair.value != "" {
+			if *pair.target != "" && *pair.target != pair.value {
+				return pilotLease{}, errors.New("job identity changed")
+			}
+			*pair.target = pair.value
 		}
 	}
 	if fields.RunnerID != 0 {
