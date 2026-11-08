@@ -235,7 +235,8 @@ validate_bench_manifest() {
   # The validator is a file of its own so it can be tested without a builder guest.
   # It is resolved relative to this script rather than by absolute path, because the
   # builder carries scripts/ alongside guest/ and the two travel together.
-  local scripts_dir=${BASH_SOURCE[0]%/*}
+  local scripts_dir
+  scripts_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
   local validator=$scripts_dir/validate_bench_manifest.py
   [[ -f $validator ]] || {
     echo 'validate_bench_manifest.py is missing beside the sealer.' >&2
