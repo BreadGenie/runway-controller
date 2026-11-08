@@ -160,7 +160,7 @@ ssh_prefix = ['ssh'] if port else ['ip', 'netns', 'exec', namespace, 'ssh']
 result = subprocess.run([*ssh_prefix, *options(), guest,
                          shlex.join(['python3', '-c', request.pop('guest_program')])],
                         input=json.dumps(request), text=True, stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL, timeout=60)
+                        stderr=None if action == 'prepare' and payload.get('regional_cache') else subprocess.DEVNULL, timeout=60)
 if result.stdout:
     sys.stdout.write(result.stdout)
 # Teardown runs after the guest program so its status stays the reported answer, and
@@ -183,7 +183,7 @@ def main() -> int:
     # network namespace and no control-plane or GitHub credential.
     parser.add_argument('--regional-cache', help='Pinned TLS cache internal-name:port (prepare only)')
     parser.add_argument('--regional-cache-ca', type=Path, help='CA PEM on the controller')
-    parser.add_argument('--regional-cache-node', type=Path, help='Current cache-node binary on the controller')
+    parser.add_argument('--regional-cache-node', type=Path, help='Development override: cache-node binary on the controller')
     parser.add_argument('--allow-guest-sudo', action='store_true',
                         help='Give a fresh guest runner account passwordless sudo inside that guest')
     # Explicit operator opt-in to select the guest kernel's tsc clocksource during
@@ -234,8 +234,8 @@ def main() -> int:
     parser.add_argument('--diagnostics-dir', type=Path, help='Private local directory for collect')
     args = parser.parse_args()
     if any((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
-        if not all((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
-            parser.error('Regional cache requires --regional-cache, --regional-cache-ca and --regional-cache-node')
+        if not all((args.regional_cache, args.regional_cache_ca)):
+            parser.error('Regional cache requires --regional-cache and --regional-cache-ca')
         if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
             parser.error('Regional cache requires internal-name:port')
     if not re.fullmatch(r'vm-[0-9]+', args.vm_id):
@@ -278,9 +278,10 @@ def main() -> int:
                    guest_program=GUEST_PROGRAM)
     if args.regional_cache and args.action == 'prepare':
         repo = Path(__file__).resolve().parents[1]
-        sources = {'ca': args.regional_cache_ca, 'node': args.regional_cache_node,
-                   'relay': repo / 'integrations/actions-runner/cache-relay',
-                   'unit': repo / 'deploy/standalone-guest/runway-cache-relay.service'}
+        sources = {'ca': args.regional_cache_ca,
+                   'allowlist': repo / 'cmd/cache-node/allowlist.json'}
+        if args.regional_cache_node:
+            sources['node'] = args.regional_cache_node
         try:
             bundle = {key: base64.b64encode(path.read_bytes()).decode('ascii') for key, path in sources.items()}
         except OSError:
@@ -310,7 +311,7 @@ def main() -> int:
                                  '-o', 'ConnectTimeout=10',
                                  args.host, shlex.join(['python3', '-c', HOST_PROGRAM])],
                                 input=json.dumps(payload), text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=75)
+                                stderr=None if args.action == 'prepare' and args.regional_cache else subprocess.DEVNULL, timeout=75)
         if result.returncode != 0:
             print(json.dumps({'state': 'unknown'}))
             return 1

@@ -36,7 +36,7 @@ var (
 )
 
 func allowlisted(name, digest string) bool {
-	bundlesOnce.Do(func() { bundles = loadAllowlist(allowlistData) })
+	bundlesOnce.Do(func() { bundles = loadGuestAllowlist(allowlistPath) })
 	return bundles[name][digest]
 }
 
@@ -290,11 +290,15 @@ func trustedFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0022 != 0 || info.Size() > 1<<20 {
+	if !trustedCacheFileInfo(info) {
 		return nil, fmt.Errorf("unsafe cache file")
 	}
 	return io.ReadAll(io.LimitReader(f, 1<<20))
+}
+
+func trustedCacheFileInfo(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0 && info.Mode().IsRegular() && info.Mode().Perm()&0022 == 0 && info.Size() <= 1<<20
 }
 
 // HTTP adapts the unchanged newline-delimited setup wire to POST /setup.
@@ -410,7 +414,24 @@ func minDeadline(a, b time.Time) time.Time {
 	return b
 }
 
+const cacheNodeVersion = "cache-node/v1 allowlist/v1"
+
 func main() {
+	// Administrative probes are explicit and never part of normal Node execution.
+	if len(os.Args) == 2 && os.Args[1] == "--runway-cache-version" {
+		fmt.Println(cacheNodeVersion)
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "--runway-cache-check-allowlist" {
+		data, err := trustedFile(os.Args[2])
+		if err != nil || len(loadAllowlist(data)) == 0 {
+			fmt.Fprintln(os.Stderr, "invalid or unsafe cache allowlist")
+			os.Exit(1)
+		}
+		fmt.Println(cacheNodeVersion)
+		return
+	}
+
 	env := environment(os.Args, os.Environ(), func() bool { return selectRoute("/run/runway", os.Getenv, setup) }, func(line string) { fmt.Fprintln(os.Stderr, line) })
 	// The non-candidate path performs no filesystem reads before exec.
 	real := filepath.Join(filepath.Dir(os.Args[0]), "node.real")

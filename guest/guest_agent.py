@@ -98,15 +98,15 @@ def install_regional_cache(bundle, paths, call):
             raise ValueError('cache service installation failed')
 
     try:
-        if set(bundle) != {'service', 'ca', 'node', 'relay', 'unit'}:
+        if set(bundle) not in ({'service', 'ca', 'allowlist'}, {'service', 'ca', 'allowlist', 'node'}):
             raise ValueError('invalid cache bundle')
         service = bundle['service']
         if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', service):
             raise ValueError('invalid service name')
         if not 1 <= int(service.rsplit(':', 1)[1]) <= 65535:
             raise ValueError('invalid service port')
-        files = {key: base64.b64decode(bundle[key], validate=True) for key in ('ca', 'node', 'relay', 'unit')}
-        if not files['node'].startswith(b'\x7fELF') or not files['relay'] or not files['unit']:
+        files = {key: base64.b64decode(bundle[key], validate=True) for key in bundle if key != 'service'}
+        if 'node' in files and not files['node'].startswith(b'\x7fELF'):
             raise ValueError('invalid cache helpers')
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.load_verify_locations(cadata=files['ca'].decode('ascii'))
@@ -116,15 +116,29 @@ def install_regional_cache(bundle, paths, call):
         nodes = [paths.runner / 'externals' / version / 'bin/node' for version in ('node20', 'node24')]
         for node in nodes:
             if not node.is_file() or node.is_symlink():
-                raise ValueError('missing runner node')
+                raise ValueError('missing baked cache-node; rebuild runner image or use development override')
             real = node.with_name('node.real')
-            if not real.exists():
-                replace(real, node.read_bytes(), stat.S_IMODE(node.stat().st_mode))
+            if 'node' in files:
+                if not real.exists():
+                    replace(real, node.read_bytes(), stat.S_IMODE(node.stat().st_mode))
+                elif not real.is_file() or real.is_symlink():
+                    raise ValueError('unsafe real node')
+                replace(node, files['node'], 0o755)
             elif not real.is_file() or real.is_symlink():
-                raise ValueError('unsafe real node')
-            replace(node, files['node'], 0o755)
-        replace(root / 'opt/runway/bin/cache-relay', files['relay'], 0o755)
-        replace(root / 'etc/systemd/system' / unit, files['unit'], 0o644)
+                raise ValueError('missing baked cache-node (rebuild runner image)')
+        replace(root / 'etc/runway/cache-allowlist.json', files['allowlist'], 0o644)
+        for node in nodes:
+            entry = node.lstat()
+            if entry.st_uid != 0 or entry.st_mode & 0o022:
+                raise ValueError('unsafe baked cache-node')
+            check = call([str(node), '--runway-cache-check-allowlist', str(root / 'etc/runway/cache-allowlist.json')])
+            if check.returncode or check.stdout.strip() != 'cache-node/v1 allowlist/v1':
+                raise ValueError('baked cache-node missing or too old for shipped allowlist; rebuild runner image or use development override')
+        for helper in ('opt/runway/bin/cache-relay', 'etc/systemd/system/' + unit):
+            target = root / helper
+            entry = target.lstat()
+            if not stat.S_ISREG(entry.st_mode) or entry.st_uid != 0 or entry.st_mode & 0o022:
+                raise ValueError('missing or unsafe baked cache relay/unit; rebuild runner image')
         replace(root / 'etc/runway/cache-ca.pem', files['ca'], 0o644)
         config = {'version': 1, 'mode': 'service', 'service': service, 'ca_file': '/etc/runway/cache-ca.pem'}
         replace(root / 'etc/runway/cache.json', (json.dumps(config) + '\n').encode(), 0o644)
@@ -164,7 +178,8 @@ def install_regional_cache(bundle, paths, call):
                 time.sleep(0.05)
         require(['systemctl', 'is-active', '--quiet', unit])
         return True
-    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        print(f'regional cache prepare failed: {error}', file=sys.stderr)
         if started:
             call(['systemctl', 'stop', unit])
         if service_touched and not enabled:

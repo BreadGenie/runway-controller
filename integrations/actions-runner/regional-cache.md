@@ -82,7 +82,7 @@ Rollback requires restoring both the launcher and runway `.previous` binaries.
 
 The routing source of truth is `cmd/cache-node/allowlist.json`: repository,
 release, full commit, entrypoint and SHA256. setup-node's action.yml is
-harness-only. cache-node embeds the file; invalid data disables all regional
+harness-only. cache-node embeds the file and prefers a trusted guest file when present; invalid data disables all regional
 routing without preventing Node execution. Non-candidates still perform no file I/O.
 
 The daily and manually dispatched `Cache allowlist` workflow tracks every major
@@ -90,8 +90,9 @@ tag at or above the oldest pinned major, including newly published majors. It
 ignores releases without a major tag, retains every tested pin, resolves manifests
 and fetches bundles by full commit. It runs vet, race tests and every pinned relay
 scenario before opening an idempotent `bot/cache-allowlist-<versions>` PR. Failures
-appear in the run summary and produce no PR. Review and merge the PR, then rebuild
-and deploy the wrapper through the normal deployment process.
+appear in the run summary and produce no PR. Review and merge the PR, then deploy the controller through the normal
+deployment process. Standalone images need a rebuilt wrapper or a trusted external
+allowlist file.
 
 Manual fallback from the repository root:
 
@@ -116,13 +117,14 @@ do not trigger ordinary pull_request workflows; the bot runs its checks before
 creating the PR. Required external checks may need a human-triggered run.
 
 Controller guests opt in during `prepare` (see [pilot](../../docs/pilot.md)):
-`--regional-cache internal-cache:443 --regional-cache-ca /controller/cache-ca.pem
---regional-cache-node /controller/cache-node`. Both paths are local to the
-controller. The adapter reads the CA, current static wrapper, repository relay
-and unit, base64 encodes them in `regional_cache` in the existing JSON payload,
-and carries them over SSH stdin through Metal to the guest. No new host file
-staging, download endpoint, credentials or vsock is needed. The adapter carries
-these bytes only for prepare; status/bootstrap/collect/stop ignore the flags.
+`--regional-cache internal-cache:443 --regional-cache-ca /controller/cache-ca.pem`.
+The adapter base64 encodes the current repository `cmd/cache-node/allowlist.json`
+and pinned CA in `regional_cache` over SSH stdin, only for prepare. The static
+wrapper, relay and unit are baked by the [image recipe](../../docs/image-building.md).
+Default prepare sends no executable. `--regional-cache-node /controller/cache-node`
+is an optional development override that replaces both wrappers transactionally;
+it still requires the baked relay and unit. Status/bootstrap/collect/stop ignore
+the cache flags.
 
 The root-owned, non-writable-by-runner `/etc/runway/cache.json` schema is:
 
@@ -147,8 +149,8 @@ unsafe configuration all persist the ordinary disabled decision for the job.
 No tokens are logged or placed in the config.
 
 Preparation requires both external node20/node24 binaries on an unregistered
-clone reporting `installed`. It preserves each `node.real`, atomically installs
-root-owned helpers/config/CA/unit and creates the runner-owned 0700 decision
+clone reporting `installed`, with baked cache-node wrappers and preserved
+`node.real` executables. It atomically installs root-owned config/CA/allowlist and creates the runner-owned 0700 decision
 directory `/run/runway` (also recreated through tmpfiles on boot), then reloads,
 enables and starts the relay. Repeated preparation preserves the original Nodes.
 Any installation/service error restores prior files and service state and fails
@@ -157,5 +159,20 @@ prepare, so the controller requests no JIT. Registered guests are refused.
 The standalone launcher explicitly writes `{"version":1,"mode":"vsock"}`;
 absent config also preserves legacy standalone behavior (setup vsock 1026,
 translator vsock 1027). Invalid existing config fails closed rather than choosing
-vsock. Controller releases must carry a rebuilt `cache-node` so allowlist updates
-ship with the controller, alongside the matching relay and unit.
+vsock.
+
+`/etc/runway/cache-allowlist.json` uses exactly the embedded JSON array schema.
+Prepare writes it root:root 0644 and asks **each baked wrapper** to validate it
+with `--runway-cache-check-allowlist`. A missing/old wrapper, unsupported schema,
+or invalid allowlist fails prepare with rollback before the controller requests
+JIT. Ordinary Node execution never probes the allowlist file. Only candidates
+load it: a present root-owned regular file, without symlinks or group/world write
+bits and at most 1 MiB, replaces the embedded pins. Any unsafe, unreadable or
+invalid present file routes nothing; only absence uses embedded pins. Config
+ancestors under `/etc` must also remain root-owned and not writable by jobs.
+
+Merged allowlist-bot PRs reach fresh managed guests on the next controller
+deploy, because prepare ships the controller checkout's JSON. Image rebuilds are
+needed for wrapper/relay changes or future schema support, not new pins. Existing
+guests keep their prepared snapshot; standalone guests use embedded pins unless
+an external allowlist is explicitly installed.

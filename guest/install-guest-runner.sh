@@ -17,6 +17,21 @@ if [[ $ID != ubuntu || $VERSION_ID != 24.04 || $(uname -m) != x86_64 ]]; then
   exit 1
 fi
 
+# Stage these reviewed artifacts beside this script before entering the guest.
+cache_assets=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+for artifact in cache-node cache-relay runway-cache-relay.service; do
+  [[ -f $cache_assets/$artifact && ! -L $cache_assets/$artifact ]] || {
+    echo "Missing image input: $cache_assets/$artifact" >&2
+    exit 1
+  }
+done
+cache_node_version=$("$cache_assets/cache-node" --runway-cache-version)
+[[ $cache_node_version == 'cache-node/v1 allowlist/v1' ]] || {
+  echo 'Unsupported cache-node image input.' >&2
+  exit 1
+}
+cache_node_sha256=$(sha256sum "$cache_assets/cache-node" | cut -d ' ' -f1)
+
 runner_version=2.337.0
 runner_sha256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
 runner_directory=/home/runner/actions-runner
@@ -73,11 +88,26 @@ apt-get clean
 usermod --append --groups docker runner
 chown -R runner:runner "$staging_directory/extracted"
 mv -- "$staging_directory/extracted" "$runner_directory"
+# Keep the official Nodes and install the static wrapper at both runner entrypoints.
+for version in node20 node24; do
+  node_bin=$runner_directory/externals/$version/bin
+  mv -- "$node_bin/node" "$node_bin/node.real"
+  install -o root -g root -m 0755 "$cache_assets/cache-node" "$node_bin/node"
+  chown root:root "$node_bin" "$node_bin/node.real"
+  chmod go-w "$node_bin" "$node_bin/node.real"
+done
+install -d -o root -g root -m 0755 /opt/runway/bin /etc/runway
+install -o root -g root -m 0755 "$cache_assets/cache-relay" /opt/runway/bin/cache-relay
+install -o root -g root -m 0644 "$cache_assets/runway-cache-relay.service" /etc/systemd/system/runway-cache-relay.service
+systemctl daemon-reload
+systemctl disable --now runway-cache-relay.service
+# No mode, CA or allowlist is baked: prepare configures a fresh clone.
 systemctl reset-failed docker
 systemctl enable --now docker
 
 {
   printf 'OS=%s\nRUNNER_VERSION=%s\nRUNNER_SHA256=%s\n' "$PRETTY_NAME" "$runner_version" "$runner_sha256"
+  printf 'CACHE_NODE_VERSION=%s\nCACHE_NODE_SHA256=%s\n' "$cache_node_version" "$cache_node_sha256"
   dpkg-query --show --showformat='${binary:Package}=${Version}\n' ca-certificates curl git python3 docker.io
 } > /etc/runway-runner-image.txt
 chmod 0644 /etc/runway-runner-image.txt
