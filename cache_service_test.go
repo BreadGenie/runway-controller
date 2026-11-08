@@ -107,6 +107,19 @@ func TestCacheServiceAttributionAndFallback(t *testing.T) {
 		}
 	}
 }
+
+// The controller's scale-set messages carry no run attempt: REST supplies it.
+func TestCacheServiceUnknownRunAttempt(t *testing.T) {
+	s, test := serviceFixture(t, func(l *cacheServiceLease) { l.Job.RunAttempt = 0 }, 200, false)
+	if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
+		t.Fatal("unknown attempt not resolved by REST", got)
+	}
+	s, test = serviceFixture(t, func(l *cacheServiceLease) { l.Job.RunAttempt = 2 }, 200, false)
+	if got := serviceSetup(t, s, test.setup, servicePeer); got != "disabled" {
+		t.Fatal("known attempt disagreeing with REST enabled", got)
+	}
+}
+
 func TestCacheServiceGrantTranslatorReplay(t *testing.T) {
 	s, test := serviceFixture(t, nil, 200, false)
 	bad := test.setup

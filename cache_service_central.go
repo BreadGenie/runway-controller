@@ -148,12 +148,14 @@ func (a *cacheServiceAuthority) resolve(ctx context.Context, b cacheGuestBinding
 	if j == nil {
 		return cacheJobRelease{}, errCacheJobNotFound
 	}
+	// The scale-set messages carry no run attempt, so a lease may not know it (0);
+	// GitHub REST then supplies the run's current attempt. A known one must agree.
 	attempt := j.RunAttempt
 	confirmed, job, err := a.github.confirmREST(ctx, b, j.RunID, &attempt)
 	if err != nil {
 		return cacheJobRelease{}, err
 	}
-	if job.Name != j.DisplayName || attempt != j.RunAttempt {
+	if job.Name != j.DisplayName || (j.RunAttempt != 0 && attempt != j.RunAttempt) {
 		return cacheJobRelease{}, errCacheJobMismatch
 	}
 	confirmed.WorkflowRef = j.WorkflowRef

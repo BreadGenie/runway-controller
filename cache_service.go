@@ -233,7 +233,7 @@ func (s *cacheService) validLease(l cacheServiceLease, address netip.Addr, tenan
 	ip, err := netip.ParseAddr(l.MeshAddress)
 	j := l.Job
 	b := cacheGuestBinding{service: true, TenantID: l.TenantID, VMID: l.VMID, RunnerID: l.RunnerID, RunnerName: l.RunnerName, Repository: l.Repository, ExpiresAt: l.Deadline}
-	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.RunAttempt > 0 && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
+	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.RunAttempt >= 0 && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
 }
 func runCacheService(path string) error {
 	data, err := readProtectedCacheFile(path, true)
