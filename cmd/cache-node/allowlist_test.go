@@ -22,3 +22,13 @@ func TestAllowlistFailsClosed(t *testing.T) {
 		t.Fatalf("lost original pins: %v", got)
 	}
 }
+
+func TestFastPathDoesNotParseAllowlist(t *testing.T) {
+	if bundles != nil {
+		t.Skip("allowlist already loaded by an earlier test in this process")
+	}
+	environment([]string{"node", "/missing/unrelated.js"}, nil, func() bool { return false }, func(string) {})
+	if bundles != nil {
+		t.Fatal("the fast path parsed the allowlist")
+	}
+}

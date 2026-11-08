@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,7 +23,17 @@ import (
 
 const route = "http://127.0.0.1:18080/"
 
-var bundles = loadAllowlist(allowlistData)
+// The allowlist is parsed only for cache-action candidates, so the fast path
+// for every other action does no work before exec.
+var (
+	bundlesOnce sync.Once
+	bundles     map[string]map[string]bool
+)
+
+func allowlisted(name, digest string) bool {
+	bundlesOnce.Do(func() { bundles = loadAllowlist(allowlistData) })
+	return bundles[name][digest]
+}
 
 func candidate(script string) string {
 	for _, name := range []string{"cache", "setup-node"} {
@@ -52,7 +63,7 @@ func supported(script, name string) (string, bool) {
 		return "", false
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
-	return digest, bundles[name][digest]
+	return digest, allowlisted(name, digest)
 }
 
 // unpinned says, in the step's own log, that a cache action fell back to

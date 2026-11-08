@@ -39,6 +39,7 @@ func TestEnvironment(t *testing.T) {
 	}
 	hash := sha256.Sum256([]byte("fixture"))
 	key := hex.EncodeToString(hash[:])
+	allowlisted("cache", key)
 	bundles["cache"][key] = true
 	defer delete(bundles["cache"], key)
 	if got := environment([]string{"node", script}, env, func() bool { return false }, func(string) {}); !reflect.DeepEqual(got, env) {
@@ -70,6 +71,7 @@ func TestUnpinnedBundleIsReportedOnce(t *testing.T) {
 	// Unrelated actions and pinned bundles say nothing.
 	notices = nil
 	environment([]string{"node", "/missing/unrelated.js"}, nil, func() bool { return false }, notify)
+	allowlisted("setup-node", "")
 	bundles["setup-node"][hex.EncodeToString(hash[:])] = true
 	defer delete(bundles["setup-node"], hex.EncodeToString(hash[:]))
 	environment([]string{"node", script}, nil, func() bool { return false }, notify)
