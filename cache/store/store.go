@@ -584,7 +584,12 @@ func (s *Server) publish(ctx context.Context, e *entry, scope Scope) int {
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
-	keys := strings.Split(r.URL.Query().Get("keys"), ",")
+	rawKeys := r.URL.Query().Get("keys")
+	// actions/cache v4 applies encodeURIComponent before its URL builder
+	// escapes the query again. Accept its encoded list delimiter as well as
+	// the ordinary v5+ comma. Cache keys themselves cannot contain commas.
+	rawKeys = strings.ReplaceAll(strings.ReplaceAll(rawKeys, "%2C", ","), "%2c", ",")
+	keys := strings.Split(rawKeys, ",")
 	version := r.URL.Query().Get("version")
 	if len(keys) > 10 || version == "" || len(version) > 128 {
 		fail(w, http.StatusBadRequest)

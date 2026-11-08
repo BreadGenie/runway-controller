@@ -167,3 +167,17 @@ func TestManagedTLSRejectsUntrustedServer(t *testing.T) {
 		t.Fatal("untrusted storage accepted", status)
 	}
 }
+
+// Pinned actions/cache v4's URL builder escapes encodeURIComponent's comma
+// again; the HTTP query therefore contains %252C between ordered restore keys.
+func TestLegacyDoubleEscapedRestoreKeyDelimiter(t *testing.T) {
+	service := storetest.Start(t)
+	token := service.Signer.Writer(t)
+	service.Save(t, token, "deps-linux-1", "archive")
+	for _, keys := range []string{"missing%2Cdeps-", "missing%252Cdeps-", "missing%252cdeps-"} {
+		status, body := service.Do(t, "GET", "/_apis/artifactcache/cache?version=v1&keys="+keys, token, "", nil)
+		if status != 200 {
+			t.Fatalf("restore keys %s: %d %s", keys, status, body)
+		}
+	}
+}
