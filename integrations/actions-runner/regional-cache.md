@@ -33,6 +33,13 @@ job name. Flock serializes setup, so main/post share the decision. Enabled scrip
 replace ACTIONS_CACHE_URL and remove ACTIONS_CACHE_SERVICE_V2; all other env,
 arguments and argv[0] survive exec. Artifact inputs and tokens remain untouched.
 Unsupported bundles and contexts retain GitHub caching.
+A script under `_actions/actions/{cache,setup-node}/` that is not allowlisted
+(for example after a moved `@v4`/`@v6` tag) writes one line to its step log:
+`runway-cache: actions/NAME bundle sha256:PREFIX (FILE) is not on the
+regional-cache allowlist; this step uses GitHub's cache`. cache-host's `stopped`
+event records `setup_enabled`. Newer releases checked so far (cache v5.1.0 and
+v6.1.0, setup-node v7.1.0) still use cache protocol v1, so allowlisting one
+needs only its hashes and a passing pinned-client run.
 
 cache-relay forwards bounded connections to vsock 1027. Its 330-second idle
 limit covers large-save finalization. The installer stages the static wrapper,
