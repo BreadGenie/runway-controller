@@ -49,7 +49,9 @@ using slot accounts `runway-fc-1` through `runway-fc-9`. Each jail lives at
 `/srv/runway-jail/firecracker/VM/root`, with a kernel hardlink (copy across
 filesystems), its own root-drive device node, and jail-relative config paths
 `/vmlinux`, `/dev/rootfs` and `/vsock/v.sock`. The VM socket directory is
-bind-mounted at `vsock/`, owned by root and the slot group with mode `0750`;
+bind-mounted at `vsock/`, owned by root and the slot group with mode `3770`
+(setgid, so new sockets get the slot group, and sticky, so the jailed Firecracker
+can create its own `v.sock` but cannot remove cache-host's);
 cache-host sockets use that group and mode `0660`. Binding v2 records
 `jail_uid` and `jail_gid`: cache-host requires the peer PID, uid and gid to
 match, and the gid must also match the socket directory. V1 bindings are refused.

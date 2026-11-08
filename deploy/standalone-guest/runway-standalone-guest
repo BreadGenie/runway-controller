@@ -138,7 +138,9 @@ launch() {
 	# Expand now: the EXIT trap runs after this function's locals are gone.
 	trap "echo 'runway-standalone-guest: launch of $vm failed; tearing down' >&2; teardown '$vm' >&2 || true" EXIT
 	install -d -m 0700 "$work_root" "$work" "$run_root/bindings"
-	install -d -m 0750 -o root -g "$jail_gid" "$socket_dir"
+	# 3770: Firecracker creates its v.sock here, setgid gives cache-host's sockets the
+	# jail group without CAP_CHOWN, and sticky keeps them out of Firecracker's reach.
+	install -d -m 3770 -o root -g "$jail_gid" "$socket_dir"
 	echo "$index" > "$work/index"
 
 	zfs clone "$image_dataset/$image@ready" "$zv"

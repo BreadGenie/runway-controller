@@ -117,7 +117,7 @@ func runCacheHost(configPath, vmID string) error {
 	}
 	vmDir := filepath.Join(config.VMDir, vmID)
 	if _, err := cacheSocketDirectoryGroup(vmDir); err != nil {
-		return errors.New("cache-host VM socket directory must be root-owned with mode 0750")
+		return errors.New("cache-host VM socket directory must be root-owned with mode 3770")
 	}
 	host := newCacheHost(config, vmID, cacheHostLogger(os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -272,10 +272,11 @@ func (host *cacheHost) serve(parent context.Context) error {
 			return errors.New("cache-host vsock listener unavailable")
 		}
 		defer os.Remove(path)
-		if err := os.Chown(path, -1, int(group)); err != nil {
+		// The setgid directory already gave the socket its group; the unit has no CAP_CHOWN.
+		if info, err := os.Lstat(path); err != nil || info.Sys().(*syscall.Stat_t).Gid != group {
 			listener.Close()
 			syscall.Umask(old)
-			return err
+			return errors.New("cache-host vsock socket did not inherit the jail group")
 		}
 		if err := os.Chmod(path, 0660); err != nil {
 			listener.Close()

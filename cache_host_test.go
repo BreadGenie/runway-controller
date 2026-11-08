@@ -69,7 +69,7 @@ func startCacheHostFixture(t *testing.T, test *authorityCase, configure ...func(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	if err := os.Chmod(dir, 0750); err != nil {
+	if err := os.Chmod(dir, 0770|os.ModeSetgid|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
 	uds := filepath.Join(dir, "v.sock")
@@ -317,7 +317,10 @@ func TestCacheHostAnswersSetupWhenItIsUnavailable(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	config := cacheHostConfig{Version: 1, RegionID: "blr-1", Audience: "https://127.0.0.1:18445", CacheDataCAFile: "/nonexistent/ca.pem", SigningKeyFile: "/nonexistent/key.pem", GitHubTokenFile: "/nonexistent/token", BindingDir: "/nonexistent", VMDir: dir, AssignmentDir: "/nonexistent", ArchiveBytes: 1 << 20}
-	if err := os.Mkdir(filepath.Join(dir, test.binding.VMID), 0750); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, test.binding.VMID), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, test.binding.VMID), 0770|os.ModeSetgid|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
 	logs := &strings.Builder{}
@@ -458,12 +461,13 @@ func TestCacheHostRejectsPeerIdentityMismatch(t *testing.T) {
 
 func TestCacheSocketDirectoryPermissions(t *testing.T) {
 	dir := t.TempDir()
-	for _, mode := range []os.FileMode{0700, 0755, 0770, 0750} {
+	jailed := 0770 | os.ModeSetgid | os.ModeSticky
+	for _, mode := range []os.FileMode{0700, 0750, 0770, 0770 | os.ModeSetgid, 0770 | os.ModeSticky, 0777 | os.ModeSetgid | os.ModeSticky, jailed} {
 		if err := os.Chmod(dir, mode); err != nil {
 			t.Fatal(err)
 		}
 		_, err := cacheSocketDirectoryGroup(dir)
-		if (err == nil) != (mode == 0750 && os.Getuid() == 0) {
+		if (err == nil) != (mode == jailed && os.Getuid() == 0) {
 			t.Fatalf("mode %o: %v", mode, err)
 		}
 	}
