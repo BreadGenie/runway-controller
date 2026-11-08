@@ -24,8 +24,8 @@
 # Environment: RUNWAY_REPOSITORY (owner/name), RUNWAY_RUNNER_LABEL (the runner
 # scale set name, which is the workflow's runs-on label), RUNWAY_SCALE_SET_ID; optional
 # RUNWAY_GUEST_IMAGE, RUNWAY_GUEST_HOURS (default 3, at most the cache-host
-# unit's RuntimeMaxSec), RUNWAY_GUEST_VCPUS (2),
-# RUNWAY_GUEST_MEMORY_MIB (5120), RUNWAY_GUEST_CLOCKSOURCE (tsc, the default,
+# unit's RuntimeMaxSec), RUNWAY_GUEST_VCPUS (4) and RUNWAY_GUEST_MEMORY_MIB
+# (12288; together close to ubuntu-latest), RUNWAY_GUEST_CLOCKSOURCE (tsc, the default,
 # or kvm-clock; empty keeps the guest kernel's choice). Only reads Metal's image store; never touches
 # metal.service or metald state.
 set -euo pipefail
@@ -222,7 +222,7 @@ YAML
 	mknod -m 0600 "$jail/dev/rootfs" b "$((16#$major))" "$((16#$minor))"
 	chown "$jail_uid:$jail_gid" "$jail/dev/rootfs"
 	mount --bind "$socket_dir" "$jail/vsock"
-	python3 -I - "$jail" "$tap" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" "$clocksource" <<'PY'
+	python3 -I - "$jail" "$tap" "${RUNWAY_GUEST_VCPUS:-4}" "${RUNWAY_GUEST_MEMORY_MIB:-12288}" "$clocksource" <<'PY'
 import json, sys
 jail, tap, vcpus, memory, clocksource = sys.argv[1:]
 boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
