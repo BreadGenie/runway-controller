@@ -53,6 +53,7 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 			}
 		}
 		if matched == nil {
+			e.rememberAssignment(job.JobMessageBase)
 			continue
 		}
 		if _, err := uuid.Parse(job.JobID); err != nil {

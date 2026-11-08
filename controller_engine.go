@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -31,14 +32,21 @@ type pilotGitHub interface {
 }
 
 type pilotEngine struct {
-	store      pilotStore
-	github     pilotGitHub
-	guest      guestTransport
-	acquirer   jobAcquirer
-	snapshot   pilotSnapshot
-	demand     int
-	haveDemand bool
-	now        func() time.Time
+	assignmentREST      *http.Client
+	pendingAssignments  map[int64]*controllerAssignmentRun
+	assignmentResults   chan controllerAssignmentResult
+	assignmentBusy      bool
+	assignmentCancel    context.CancelFunc
+	assignmentLeaseID   string
+	assignmentSaturated time.Time
+	store               pilotStore
+	github              pilotGitHub
+	guest               guestTransport
+	acquirer            jobAcquirer
+	snapshot            pilotSnapshot
+	demand              int
+	haveDemand          bool
+	now                 func() time.Time
 }
 
 func (e *pilotEngine) remember(lease pilotLease) {
@@ -54,6 +62,9 @@ func (e *pilotEngine) update(ctx context.Context, lease pilotLease, event string
 	updated, err := e.store.Update(ctx, lease.ID, event, fields)
 	if err == nil {
 		e.remember(updated)
+		if e.assignmentCancel != nil && updated.ID == e.assignmentLeaseID && !e.assignmentLeaseEligible(updated) {
+			e.assignmentCancel()
+		}
 	}
 	return updated, err
 }
@@ -94,12 +105,18 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 			return err
 		}
 	}
+	if err := e.resolveAssignments(ctx); err != nil {
+		return err
+	}
 	return e.acquireAvailableJob(ctx, message)
 }
 
 // Reconcile executes at most one provisioning step per lease; Central returns
 // every durable phase after restart. JIT material exists only during one call.
 func (e *pilotEngine) Reconcile(ctx context.Context) error {
+	if err := e.resolveAssignments(ctx); err != nil {
+		return err
+	}
 	for _, lease := range append([]pilotLease(nil), e.snapshot.Leases...) {
 		if lease.Phase == "deleted" && lease.JITState == "removed" {
 			continue

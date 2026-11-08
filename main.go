@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -172,6 +173,10 @@ func writeSecret(file *os.File, secret string) error {
 }
 
 func authenticatedClient(ctx context.Context, url string, options ...scaleset.HTTPOption) (*scaleset.Client, error) {
+	return authenticatedControllerClient(ctx, url, nil, options...)
+}
+
+func authenticatedControllerClient(ctx context.Context, url string, rest **http.Client, options ...scaleset.HTTPOption) (*scaleset.Client, error) {
 	appID := os.Getenv("RUNWAY_GITHUB_APP_CLIENT_ID")
 	keyFile := os.Getenv("RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE")
 	installation := os.Getenv("RUNWAY_GITHUB_APP_INSTALLATION_ID")
@@ -180,6 +185,13 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 	if tokenFile := os.Getenv("RUNWAY_GITHUB_TOKEN_FILE"); tokenFile != "" {
 		if hasApp {
 			return nil, errors.New("select one GitHub credential source")
+		}
+		if rest != nil {
+			client, err := newCacheRepositoryClient(tokenFile)
+			if err != nil {
+				return nil, err
+			}
+			*rest = client
 		}
 		return cacheGitHubClient(url, tokenFile, options...)
 	}
@@ -192,6 +204,13 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 		if err != nil {
 			return nil, errors.New("cannot read GitHub App private key file")
 		}
+		if rest != nil {
+			client, err := newControllerAppREST(appID, id, key)
+			if err != nil {
+				return nil, err
+			}
+			*rest = client
+		}
 		return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
 			GitHubConfigURL: url,
 			GitHubAppAuth:   scaleset.GitHubAppAuth{ClientID: appID, InstallationID: id, PrivateKey: string(key)},
@@ -201,6 +220,9 @@ func authenticatedClient(ctx context.Context, url string, options ...scaleset.HT
 	token, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
 	if err != nil {
 		return nil, errors.New("gh authentication unavailable; configure gh or RUNWAY_GITHUB_APP_* variables")
+	}
+	if rest != nil {
+		*rest = &http.Client{Transport: cacheRepositoryCredential{token: strings.TrimSpace(string(token)), transport: http.DefaultTransport}}
 	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 		GitHubConfigURL: url, PersonalAccessToken: strings.TrimSpace(string(token)),

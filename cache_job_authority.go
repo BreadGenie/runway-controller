@@ -238,7 +238,7 @@ func (authority githubCacheJobAuthority) resolveREST(ctx context.Context, bindin
 
 // confirmREST looks for the bound runner's in-progress job in the run's current
 // attempt. A missing or still-queued job is errCacheJobNotFound (keep polling).
-func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64) (cacheJobConfirmation, cacheGitHubJob, error) {
+func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, binding cacheGuestBinding, runID int64, attempt *int64, matchName ...bool) (cacheJobConfirmation, cacheGitHubJob, error) {
 	if *attempt == 0 {
 		data, err := readCacheGitHubMetadata(ctx, authority.client, "/repos/"+binding.Repository+"/actions/runs/"+strconv.FormatInt(runID, 10))
 		if err != nil {
@@ -252,7 +252,11 @@ func (authority githubCacheJobAuthority) confirmREST(ctx context.Context, bindin
 		}
 		*attempt = run.RunAttempt
 	}
-	job, err := readCacheBoundJob(ctx, authority.client, binding.Repository, runID, *attempt, binding.RunnerID)
+	var names []string
+	if len(matchName) > 0 && matchName[0] {
+		names = []string{binding.RunnerName}
+	}
+	job, err := readCacheBoundJob(ctx, authority.client, binding.Repository, runID, *attempt, binding.RunnerID, names...)
 	switch {
 	case errors.Is(err, errCacheJobNotFound), errors.Is(err, errCacheJobMismatch):
 		return cacheJobConfirmation{}, cacheGitHubJob{}, err
@@ -413,7 +417,7 @@ func cacheJobPending(status string) bool {
 
 // readCacheBoundJob pages through one attempt's jobs (at most 1000) and returns
 // the single job assigned to runnerID, or errCacheJobNotFound.
-func readCacheBoundJob(ctx context.Context, client *http.Client, repository string, runID, attempt, runnerID int64) (cacheGitHubJob, error) {
+func readCacheBoundJob(ctx context.Context, client *http.Client, repository string, runID, attempt, runnerID int64, runnerName ...string) (cacheGitHubJob, error) {
 	var found []cacheGitHubJob
 	seen := 0
 	for page := 1; page <= 10; page++ {
@@ -427,7 +431,11 @@ func readCacheBoundJob(ctx context.Context, client *http.Client, repository stri
 			return cacheGitHubJob{}, err
 		}
 		for _, job := range jobs {
-			if job.RunnerID == runnerID {
+			matches := job.RunnerID == runnerID
+			if len(runnerName) > 0 {
+				matches = job.Status == "in_progress" && job.RunnerName == runnerName[0] && (job.RunnerID == 0 || job.RunnerID == runnerID)
+			}
+			if matches {
 				found = append(found, job)
 			}
 		}
