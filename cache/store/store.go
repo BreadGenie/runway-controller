@@ -585,6 +585,7 @@ func (s *Server) publish(ctx context.Context, e *entry, scope Scope) int {
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
 	rawKeys := r.URL.Query().Get("keys")
+	literalKeys := rawKeys
 	// actions/cache v4 applies encodeURIComponent before its URL builder
 	// escapes the query again. Accept its encoded list delimiter as well as
 	// the ordinary v5+ comma. Cache keys themselves cannot contain commas.
@@ -604,7 +605,13 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, ref := range scope.ReadRefs {
-		for _, key := range keys {
+		candidates := keys
+		// A literal percent sequence is also a valid cache key. Prefer that
+		// spelling before interpreting the legacy escaped list delimiter.
+		if literalKeys != rawKeys {
+			candidates = append([]string{literalKeys}, keys...)
+		}
+		for _, key := range candidates {
 			var match *entry
 			for _, e := range s.entries {
 				if e.hidden || !e.published || e.repository != scope.Repository || e.ref != ref || e.version != version || !strings.HasPrefix(e.key, key) {

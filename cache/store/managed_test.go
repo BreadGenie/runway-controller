@@ -181,3 +181,13 @@ func TestLegacyDoubleEscapedRestoreKeyDelimiter(t *testing.T) {
 		}
 	}
 }
+
+func TestLiteralEscapedCommaKeyStillRestores(t *testing.T) {
+	service := storetest.Start(t)
+	token := service.Signer.Writer(t)
+	service.Save(t, token, "literal%2Ckey", "archive")
+	status, raw := service.Do(t, "GET", "/_apis/artifactcache/cache?version=v1&keys=literal%252Ckey", token, "", nil)
+	if status != 200 {
+		t.Fatalf("literal percent key lost: %d %s", status, raw)
+	}
+}
