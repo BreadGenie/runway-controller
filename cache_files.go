@@ -105,3 +105,19 @@ func readProtectedCacheFile(path string, private bool) ([]byte, error) {
 	}
 	return io.ReadAll(io.LimitReader(file, 4097))
 }
+
+// cacheSocketDirectoryGroup admits only the jailed Firecracker's group (mode
+// 3770). Firecracker must create its own v.sock beside cache-host's sockets;
+// setgid gives new sockets that group without CAP_CHOWN, and the sticky bit
+// stops Firecracker removing or replacing cache-host's root-owned sockets.
+func cacheSocketDirectoryGroup(dir string) (uint32, error) {
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0770 || info.Mode()&(os.ModeSetgid|os.ModeSticky) != os.ModeSetgid|os.ModeSticky || info.Mode()&os.ModeSetuid != 0 {
+		return 0, errCacheInvalid
+	}
+	metadata, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || metadata.Uid != 0 {
+		return 0, errCacheInvalid
+	}
+	return metadata.Gid, nil
+}

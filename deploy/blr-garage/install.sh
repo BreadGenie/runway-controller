@@ -9,6 +9,16 @@ here=$(cd "$(dirname "$0")" && pwd)
 runway=${1:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
 cache_node=${2:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+if [ -d /run/runway-cache/bindings ] && [ -n "$(find /run/runway-cache/bindings -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+	echo "refusing install: guest binding files exist in /run/runway-cache/bindings; tear down all guests first" >&2
+	exit 1
+fi
+for index in {1..9}; do
+	account=runway-fc-$index
+	getent group "$account" >/dev/null || groupadd --system "$account"
+	id "$account" >/dev/null 2>&1 || useradd --system --gid "$account" --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$account"
+done
+install -d -m 0711 -o root -g root /srv/runway-jail
 # shellcheck source=garage.pin
 . "$here/garage.pin"
 

@@ -151,7 +151,7 @@ func newAuthorityCase(t *testing.T) *authorityCase {
 	now := time.Now()
 	return &authorityCase{
 		repo: loadGitHubFixture(t, "repo.json"), run: loadGitHubFixture(t, "run.json"), jobs: []map[string]any{jobs},
-		binding: cacheGuestBinding{Version: 1, VMID: "rc-warm", VsockUDS: "/run/runway-cache/vms/rc-warm/v.sock", FirecrackerPID: 4242, GuestCID: 3, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", Repository: fixtureRepository, ExpiresAt: now.Add(3 * time.Hour)},
+		binding: cacheGuestBinding{Version: 2, VMID: "rc-warm", VsockUDS: "/run/runway-cache/vms/rc-warm/v.sock", FirecrackerPID: 4242, GuestCID: 3, RunnerID: 219, RunnerName: "runway-cache-test-1104-warm", Repository: fixtureRepository, ExpiresAt: now.Add(3 * time.Hour)},
 		release: cacheJobRelease{JobID: jobID, RequestID: 0, Stop: now.Add(3 * time.Hour)},
 		setup: grant.SetupRequest{Version: 2, Nonce: "9c0f8e4a-2f7d-4e1b-8a3c-5d6e7f8a9b0c", Context: grant.SetupContext{
 			Repository: value(fixtureRepository), RepositoryID: value("580439734"), RunID: value("41867135947"), RunAttempt: value("1"),
@@ -442,6 +442,7 @@ func TestCacheGuestBindingIsStrict(t *testing.T) {
 		t.Fatal("valid binding refused", err)
 	}
 	for name, bad := range map[string]string{
+		"v1":          strings.Replace(string(data), `"version":2`, `"version":1`, 1),
 		"duplicate":   strings.Replace(string(data), `"runner_id":219`, `"runner_id":218,"runner_id":219`, 1),
 		"missing":     strings.Replace(string(data), `"runner_id":219,`, ``, 1),
 		"unknown":     strings.Replace(string(data), `"runner_id":219`, `"runner_id":219,"trusted":true`, 1),

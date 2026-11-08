@@ -45,6 +45,7 @@ token_file=/etc/runway-cache/github-token
 ssh_key=/var/lib/fc-metal/keys/id_ed25519
 run_root=/run/runway-cache
 work_root=/var/lib/runway-standalone
+jail_base=/srv/runway-jail
 guest_files=/opt/runway-cache/guest
 hours=${RUNWAY_GUEST_HOURS:-3}
 clocksource=${RUNWAY_GUEST_CLOCKSOURCE-tsc}
@@ -125,15 +126,21 @@ launch() {
 	local work=$work_root/$vm socket_dir=$run_root/vms/$vm zv=metal/runway-sg-$vm ns=rsg-$vm
 	local host_if=rsg${index}h guest_if=rsg${index}g tap=rsg${index}tap
 	local base=$((index * 4)) root max_hours
+	local account=runway-fc-$index jail=$jail_base/firecracker/$vm/root jail_uid jail_gid
+	jail_uid=$(id -u "$account")
+	jail_gid=$(id -g "$account")
 	# The binding (and so the guest) must not outlive its cache-host process.
 	max_hours=$(sed -n 's/^RuntimeMaxSec=\([0-9]*\)h$/\1/p' /etc/systemd/system/runway-cache-host@.service)
 	case $clocksource in "" | kvm-clock | tsc) ;; *) die "RUNWAY_GUEST_CLOCKSOURCE must be kvm-clock or tsc" ;; esac
 	[[ $hours =~ ^[1-9][0-9]*$ ]] && [ -n "$max_hours" ] && [ "$hours" -le "$max_hours" ] || die "RUNWAY_GUEST_HOURS must be 1-${max_hours:-?}"
-	[ ! -e "$work" ] && [ ! -e "$socket_dir" ] || die "$vm already exists"
+	[ ! -e "$work" ] && [ ! -e "$socket_dir" ] && [ ! -e "$jail_base/firecracker/$vm" ] || die "$vm already exists"
 	ip link show "$host_if" >/dev/null 2>&1 && die "index $index in use"
 	# Expand now: the EXIT trap runs after this function's locals are gone.
 	trap "echo 'runway-standalone-guest: launch of $vm failed; tearing down' >&2; teardown '$vm' >&2 || true" EXIT
-	install -d -m 0700 "$work_root" "$work" "$socket_dir" "$run_root/bindings"
+	install -d -m 0700 "$work_root" "$work" "$run_root/bindings"
+	# 3770: Firecracker creates its v.sock here, setgid gives cache-host's sockets the
+	# jail group without CAP_CHOWN, and sticky keeps them out of Firecracker's reach.
+	install -d -m 3770 -o root -g "$jail_gid" "$socket_dir"
 	echo "$index" > "$work/index"
 
 	zfs clone "$image_dataset/$image@ready" "$zv"
@@ -191,7 +198,7 @@ YAML
 	ip -n "$ns" addr add "10.254.200.$((base + 2))/30" dev "$guest_if"
 	ip -n "$ns" link set "$guest_if" mtu 1380 up
 	ip -n "$ns" link set lo up
-	ip netns exec "$ns" ip tuntap add "$tap" mode tap
+	ip netns exec "$ns" ip tuntap add "$tap" mode tap user "$jail_uid" group "$jail_gid"
 	ip -n "$ns" addr add 172.16.0.1/24 dev "$tap"
 	ip -n "$ns" link set "$tap" up
 	ip -n "$ns" route add default via "10.254.200.$((base + 1))"
@@ -199,9 +206,20 @@ YAML
 	ip netns exec "$ns" iptables -t nat -A POSTROUTING -o "$guest_if" -j MASQUERADE
 	ip netns exec "$ns" iptables -t mangle -A FORWARD -o "$guest_if" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-	python3 -I - "$work" "$image_root/$image/vmlinux" "$zv" "$tap" "$socket_dir/v.sock" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" "$clocksource" <<'PY'
+	install -d -m 0755 "$jail_base/firecracker" "$jail_base/firecracker/$vm" "$jail" "$jail/dev"
+	install -d -m 0700 -o "$jail_uid" -g "$jail_gid" "$jail/run"
+	install -d -m 0750 "$jail/vsock"
+	ln "$image_root/$image/vmlinux" "$jail/vmlinux" || cp "$image_root/$image/vmlinux" "$jail/vmlinux"
+	chown root:root "$jail/vmlinux"
+	chmod 0644 "$jail/vmlinux"
+	local major minor
+	read -r major minor < <(stat -Lc '%t %T' "/dev/zvol/$zv")
+	mknod -m 0600 "$jail/dev/rootfs" b "$((16#$major))" "$((16#$minor))"
+	chown "$jail_uid:$jail_gid" "$jail/dev/rootfs"
+	mount --bind "$socket_dir" "$jail/vsock"
+	python3 -I - "$jail" "$tap" "${RUNWAY_GUEST_VCPUS:-2}" "${RUNWAY_GUEST_MEMORY_MIB:-5120}" "$clocksource" <<'PY'
 import json, sys
-work, kernel, zv, tap, uds, vcpus, memory, clocksource = sys.argv[1:]
+jail, tap, vcpus, memory, clocksource = sys.argv[1:]
 boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
 # Nested KVM withholds a stable kvm-clock, so the guest's vDSO falls back to a
 # clock_gettime syscall; tsc restores the fast path. The guest kernel's TSC
@@ -209,19 +227,21 @@ boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw ip=172.16.0
 if clocksource:
     boot_args += " clocksource=" + clocksource
 config = {
-    "boot-source": {"kernel_image_path": kernel, "boot_args": boot_args},
-    "drives": [{"drive_id": "rootfs", "path_on_host": f"/dev/zvol/{zv}", "is_root_device": True, "is_read_only": False}],
+    "boot-source": {"kernel_image_path": "/vmlinux", "boot_args": boot_args},
+    "drives": [{"drive_id": "rootfs", "path_on_host": "/dev/rootfs", "is_root_device": True, "is_read_only": False}],
     "network-interfaces": [{"iface_id": "eth0", "host_dev_name": tap, "guest_mac": "06:00:ac:10:00:02"}],
-    "vsock": {"guest_cid": 3, "uds_path": uds},
+    "vsock": {"guest_cid": 3, "uds_path": "/vsock/v.sock"},
     "machine-config": {"vcpu_count": int(vcpus), "mem_size_mib": int(memory)},
 }
-open(f"{work}/firecracker.json", "w").write(json.dumps(config))
+open(f"{jail}/config.json", "w").write(json.dumps(config))
 PY
+	chmod 0644 "$jail/config.json"
 	# The host side listens before the guest can connect.
 	systemctl start "runway-cache-host@$vm.service"
 	systemd-run --quiet --unit="runway-guest-$vm" --property=RuntimeMaxSec=$((hours * 3600)) \
 		--property=StandardOutput="file:$work/console.log" --property=StandardError="file:$work/console.log" \
-		ip netns exec "$ns" /usr/bin/firecracker --api-sock "$work/fc.sock" --config-file "$work/firecracker.json"
+		/usr/bin/jailer --id "$vm" --exec-file /usr/bin/firecracker --uid "$jail_uid" --gid "$jail_gid" \
+		--chroot-base-dir "$jail_base" --netns "/var/run/netns/$ns" -- --config-file /config.json --api-sock /run/firecracker.socket
 	touch "$work/started" # reap considers only guests whose VM unit was started
 	for _ in $(seq 60); do guest_ssh "$vm" true 2>/dev/null && break; sleep 2; done
 	guest_ssh "$vm" true || die "guest SSH unavailable"
@@ -246,13 +266,16 @@ json.dump({"runner_id": d["runner_id"], "runner_name": d["runner_name"], "reposi
 	# Binding: only root writes it, in a root-only directory, atomically.
 	local pid
 	pid=$(systemctl show -p MainPID --value "runway-guest-$vm.service")
-	[ "$(readlink "/proc/$pid/exe")" = /usr/bin/firecracker ] || die "Firecracker PID not found"
-	python3 -I - "$work" "$vm" "$socket_dir/v.sock" "$pid" "$RUNWAY_REPOSITORY" "$hours" "$run_root/bindings" <<'PY'
+	# After pivot_root, readlink of /proc/PID/exe names the path inside the jail,
+	# so identify the process by its root directory and executable digest instead.
+	[ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$(stat -Lc %d:%i "/proc/$pid/root")" = "$(stat -Lc %d:%i "$jail")" ] || die "Firecracker PID not found in its jail"
+	[ "$(sha256sum "/proc/$pid/exe" | cut -c1-64)" = "$(sha256sum /usr/bin/firecracker | cut -c1-64)" ] || die "Firecracker binary digest mismatch"
+	python3 -I - "$work" "$vm" "$socket_dir/v.sock" "$pid" "$RUNWAY_REPOSITORY" "$hours" "$run_root/bindings" "$jail_uid" "$jail_gid" <<'PY'
 import datetime, json, os, sys
-work, vm, uds, pid, repository, hours, directory = sys.argv[1:]
+work, vm, uds, pid, repository, hours, directory, uid, gid = sys.argv[1:]
 runner = json.load(open(work + "/runner.json"))
 expires = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0) + datetime.timedelta(hours=int(hours))
-binding = {"version": 1, "vm_id": vm, "vsock_uds": uds, "firecracker_pid": int(pid), "guest_cid": 3,
+binding = {"version": 2, "jail_uid": int(uid), "jail_gid": int(gid), "vm_id": vm, "vsock_uds": uds, "firecracker_pid": int(pid), "guest_cid": 3,
            "runner_id": runner["runner_id"], "runner_name": runner["runner_name"], "repository": repository,
            "expires_at": expires.isoformat().replace("+00:00", "Z")}
 path = os.path.join(directory, vm + ".json")
@@ -293,25 +316,35 @@ teardown() {
 	[ -f "$work/index" ] && index=$(cat "$work/index")
 	# Fail closed first: without a binding the host refuses every request.
 	rm -f "$run_root/bindings/$vm.json" "$run_root/bindings/$vm.json.tmp"
+	systemctl stop "runway-guest-$vm.service" 2>/dev/null || true
+	systemctl reset-failed "runway-guest-$vm.service" 2>/dev/null || true
+	local jail=$jail_base/firecracker/$vm/root failed=0
+	# Never remove the jail through a live bind mount: it would delete cache-host's
+	# sockets. Keep cleaning up everything else, and report the failure at the end.
+	if mountpoint -q "$jail/vsock" && ! umount "$jail/vsock"; then
+		echo "warning: $jail/vsock still mounted; leaving the jail for reap" >&2
+		failed=1
+	else
+		rm -rf --one-file-system "$jail_base/firecracker/$vm" || failed=1
+	fi
 	if [ -f "$work/runner.json" ] && [ -s "$token_file" ]; then
 		local id repository status
 		read -r id repository < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["runner_id"], d["repository"])' "$work/runner.json")
-		status=$(github DELETE "/repos/$repository/actions/runners/$id" | tail -1)
+		status=$(github DELETE "/repos/$repository/actions/runners/$id" | tail -1) || true
 		case $status in 204 | 404) ;; *) echo "warning: runner $id deletion returned $status" >&2 ;; esac
 		forget_assignment "$id"
 	fi
-	systemctl stop "runway-guest-$vm.service" 2>/dev/null || true
-	systemctl reset-failed "runway-guest-$vm.service" 2>/dev/null || true
-	pkill -9 -f "firecracker --api-sock $work/fc.sock" 2>/dev/null || true
 	systemctl stop "runway-cache-host@$vm.service" 2>/dev/null || true
 	systemctl reset-failed "runway-cache-host@$vm.service" 2>/dev/null || true
-	mountpoint -q "$work/root" 2>/dev/null && umount "$work/root"
+	if mountpoint -q "$work/root" 2>/dev/null; then umount "$work/root" || failed=1; fi
 	ip netns del "$ns" 2>/dev/null || true
 	[ -n "$index" ] && ip link del "rsg${index}h" 2>/dev/null || true
 	sleep 1
 	if zfs list -H "$zv" >/dev/null 2>&1; then zfs destroy "$zv" || { sleep 3; zfs destroy "$zv"; }; fi
-	rm -rf "$work" "$run_root/vms/$vm"
-	echo "{\"vm_id\":\"$vm\",\"torn_down\":true}"
+	# A still-mounted work root or jail keeps its directories for reap to retry.
+	if [ "$failed" = 0 ]; then rm -rf --one-file-system "$work" "$run_root/vms/$vm"; fi
+	echo "{\"vm_id\":\"$vm\",\"torn_down\":$([ "$failed" = 0 ] && echo true || echo false)}"
+	return "$failed"
 }
 
 # reap tears down every guest whose VM unit is no longer running, for example
@@ -323,7 +356,7 @@ reap() {
 		vm=$(basename "$work")
 		[[ $vm =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -e "$work/started" ] || continue
 		systemctl is-active --quiet "runway-guest-$vm.service" && continue
-		teardown "$vm"
+		teardown "$vm" || echo "warning: teardown of $vm incomplete; reap will retry" >&2
 	done
 }
 

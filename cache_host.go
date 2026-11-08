@@ -116,8 +116,8 @@ func runCacheHost(configPath, vmID string) error {
 		return errors.New("cache-host configuration refused")
 	}
 	vmDir := filepath.Join(config.VMDir, vmID)
-	if err := checkCachePrivateDirectory(vmDir); err != nil {
-		return errors.New("cache-host VM socket directory must be root-owned and private")
+	if _, err := cacheSocketDirectoryGroup(vmDir); err != nil {
+		return errors.New("cache-host VM socket directory must be root-owned with mode 3770")
 	}
 	host := newCacheHost(config, vmID, cacheHostLogger(os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -130,7 +130,7 @@ func runCacheHost(configPath, vmID string) error {
 func newCacheHost(config cacheHostConfig, vmID string, log func(map[string]any)) *cacheHost {
 	host := &cacheHost{
 		vmID: vmID, uds: filepath.Join(config.VMDir, vmID, "v.sock"), bindings: cacheBindingFiles{dir: config.BindingDir},
-		clock: newCacheHostClock().observe, audience: config.Audience, archiveBytes: config.ArchiveBytes, peer: cacheUnixPeerPID, log: log,
+		clock: newCacheHostClock().observe, audience: config.Audience, archiveBytes: config.ArchiveBytes, peer: cacheUnixPeerCredentials, log: log,
 	}
 	key, keyErr := readCacheSigningKey(config.SigningKeyFile)
 	ca, caErr := readProtectedCacheFile(config.CacheDataCAFile, false)
@@ -154,18 +154,19 @@ func newCacheHost(config cacheHostConfig, vmID string, log func(map[string]any))
 }
 
 type cacheHost struct {
-	vmID, uds    string
-	bindings     cacheBindingSource
-	authority    *githubCacheJobAuthority // nil when unavailable is set
-	unavailable  string                   // why setup is disabled for this whole VM
-	clock        func(context.Context) (grant.Clock, error)
-	key          ed25519.PrivateKey
-	audience     string
-	roots        *x509.CertPool
-	archiveBytes int64
-	peer         func(net.Conn) (int, error)
-	log          func(map[string]any)
-	renewWindow  time.Duration // renew this long before expiry; zero is cacheHostRenewWindow
+	vmID, uds      string
+	bindings       cacheBindingSource
+	authority      *githubCacheJobAuthority // nil when unavailable is set
+	unavailable    string                   // why setup is disabled for this whole VM
+	clock          func(context.Context) (grant.Clock, error)
+	key            ed25519.PrivateKey
+	audience       string
+	roots          *x509.CertPool
+	archiveBytes   int64
+	peer           func(net.Conn) (*unix.Ucred, error)
+	directoryGroup func(string) (uint32, error)
+	log            func(map[string]any)
+	renewWindow    time.Duration // renew this long before expiry; zero is cacheHostRenewWindow
 
 	ctx        context.Context
 	mu         sync.Mutex
@@ -192,36 +193,35 @@ func cacheHostLogger(out io.Writer) func(map[string]any) {
 	}
 }
 
-// cacheUnixPeerPID returns the kernel-recorded PID of the process that
-// connected (SO_PEERCRED). For guest-initiated vsock that is Firecracker.
-func cacheUnixPeerPID(conn net.Conn) (int, error) {
+// cacheUnixPeerCredentials identifies the connecting Firecracker process (SO_PEERCRED).
+func cacheUnixPeerCredentials(conn net.Conn) (*unix.Ucred, error) {
 	if slot, ok := conn.(*cacheHostSlotConn); ok {
 		conn = slot.Conn
 	}
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return 0, grant.ErrInvalid
+		return nil, grant.ErrInvalid
 	}
 	raw, err := unixConn.SyscallConn()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var credential *unix.Ucred
 	var credentialErr error
 	if err := raw.Control(func(fd uintptr) {
 		credential, credentialErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
 	}); err != nil {
-		return 0, err
+		return nil, err
 	}
 	if credentialErr != nil || credential == nil || credential.Pid <= 0 {
-		return 0, grant.ErrInvalid
+		return nil, grant.ErrInvalid
 	}
-	return int(credential.Pid), nil
+	return credential, nil
 }
 
-// authenticate binds a connection to this VM's launcher binding by peer PID.
+// authenticate binds a connection to this VM's launcher binding by peer PID, uid and gid.
 func (host *cacheHost) authenticate(conn net.Conn) (cacheGuestBinding, string) {
-	pid, err := host.peer(conn)
+	peer, err := host.peer(conn)
 	if err != nil {
 		return cacheGuestBinding{}, "peer_unknown"
 	}
@@ -233,12 +233,23 @@ func (host *cacheHost) authenticate(conn net.Conn) (cacheGuestBinding, string) {
 		return cacheGuestBinding{}, "binding_invalid"
 	case binding.VsockUDS != host.uds:
 		return cacheGuestBinding{}, "binding_socket_mismatch"
-	case binding.FirecrackerPID != pid:
+	case binding.FirecrackerPID != int(peer.Pid) || binding.JailUID != peer.Uid || binding.JailGID != peer.Gid:
 		return cacheGuestBinding{}, "peer_mismatch"
 	case !time.Now().Before(binding.ExpiresAt):
 		return cacheGuestBinding{}, "binding_expired"
 	}
+	group, err := host.socketDirectoryGroup()
+	if err != nil || group != binding.JailGID {
+		return cacheGuestBinding{}, "peer_mismatch"
+	}
 	return binding, ""
+}
+
+func (host *cacheHost) socketDirectoryGroup() (uint32, error) {
+	if host.directoryGroup != nil {
+		return host.directoryGroup(filepath.Dir(host.uds))
+	}
+	return cacheSocketDirectoryGroup(filepath.Dir(host.uds))
 }
 
 func (host *cacheHost) serve(parent context.Context) error {
@@ -246,6 +257,10 @@ func (host *cacheHost) serve(parent context.Context) error {
 	defer cancel()
 	host.ctx = ctx
 	host.nonces = map[string]bool{}
+	group, err := host.socketDirectoryGroup()
+	if err != nil {
+		return errors.New("cache-host VM socket directory refused")
+	}
 	listeners := map[int]net.Listener{}
 	old := syscall.Umask(0077)
 	for _, port := range []int{1026, 1027} {
@@ -257,6 +272,17 @@ func (host *cacheHost) serve(parent context.Context) error {
 			return errors.New("cache-host vsock listener unavailable")
 		}
 		defer os.Remove(path)
+		// The setgid directory already gave the socket its group; the unit has no CAP_CHOWN.
+		if info, err := os.Lstat(path); err != nil || info.Sys().(*syscall.Stat_t).Gid != group {
+			listener.Close()
+			syscall.Umask(old)
+			return errors.New("cache-host vsock socket did not inherit the jail group")
+		}
+		if err := os.Chmod(path, 0660); err != nil {
+			listener.Close()
+			syscall.Umask(old)
+			return err
+		}
 		defer listener.Close()
 		listeners[port] = &cacheHostLimitedListener{Listener: listener, slots: make(chan struct{}, cacheHostSlots[port])}
 	}
@@ -280,7 +306,7 @@ func (host *cacheHost) serve(parent context.Context) error {
 		<-ctx.Done()
 		_ = server.Close()
 	}()
-	err := server.Serve(listeners[1027])
+	err = server.Serve(listeners[1027])
 	host.mu.Lock()
 	if host.current != nil {
 		host.current.Close()
