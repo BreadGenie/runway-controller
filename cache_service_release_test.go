@@ -30,9 +30,21 @@ func TestReleaseTLSIdentity(t *testing.T) {
 	if err := prepareCacheServiceTLS(c, local, "runway-cache-svc.example.test"); err != nil {
 		t.Fatal(err)
 	}
+	certificate, _ := os.ReadFile(local(c.CertificateFile))
+	ca, _ := os.ReadFile(local(c.CacheDataCAFile))
+	if string(certificate) != string(ca) {
+		t.Fatal("public CA differs from service certificate")
+	}
+	if err := os.WriteFile(local(c.CacheDataCAFile), []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	before, _ := os.ReadFile(local(c.PrivateKeyFile))
 	if err := prepareCacheServiceTLS(c, local, "runway-cache-svc.example.test"); err != nil {
 		t.Fatal(err)
+	}
+	ca, _ = os.ReadFile(local(c.CacheDataCAFile))
+	if string(certificate) != string(ca) {
+		t.Fatal("public CA not repaired on initialization")
 	}
 	after, _ := os.ReadFile(local(c.PrivateKeyFile))
 	if string(before) != string(after) {

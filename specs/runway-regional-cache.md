@@ -215,7 +215,7 @@ serialized and limited to one per second, including failed fetches.
 
 The JSON body has exactly `central_url`, `region`, and `credential`, with no
 null, duplicate, missing, or extra keys. Origin and Region name must exactly
-match configuration. Success is HTTP 200 with exactly `{"configured": true}`.
+match configuration. Success is HTTP 200 with exactly `{"configured": true, "ca": "<public service CA PEM>"}`.
 The opaque credential is never logged. It is written to a mode-0600 temporary
 file in the existing root-owned private token directory, fsynced, renamed over
 `central_token_file`, and the directory fsynced before publishing an immutable
@@ -353,12 +353,15 @@ The managed backend starts before enrolment and reads the credential on each
 bucket lookup. Central and storage CA trust are separate; empty storage CA uses
 system roots. Partial TLS identity is refused. Back up keys and journal together.
 
-Atlas contract correction required: its current `audience: "runway-cache"` is
-not a valid Runway grant audience. It must supply an HTTPS loopback data origin,
-for example `https://127.0.0.1:18445`, distinct from the guest and operator ports.
-Setup deliberately refuses the current invalid value. Atlas also unconditionally
-restarts services after the package installer returns, even when its pinned hash
-skips setup; setup's idempotence does not suppress that Atlas restart. Atlas's
-hash shortcut also means changes to derived config inputs require rerunning setup
-(or changing the pin); the service initialization reads the latest canonical JSON
-on every data-service restart.
+Atlas supplies the HTTPS loopback data origin `https://127.0.0.1:18445` as
+`audience`. Setup owns restarts when installed files or configuration change.
+Atlas's matching-package-hash shortcut skips setup and does not restart services;
+changes to derived config inputs require rerunning setup or changing the pin.
+
+Central enrolment stores the public CA and the configured guest endpoint
+`cache_service_name` (`internal-<operator-domain>:<guest-port>`) on Region.
+Only pools with `regional_cache` receive `regional_cache`, `cache_service` and
+`cache_ca` in their pool snapshot. The controller writes a temporary local CA
+file for prepare and removes it after transport exits. Missing endpoint or CA
+omits regional cache for that VM. The transport includes the checked-in cache
+allowlist and uses the cache-node binary baked into the guest image.

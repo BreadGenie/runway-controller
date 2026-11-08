@@ -85,7 +85,14 @@ def update(lease, fields):
 if __name__ == '__main__':
     try:
         request = json.load(sys.stdin)
-        print(json.dumps({'message': update(request['lease'], request['fields'])}))
+        if 'pool' in request:
+            namespace = {'frappe': SimpleNamespace(get_doc=lambda *args: Document(request['region'])),
+                         'iso_utc': lambda value: value, 'active_leases': lambda **kwargs: []}
+            load_functions('central/infrastructure/runway.py', ['pool_snapshot'], namespace)
+            result = namespace['pool_snapshot'](Document(request['pool']))
+        else:
+            result = update(request['lease'], request['fields'])
+        print(json.dumps({'message': result}))
     except ContractError as error:
         print(json.dumps({'error': str(error)}))
         sys.exit(1)

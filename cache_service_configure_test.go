@@ -29,6 +29,10 @@ func configureFixture(t *testing.T) (*cacheConfigure, ed25519.PrivateKey, *atomi
 	}))
 	t.Cleanup(jwks.Close)
 	h := &cacheConfigure{config: cacheServiceConfig{CentralURL: jwks.URL, CentralJWKSURL: jwks.URL, CentralIssuer: "central", CentralRegionID: 1, MeshRegionID: 1, RegionID: "blr-1", CentralTokenFile: filepath.Join(t.TempDir(), "token")}, central: &cacheCentralRotating{}, client: jwks.Client(), store: writeCacheCredential}
+	h.config.CacheDataCAFile = filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(h.config.CacheDataCAFile, []byte("public CA"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	return h, key, calls
 }
 func configureToken(t *testing.T, key ed25519.PrivateKey, kid string, edit func(jwt.MapClaims)) string {
@@ -147,7 +151,7 @@ func TestCacheConfigureAtomicRotation(t *testing.T) {
 	token := configureToken(t, key, "key", nil)
 	for _, value := range []string{"first", "second"} {
 		w := configureRequest(h, token, configureBody(h, value))
-		if w.Code != 200 || w.Body.String() != `{"configured": true}` {
+		if w.Code != 200 || w.Body.String() != "{\"ca\":\"public CA\",\"configured\":true}\n" {
 			t.Fatal(w.Code, w.Body.String())
 		}
 		raw, err := os.ReadFile(h.config.CentralTokenFile)
@@ -277,5 +281,19 @@ func TestCacheConfigureNetworkBoundary(t *testing.T) {
 	h.config.OperatorPeers = []string{"fdaa:1::7"}
 	if w := configureRequest(h, configureToken(t, key, "key", nil), configureBody(h, "secret")); w.Code != 200 {
 		t.Fatal(w.Code)
+	}
+}
+
+func TestCacheConfigureMissingCADoesNotRotateCredential(t *testing.T) {
+	h, key, _ := configureFixture(t)
+	if err := os.Remove(h.config.CacheDataCAFile); err != nil {
+		t.Fatal(err)
+	}
+	response := configureRequest(h, configureToken(t, key, "key", nil), configureBody(h, "secret"))
+	if response.Code != http.StatusServiceUnavailable || h.central.current.Load() != nil {
+		t.Fatal("enrolled without public CA")
+	}
+	if _, err := os.Stat(h.config.CentralTokenFile); !os.IsNotExist(err) {
+		t.Fatal("persisted credential without public CA", err)
 	}
 }

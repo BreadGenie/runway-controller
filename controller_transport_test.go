@@ -109,3 +109,67 @@ func TestControllerTransportEmitsPreparationTimingsWhenTheGuestReportsThem(t *te
 		t.Fatalf("timings arrived as %v, not the numbers the guest reported", event.TimingsMs)
 	}
 }
+
+func TestControllerTransportRegionalCache(t *testing.T) {
+	for _, pool := range []pilotPool{
+		{RegionalCache: true, CacheService: "internal-cache.example.test:8443", CacheCA: "public CA"},
+		{RegionalCache: true, CacheService: "internal-cache.example.test:8443"},
+		{RegionalCache: true, CacheCA: "public CA"},
+		{CacheService: "internal-cache.example.test:8443", CacheCA: "public CA"},
+	} {
+		executable, _ := os.Executable()
+		record := t.TempDir() + "/ca-path"
+		transport := commandTransport{command: []string{executable, "-test.run=^TestControllerTransportCacheHelper$", "--", record}, timeout: 5 * time.Second}
+		state, err := transport.Call(context.Background(), "prepare", pilotLease{VMID: "vm", RunnerName: "runner", cachePool: pool}, "")
+		if err != nil || state != "installed" {
+			t.Fatalf("prepare: %q %v", state, err)
+		}
+		path, err := os.ReadFile(record)
+		enabled := pool.RegionalCache && pool.CacheService != "" && pool.CacheCA != ""
+		if enabled {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(string(path)); !os.IsNotExist(err) {
+				t.Fatal("temporary CA retained", err)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatal("regional cache enabled without complete trust")
+		}
+	}
+}
+
+func TestControllerTransportCacheHelper(t *testing.T) {
+	index := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return
+	}
+	record := os.Args[index+1]
+	for i, arg := range os.Args {
+		if arg == "--regional-cache" && os.Args[i+1] != "internal-cache.example.test:8443" {
+			os.Exit(2)
+		}
+		if arg == "--regional-cache-ca" {
+			path := os.Args[i+1]
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != "public CA" {
+				os.Exit(3)
+			}
+			info, _ := os.Stat(path)
+			if info.Mode().Perm() != 0600 {
+				os.Exit(4)
+			}
+			if os.WriteFile(record, []byte(path), 0600) != nil {
+				os.Exit(5)
+			}
+		}
+	}
+	fmt.Println(`{"state":"installed"}`)
+	os.Exit(0)
+}

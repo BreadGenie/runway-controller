@@ -143,18 +143,20 @@ diff --git a/central/infrastructure/doctype/region/region.json b/central/infrast
 index d7afe78..4adda26 100644
 --- a/central/infrastructure/doctype/region/region.json
 +++ b/central/infrastructure/doctype/region/region.json
-@@ -36,7 +36,9 @@
+@@ -36,7 +36,11 @@
    "cargo_base_url",
    "cargo_registered_at",
    "cargo_delivery_section",
 -  "cargo_webhook_secret"
 +  "cargo_webhook_secret",
 +  "cache_service_url",
-+  "cache_service_credential"
++  "cache_service_credential",
++  "cache_service_name",
++  "cache_service_ca"
   ],
   "fields": [
    {
-@@ -231,6 +233,17 @@
+@@ -231,6 +233,29 @@
     "fieldname": "region_id",
     "fieldtype": "Int",
     "label": "Region ID"
@@ -168,6 +170,18 @@ index d7afe78..4adda26 100644
 +   "fieldname": "cache_service_credential",
 +   "fieldtype": "Password",
 +   "label": "Cache Service Credential",
++   "read_only": 1
++  },
++  {
++   "fieldname": "cache_service_name",
++   "fieldtype": "Data",
++   "label": "Cache Service Name",
++   "description": "Guest TLS endpoint: internal-service-name:port"
++  },
++  {
++   "fieldname": "cache_service_ca",
++   "fieldtype": "Long Text",
++   "label": "Cache Service CA",
 +   "read_only": 1
    }
   ],
@@ -879,7 +893,7 @@ new file mode 100644
 index 0000000..3273173
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,331 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -991,10 +1005,15 @@ index 0000000..3273173
 +
 +def pool_snapshot(pool) -> dict:
 +	fields = ("team", "region", "repository_url", "scale_set_id", "max_concurrency", "max_job_seconds")
++	cache = {}
++	if pool.get("regional_cache"):
++		region = frappe.get_doc("Region", pool.region)
++		cache = {"regional_cache": True, "cache_service": region.cache_service_name or "", "cache_ca": region.cache_service_ca or ""}
 +	return {
 +		"fence": int(pool.fence),
 +		"pool": {
 +			"id": pool.name,
++			**cache,
 +			**{field: pool.get(field) for field in fields},
 +			"enabled": pool.status == "Active",
 +			"owner_expires_at": iso_utc(pool.owner_expires_at),
@@ -1440,7 +1459,7 @@ new file mode 100644
 index 0000000..550d62d
 --- /dev/null
 +++ b/central/runway.py
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,297 @@
 +"""Narrow regional cache authority. This credential is never a Central API key."""
 +
 +import secrets
@@ -1715,8 +1734,27 @@ index 0000000..550d62d
 +			timeout=(5, 20),
 +			allow_redirects=False,
 +		)
-+		if response.status_code != 200 or response.json() != {"configured": True}:
++		from cryptography import x509
++		import re
++
++		result = response.json()
++		if response.status_code != 200 or not isinstance(result, dict) or set(result) != {"configured", "ca"} or result["configured"] is not True:
 +			frappe.throw("Cache service rejected configuration.")
++		try:
++			name, port = self.cache_service_name.rsplit(":", 1)
++			if not re.fullmatch(r"internal-[a-z0-9][a-z0-9.-]*", name) or not 1 <= int(port) <= 65535:
++				raise ValueError("Invalid cache service name")
++			pem = result["ca"]
++			if not isinstance(pem, str) or not re.fullmatch(r"\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*", pem):
++				raise ValueError("Expected one public certificate")
++			certificate = x509.load_pem_x509_certificate(pem.encode())
++			if not certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
++				raise ValueError("Expected CA certificate")
++			if name not in certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName):
++				raise ValueError("Missing service SAN")
++		except (ValueError, TypeError, AttributeError, x509.ExtensionNotFound):
++			frappe.throw("Cache service returned an invalid CA or service name.")
++		self.cache_service_ca = pem
 +		self.cache_service_credential = credential
 +		self.save()
 diff --git a/central/services/doctype/team_service/team_service.json b/central/services/doctype/team_service/team_service.json
@@ -2222,7 +2260,7 @@ new file mode 100644
 index 0000000..2825f76
 --- /dev/null
 +++ b/central/tests/test_runway_cache.py
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,364 @@
 +import json
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
@@ -2407,20 +2445,68 @@ index 0000000..2825f76
 +		)
 +		self.assertEqual(frappe.response["secret_key"], "secret")
 +
++	def service_ca(self, name="internal-cache.example.test", ca=True):
++		from datetime import datetime, timedelta, timezone
++		from cryptography import x509
++		from cryptography.hazmat.primitives import serialization
++		from cryptography.hazmat.primitives.asymmetric import ed25519
++		key = ed25519.Ed25519PrivateKey.generate()
++		subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, name)])
++		now = datetime.now(timezone.utc)
++		certificate = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
++			.public_key(key.public_key()).serial_number(x509.random_serial_number())
++			.not_valid_before(now - timedelta(hours=1)).not_valid_after(now + timedelta(days=1))
++			.add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
++			.add_extension(x509.SubjectAlternativeName([x509.DNSName(name)]), critical=False)
++			.sign(key, None))
++		return certificate.public_bytes(serialization.Encoding.PEM).decode()
++
++	def test_enrolment_rejects_invalid_ca_without_replacing_trust(self):
++		self.region.cache_service_url = "https://cache.example.test"
++		self.region.cache_service_name = "internal-cache.example.test:8443"
++		self.region.cache_service_ca = self.service_ca()
++		self.region.save()
++		original = self.region.cache_service_ca
++		for pem in ("invalid", original + original, self.service_ca(ca=False), self.service_ca("internal-other.example.test")):
++			with patch("central.runway.requests.post", return_value=Mock(status_code=200, json=lambda: {"configured": True, "ca": pem})):
++				with self.assertRaises(frappe.ValidationError):
++					self.region.enroll_cache()
++			self.region.reload()
++			self.assertEqual(self.region.cache_service_ca, original)
++
++	def test_pool_snapshot_exposes_public_trust_only_when_enabled(self):
++		from central.infrastructure.runway import pool_snapshot
++		self.pool.reload()
++		self.region.cache_service_name = "internal-cache.example.test:8443"
++		self.region.cache_service_ca = self.service_ca()
++		self.region.save()
++		for enabled in (0, 1):
++			self.pool.regional_cache = enabled
++			result = pool_snapshot(self.pool)["pool"]
++			self.assertEqual("cache_ca" in result, bool(enabled))
++			self.assertNotIn("cache_service_credential", result)
++			if enabled:
++				self.assertEqual(result["cache_ca"], self.region.cache_service_ca)
++				self.assertEqual(result["cache_service"], self.region.cache_service_name)
++
 +	def test_enrolment_and_rotation(self):
++		first_ca, second_ca = self.service_ca(), self.service_ca()
++		self.region.cache_service_name = "internal-cache.example.test:8443"
 +		self.region.cache_service_url = "https://cache.example.test"
 +		self.region.save()
 +		with (
 +			patch(
 +				"central.runway.requests.post",
-+				return_value=Mock(status_code=200, json=lambda: {"configured": True}),
++				side_effect=[Mock(status_code=200, json=lambda: {"configured": True, "ca": first_ca}), Mock(status_code=200, json=lambda: {"configured": True, "ca": second_ca})],
 +			) as post,
 +			patch("central.sso.mint_cargo_token", side_effect=AssertionError("Cargo token requested")) as cargo,
 +			patch("central.sso._mint_regional_token", return_value="cache-configure-jwt") as mint,
 +		):
 +			self.region.enroll_cache()
++			self.assertEqual(self.region.cache_service_ca, first_ca)
 +			first = self.region.get_password("cache_service_credential")
 +			self.region.enroll_cache()
++			self.assertEqual(self.region.cache_service_ca, second_ca)
 +			second = self.region.get_password("cache_service_credential")
 +			self.assertNotEqual(first, second)
 +			cargo.assert_not_called()
@@ -2557,7 +2643,7 @@ new file mode 100644
 index 0000000..23765fc
 --- /dev/null
 +++ b/spec/RUNWAY.md
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,82 @@
 +# Runway internal runner pilot
 +
 +## Purpose
@@ -2621,7 +2707,12 @@ index 0000000..23765fc
 +generic regional signer's five-minute TTL. Verify using Central's issuer URL/JWKS
 +from `central.sso.central_url()` / `jwks_url()`. The cache service never accepts
 +or holds Cargo-audience tokens. JSON has exactly `central_url`, `region`, `credential`; success is HTTP
-+200 with exactly `{"configured": true}`. Re-enrolment rotates the read credential.
++200 with exactly `{"configured": true, "ca": "<public CA PEM>"}`.
++Region stores `cache_service_ca` after checking a single CA certificate and its
++DNS SAN against configured `cache_service_name` (`internal-name:guest-port`).
++Re-enrolment replaces the public CA and rotates the read credential together.
++Only pools with `regional_cache` expose `regional_cache: true`, `cache_service`
++and `cache_ca` in the pool snapshot; credentials never appear there.
 +The service must implement this contract; no Cargo modifications are required.
 +
 +`Authorization: token <credential>` permits only GET `central.runway.cache_lease`

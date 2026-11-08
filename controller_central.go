@@ -26,6 +26,9 @@ type controllerConfig struct {
 }
 
 type pilotPool struct {
+	RegionalCache  bool   `json:"regional_cache"`
+	CacheService   string `json:"cache_service"`
+	CacheCA        string `json:"cache_ca"`
 	ID             string `json:"id"`
 	Region         string `json:"region"`
 	Team           string `json:"team"`
@@ -37,6 +40,7 @@ type pilotPool struct {
 }
 
 type pilotLease struct {
+	cachePool      pilotPool
 	Ref            string    `json:"ref,omitempty"`
 	SHA            string    `json:"sha,omitempty"`
 	RepositoryID   int64     `json:"repository_id,omitempty"`
