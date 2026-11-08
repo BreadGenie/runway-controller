@@ -39,9 +39,9 @@ func TestEnvironment(t *testing.T) {
 	}
 	hash := sha256.Sum256([]byte("fixture"))
 	key := hex.EncodeToString(hash[:])
-	allowlisted("cache", key)
-	bundles["cache"][key] = true
-	defer delete(bundles["cache"], key)
+	allowlisted("actions/cache", key)
+	bundles["actions/cache"][key] = true
+	defer delete(bundles["actions/cache"], key)
 	if got := environment([]string{"node", script}, env, func() bool { return false }, func(string) {}); !reflect.DeepEqual(got, env) {
 		t.Fatal(got)
 	}
@@ -71,14 +71,14 @@ func TestUnpinnedBundleIsReportedOnce(t *testing.T) {
 	// Unrelated actions and pinned bundles say nothing.
 	notices = nil
 	environment([]string{"node", "/missing/unrelated.js"}, nil, func() bool { return false }, notify)
-	allowlisted("setup-node", "")
-	bundles["setup-node"][hex.EncodeToString(hash[:])] = true
-	defer delete(bundles["setup-node"], hex.EncodeToString(hash[:]))
+	allowlisted("actions/setup-node", "")
+	bundles["actions/setup-node"][hex.EncodeToString(hash[:])] = true
+	defer delete(bundles["actions/setup-node"], hex.EncodeToString(hash[:]))
 	environment([]string{"node", script}, nil, func() bool { return false }, notify)
 	if len(notices) != 0 {
 		t.Fatal(notices)
 	}
-	if line := unpinned("cache", "/missing/index.js", ""); !strings.Contains(line, "unreadable") {
+	if line := unpinned("actions/cache", "/missing/index.js", ""); !strings.Contains(line, "unreadable") {
 		t.Fatal(line)
 	}
 }
@@ -212,5 +212,52 @@ func TestMissingInfrastructureAndContainer(t *testing.T) {
 	defer func() { os.Args = args }()
 	if selectRoute(t.TempDir(), getenv, setup) {
 		t.Fatal("container enabled")
+	}
+}
+
+func TestCandidateOwners(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/work/_actions/actions/cache/v6/dist/save/index.js", "actions/cache"},
+		{"/work/_actions/actions/setup-node/v7/dist/setup/index.js", "actions/setup-node"},
+		{"/work/_actions/astral-sh/setup-uv/v7/dist/setup/index.cjs", "astral-sh/setup-uv"},
+		{"/work/_actions/actions/setup-uv/v7/dist/setup/index.cjs", ""},
+		{"/work/_actions/other/setup-uv/v7/dist/setup/index.cjs", ""},
+		{"/work/_actions/astral-sh/setup-uv-extra/v7/dist/setup/index.cjs", ""},
+	} {
+		if got := candidate(tc.path); got != tc.want {
+			t.Fatalf("%s: %q, want %q", tc.path, got, tc.want)
+		}
+	}
+	line := unpinned("astral-sh/setup-uv", "/missing/index.cjs", "")
+	if !strings.Contains(line, "runway-cache: astral-sh/setup-uv bundle") {
+		t.Fatal(line)
+	}
+}
+
+func TestSetupUVEnvironment(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "_actions/astral-sh/setup-uv/v7/dist/setup")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "index.cjs")
+	data := []byte("setup-uv fixture")
+	if err := os.WriteFile(script, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	key := hex.EncodeToString(digest[:])
+	env := []string{"ACTIONS_CACHE_URL=upstream", "ACTIONS_CACHE_SERVICE_V2=true"}
+	var notices []string
+	notify := func(line string) { notices = append(notices, line) }
+	got := environment([]string{"node", script}, env, func() bool { t.Fatal("unpinned bundle reached setup"); return true }, notify)
+	if !reflect.DeepEqual(got, env) || len(notices) != 1 || !strings.Contains(notices[0], "astral-sh/setup-uv") {
+		t.Fatal(got, notices)
+	}
+	allowlisted("astral-sh/setup-uv", key)
+	bundles["astral-sh/setup-uv"][key] = true
+	defer delete(bundles["astral-sh/setup-uv"], key)
+	got = environment([]string{"node", script}, env, func() bool { return true }, notify)
+	if !reflect.DeepEqual(got, []string{"ACTIONS_CACHE_URL=" + route}) {
+		t.Fatal(got)
 	}
 }

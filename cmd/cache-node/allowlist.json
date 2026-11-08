@@ -142,5 +142,53 @@
     "path": "action.yml",
     "sha256": "84cd55863dbadfb83ed786c0bb4336553c2f4ceb52e102fccec01848f1977387",
     "harness_only": true
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v6.8.0",
+    "commit": "d0cc045d04ccac9d8b7881df0226f9e82c39688e",
+    "path": "dist/setup/index.js",
+    "sha256": "d647c2b0399e4bb7cfbe8ed453d757a8e30d6fd42b8ca94b4f4ce8aae69ba769",
+    "harness_only": false
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v6.8.0",
+    "commit": "d0cc045d04ccac9d8b7881df0226f9e82c39688e",
+    "path": "dist/save-cache/index.js",
+    "sha256": "d43ebf40c109d220db02f8bf166bdd900d7fc42bed043f1ddc59b7f15dac4265",
+    "harness_only": false
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v6.8.0",
+    "commit": "d0cc045d04ccac9d8b7881df0226f9e82c39688e",
+    "path": "action.yml",
+    "sha256": "b7e64add830d513ed49b8cadba8c75138eb45e0ff3dbf95bd687cc250b761444",
+    "harness_only": true
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v7.6.0",
+    "commit": "37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+    "path": "dist/setup/index.cjs",
+    "sha256": "58b1a54d364b29926dc91f4f506050408e9348530dfc25edb758655c32f4ad13",
+    "harness_only": false
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v7.6.0",
+    "commit": "37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+    "path": "dist/save-cache/index.cjs",
+    "sha256": "993a087978d964d5b62c5bde21e5de2036b47b8c01b89311d4c2fd51dd58311d",
+    "harness_only": false
+  },
+  {
+    "repo": "astral-sh/setup-uv",
+    "version": "v7.6.0",
+    "commit": "37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+    "path": "action.yml",
+    "sha256": "fb1672973d8ed83aa98a26f908b2946aafa01d415299913d55bb135ab0864752",
+    "harness_only": true
   }
 ]

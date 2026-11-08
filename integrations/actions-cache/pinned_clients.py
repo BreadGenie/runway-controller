@@ -17,11 +17,13 @@ def pinned_version(kind, release, commit, hashes):
     """Describe full-commit upstream files without performing network I/O."""
     bundles = {}
     for name, digest in hashes.items():
-        path = "action.yml" if name == "action.yml" else "dist/" + name + "/index.js"
+        extension = "cjs" if kind == "setup-uv" and int(release.split(".")[0][1:]) >= 7 else "js"
+        path = "action.yml" if name == "action.yml" else "dist/" + name + "/index." + extension
+        repo = "astral-sh/setup-uv" if kind == "setup-uv" else "actions/" + kind
         bundles[name] = {
-            "url": "https://raw.githubusercontent.com/actions/" + kind + "/" + commit + "/" + path,
+            "url": "https://raw.githubusercontent.com/" + repo + "/" + commit + "/" + path,
             "sha256": digest,
-            "filename": "action.yml" if name == "action.yml" else name + "-index.js",
+            "filename": "action.yml" if name == "action.yml" else name + "-index." + extension,
         }
     prefix = "actions-cache" if kind == "cache" else kind
     return {"release": release, "commit": commit,
@@ -32,7 +34,7 @@ def load_versions():
     import json
     grouped = {}
     for entry in json.loads((ROOT / "cmd/cache-node/allowlist.json").read_text()):
-        kind = entry["repo"].removeprefix("actions/")
+        kind = entry["repo"].split("/")[1]
         key = (kind, entry["version"], entry["commit"])
         name = "action.yml" if entry["harness_only"] else entry["path"].split("/")[1]
         grouped.setdefault(key, {})[name] = entry["sha256"]

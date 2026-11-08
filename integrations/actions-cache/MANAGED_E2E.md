@@ -28,10 +28,10 @@ RUNWAY_MANAGED_E2E=1 RUNWAY_MANAGED_E2E_OFFLINE=1 \
 ```
 
 The full in-memory variant also works offline after provisioning the pinned
-vendor directory, Node, Yarn, tar and zstd. Bundles are verified against the
+vendor directory, Node, Yarn, uv, tar and zstd. Bundles are verified against the
 cache-node allowlist before execution. Six actions/cache cases (v4.3.0, v5.1.0,
 v6.1.0, both main/post and restore/save-only) and two setup-node cases (v6.5.0,
-v7.1.0) run.
+v7.1.0), plus two setup-uv cases (v6.8.0, v7.6.0), run.
 
 ## Boundaries and assertions
 
@@ -60,7 +60,7 @@ service connections; permitted connections must reach the fixed guest relay.
 
 | Scenario | Assertion |
 | --- | --- |
-| Miss/save/exact/restore-key | Every pinned cache case restores identical file hashes; setup-node does miss/save/exact with identical hashes. |
+| Miss/save/exact/restore-key | Every pinned cache case restores identical file hashes; setup-node and setup-uv do miss/save/exact with identical hashes. |
 | Cross-team, same repository | Team B misses A's key and cannot redeem A's archive ticket. |
 | Spoofed/unknown attribution | Invalid source region, unknown address and Central/source tenant mismatch produce no enabled setup. |
 | Early setup | Controller REST resolver records assigned evidence, `started=false`; service independently verifies GitHub REST. |

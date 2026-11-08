@@ -41,8 +41,8 @@ func allowlisted(name, digest string) bool {
 }
 
 func candidate(script string) string {
-	for _, name := range []string{"cache", "setup-node"} {
-		if strings.Contains(script, "/_actions/actions/"+name+"/") {
+	for _, name := range []string{"actions/cache", "actions/setup-node", "astral-sh/setup-uv"} {
+		if strings.Contains(script, "/_actions/"+name+"/") {
 			return name
 		}
 	}
@@ -79,7 +79,7 @@ func unpinned(name, script, digest string) string {
 	} else {
 		digest = "sha256:" + digest[:12]
 	}
-	return fmt.Sprintf("runway-cache: actions/%s bundle %s (%s) is not on the regional-cache allowlist; this step uses GitHub's cache", name, digest, filepath.Base(script))
+	return fmt.Sprintf("runway-cache: %s bundle %s (%s) is not on the regional-cache allowlist; this step uses GitHub's cache", name, digest, filepath.Base(script))
 }
 
 func routed(env []string) []string {
