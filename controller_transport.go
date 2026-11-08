@@ -29,6 +29,22 @@ func (t commandTransport) Call(ctx context.Context, action string, lease pilotLe
 	if action == "bootstrap" {
 		args = append(args, "--deadline", lease.Deadline.UTC().Format(time.RFC3339Nano))
 	}
+	if action == "prepare" && lease.cachePool.RegionalCache && lease.cachePool.CacheService != "" && lease.cachePool.CacheCA != "" {
+		file, err := os.CreateTemp("", "runway-cache-ca-*.pem")
+		if err != nil {
+			return "unknown", err
+		}
+		defer os.Remove(file.Name())
+		_, writeErr := file.WriteString(lease.cachePool.CacheCA)
+		closeErr := file.Close()
+		if writeErr != nil {
+			return "unknown", writeErr
+		}
+		if closeErr != nil {
+			return "unknown", closeErr
+		}
+		args = append(args, "--regional-cache", lease.cachePool.CacheService, "--regional-cache-ca", file.Name())
+	}
 	cmd := exec.CommandContext(ctx, t.command[0], args...)
 	// Do not inherit GitHub/App or control-plane credentials into transport.
 	for _, key := range []string{"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SSH_AUTH_SOCK"} {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -49,6 +50,7 @@ type managedE2E struct {
 	setup                    grant.SetupRequest
 	mu                       sync.Mutex
 	credential               string
+	cachePool                pilotPool
 	lease                    cacheServiceLease
 	buckets                  map[int64]store.GarageConfig
 	provider                 *cacheBucketProvider
@@ -183,6 +185,18 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
 	f.guest = httptest.NewUnstartedServer(managedPeer(f.service, servicePeer))
 	f.guest.Config.IdleTimeout = 5 * time.Second
+	identity := t.TempDir()
+	c := cacheServiceConfig{CertificateFile: "/cert.pem", PrivateKeyFile: "/key.pem", CacheDataCAFile: "/ca.pem"}
+	local := func(path string) string { return filepath.Join(identity, path) }
+	if err := prepareCacheServiceTLS(c, local, "cache.example.test"); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.LoadX509KeyPair(local(c.CertificateFile), local(c.PrivateKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.configure.config.CacheDataCAFile = local(c.CacheDataCAFile)
+	f.guest.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
 	f.guest.StartTLS()
 	t.Cleanup(f.guest.Close)
 	t.Cleanup(func() {
@@ -281,9 +295,24 @@ func (f *managedE2E) enroll(credential string) {
 	}
 	defer response.Body.Close()
 	raw, _ := io.ReadAll(response.Body)
-	if response.StatusCode != 200 || string(raw) != `{"configured": true}` {
+	var configured struct {
+		Configured bool   `json:"configured"`
+		CA         string `json:"ca"`
+	}
+	if response.StatusCode != 200 || json.Unmarshal(raw, &configured) != nil || !configured.Configured || configured.CA == "" {
 		f.t.Fatalf("enrolment: %d %s", response.StatusCode, raw)
 	}
+	request, _ := json.Marshal(map[string]any{"pool": map[string]any{"name": "pool", "regional_cache": true, "fence": 1, "region": "blr-1"}, "region": map[string]string{"cache_service_name": "internal-cache.example.test:8443", "cache_service_ca": configured.CA}})
+	command := exec.Command("python3", "integrations/central/contract_harness.py")
+	command.Stdin = bytes.NewReader(request)
+	output, err := command.CombinedOutput()
+	var snapshot struct {
+		Message pilotSnapshot `json:"message"`
+	}
+	if err != nil || json.Unmarshal(output, &snapshot) != nil {
+		f.t.Fatalf("Central pool snapshot: %v %s", err, output)
+	}
+	f.cachePool = snapshot.Message.Pool
 	f.mu.Lock()
 	f.credential = credential
 	f.mu.Unlock()
@@ -501,7 +530,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 			f := newManagedE2E(t, garageBuckets)
 			f.enroll("central-e2e-first")
 			ca := filepath.Join(t.TempDir(), "ca.pem")
-			os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.guest.Certificate().Raw}), 0600)
+			os.WriteFile(ca, []byte(f.cachePool.CacheCA), 0600)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 			defer cancel()
 			contextPath := filepath.Join(t.TempDir(), "context.json")

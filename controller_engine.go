@@ -229,6 +229,7 @@ func (e *pilotEngine) Reconcile(ctx context.Context) error {
 func (e *pilotEngine) startFreshRunner(ctx context.Context, lease pilotLease) error {
 	ctx, cancel := context.WithDeadline(ctx, lease.Deadline)
 	defer cancel()
+	lease.cachePool = e.snapshot.Pool
 	state, err := e.guest.Call(ctx, "prepare", lease, "")
 	if err != nil {
 		return err

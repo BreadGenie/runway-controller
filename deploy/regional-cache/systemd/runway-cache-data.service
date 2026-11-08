@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/runway/release.env
+ExecStartPre=/usr/local/bin/runway --action cache-service-init --config /etc/runway/cache-service.json
 ExecStart=/usr/local/bin/runway --action cache-data --config /etc/runway/cache-data.json
 Restart=on-failure
 RestartSec=5

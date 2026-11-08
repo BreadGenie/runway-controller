@@ -11,6 +11,7 @@ import (
 )
 
 type cacheManagedConfig struct {
+	CentralCAFile     string `json:"central_ca_file,omitempty"`
 	CentralURL        string `json:"central_url"`
 	CentralTokenFile  string `json:"central_token_file"`
 	StorageCAFile     string `json:"storage_ca_file"`

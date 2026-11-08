@@ -186,6 +186,11 @@ func (h *cacheConfigure) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "configure refused", 400)
 		return
 	}
+	ca, err := os.ReadFile(h.config.CacheDataCAFile)
+	if err != nil {
+		http.Error(w, "configure unavailable", 503)
+		return
+	}
 	persist := h.store
 	if persist == nil {
 		persist = storeCacheCredential
@@ -196,7 +201,7 @@ func (h *cacheConfigure) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.central.current.Store(&cacheCentralWithBuckets{cacheCentralHTTPS{origin: h.config.CentralURL, token: body.Credential, client: h.client}})
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = io.WriteString(w, `{"configured": true}`)
+	_ = json.NewEncoder(w).Encode(map[string]any{"configured": true, "ca": string(ca)})
 }
 func storeCacheCredential(path, token string) error {
 	if checkCachePrivateDirectory(filepath.Dir(path)) != nil {

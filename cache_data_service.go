@@ -135,15 +135,30 @@ func runCacheDataService(configPath string) error {
 	}
 	if m := config.Managed; m != nil {
 		token, err := readProtectedCacheFile(m.CentralTokenFile, true)
-		if err != nil {
+		if _, statErr := os.Lstat(m.CentralTokenFile); err != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return grant.ErrInvalid
 		}
 		ca, err := readProtectedCacheFile(m.StorageCAFile, false)
 		if err != nil {
 			return grant.ErrInvalid
 		}
-		roots := x509.NewCertPool()
-		if !roots.AppendCertsFromPEM(ca) {
+		if len(ca) == 0 {
+			ca, err = os.ReadFile("/etc/ssl/certs/ca-certificates.crt")
+			if err != nil {
+				return grant.ErrInvalid
+			}
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			return grant.ErrInvalid
+		}
+		if m.CentralCAFile != "" {
+			centralCA, err := readProtectedCacheFile(m.CentralCAFile, false)
+			if err != nil || !roots.AppendCertsFromPEM(centralCA) {
+				return grant.ErrInvalid
+			}
+		}
+		if len(ca) > 0 && !x509.NewCertPool().AppendCertsFromPEM(ca) {
 			return grant.ErrInvalid
 		}
 		core.CleanupStaleAfter = time.Duration(m.CleanupStaleHours) * time.Hour
@@ -298,6 +313,9 @@ func managedConfigFields(raw json.RawMessage) []string {
 	fields := []string{"central_url", "central_token_file", "storage_ca_file"}
 	var obj map[string]json.RawMessage
 	json.Unmarshal(raw, &obj)
+	if _, ok := obj["central_ca_file"]; ok {
+		fields = append(fields, "central_ca_file")
+	}
 	if _, ok := obj["cleanup_stale_hours"]; ok {
 		fields = append(fields, "cleanup_stale_hours")
 	}
