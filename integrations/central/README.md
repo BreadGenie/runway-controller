@@ -44,8 +44,11 @@ deterministic names prevent a second bucket or takeover.
 
 Save an HTTPS `cache_service_url` on Region, then invoke the operator-only
 `enroll_cache` document method. Repeat to rotate its credential. Central POSTs
-`/configure` with `X-Cargo-Access-Token`, using the existing regional management
-JWT trust, and exactly `{central_url, region, credential}`. Success is HTTP 200
+`/configure` with `Authorization: Bearer <jwt>`. This dedicated five-minute
+regional token has issuer `central`, audience `runway-cache:<numeric region id>`
+and scope `runway-cache-configure`, verified with Central's issuer URL/JWKS
+(`central.sso.central_url()` / `jwks_url()`). The cache service never accepts or
+holds Cargo-audience tokens. The JSON body is exactly `{central_url, region, credential}`. Success is HTTP 200
 with exactly `{"configured": true}`; redirects are refused. The cache service
 must implement this contract; Cargo needs no change. A timeout or Central
 rollback after remote acceptance requires re-enrolment.

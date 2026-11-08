@@ -1366,7 +1366,7 @@ new file mode 100644
 index 0000000..550d62d
 --- /dev/null
 +++ b/central/runway.py
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,263 @@
 +"""Narrow regional cache authority. This credential is never a Central API key."""
 +
 +import secrets
@@ -1384,6 +1384,13 @@ index 0000000..550d62d
 +
 +METHODS = {"central.runway.cache_lease", "central.runway.cache_bucket"}
 +CACHE_USER = "runway-cache@central.invalid"
++
++
++def mint_cache_configure_token(region_id: int) -> str:
++	"""Mint a short-lived credential that cannot authorize Cargo management."""
++	from central.sso import _mint_regional_token
++
++	return _mint_regional_token(region_id, f"runway-cache:{region_id}", "runway-cache-configure")
 +
 +
 +def authenticate_cache():
@@ -1609,12 +1616,12 @@ index 0000000..550d62d
 +				}
 +			).insert(ignore_permissions=True, ignore_if_duplicate=True)
 +		credential = secrets.token_urlsafe(32)
-+		from central.sso import central_url, mint_cargo_token
++		from central.sso import central_url
 +
-+		# Same regional management JWT trust used to enrol Cargo; never authenticate configure with the new secret itself.
++		# Configure has its own audience and scope; never expose a Cargo credential.
 +		response = requests.post(
 +			self.cache_service_url + "/configure",
-+			headers={"X-Cargo-Access-Token": mint_cargo_token(self.get_atlas_region_id())},
++			headers={"Authorization": "Bearer " + mint_cache_configure_token(self.get_atlas_region_id())},
 +			json={"central_url": central_url(), "region": self.name, "credential": credential},
 +			timeout=(5, 20),
 +			allow_redirects=False,
@@ -2107,7 +2114,7 @@ new file mode 100644
 index 0000000..2825f76
 --- /dev/null
 +++ b/central/tests/test_runway_cache.py
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,311 @@
 +import json
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
@@ -2295,13 +2302,22 @@ index 0000000..2825f76
 +				"central.runway.requests.post",
 +				return_value=Mock(status_code=200, json=lambda: {"configured": True}),
 +			) as post,
-+			patch("central.sso.mint_cargo_token", return_value="management-jwt"),
++			patch("central.sso.mint_cargo_token", side_effect=AssertionError("Cargo token requested")) as cargo,
++			patch("central.sso._mint_regional_token", return_value="cache-configure-jwt") as mint,
 +		):
 +			self.region.enroll_cache()
 +			first = self.region.get_password("cache_service_credential")
 +			self.region.enroll_cache()
 +			second = self.region.get_password("cache_service_credential")
 +			self.assertNotEqual(first, second)
++			cargo.assert_not_called()
++			region_id = self.region.get_atlas_region_id()
++			self.assertEqual(mint.call_count, 2)
++			for call in mint.call_args_list:
++				self.assertEqual(call.args, (region_id, f"runway-cache:{region_id}", "runway-cache-configure"))
++				self.assertEqual(call.kwargs, {})
++			for call in post.call_args_list:
++				self.assertEqual(call.kwargs["headers"], {"Authorization": "Bearer cache-configure-jwt"})
 +			self.assertEqual(
 +				post.call_args.kwargs["json"],
 +				{
@@ -2428,7 +2444,7 @@ new file mode 100644
 index 0000000..23765fc
 --- /dev/null
 +++ b/spec/RUNWAY.md
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +# Runway internal runner pilot
 +
 +## Purpose
@@ -2487,8 +2503,11 @@ index 0000000..23765fc
 +eventual, outside document-save transactions, to avoid reversing lease locks.
 +
 +Region `cache_service_url` is HTTPS. Operator `enroll_cache` POSTs `/configure`
-+using the regional `X-Cargo-Access-Token` management JWT (Cargo audience and trust
-+rules). JSON has exactly `central_url`, `region`, `credential`; success is HTTP
++using `Authorization: Bearer <jwt>`, with issuer `central`, audience
++`runway-cache:<numeric region id>`, scope `runway-cache-configure`, and the
++generic regional signer's five-minute TTL. Verify using Central's issuer URL/JWKS
++from `central.sso.central_url()` / `jwks_url()`. The cache service never accepts
++or holds Cargo-audience tokens. JSON has exactly `central_url`, `region`, `credential`; success is HTTP
 +200 with exactly `{"configured": true}`. Re-enrolment rotates the read credential.
 +The service must implement this contract; no Cargo modifications are required.
 +
