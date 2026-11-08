@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -92,12 +93,12 @@ func TestControllerAssignmentREST(t *testing.T) {
 				}
 				conflict := job
 				conflict.JobID = uuid.NewString()
-				if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: conflict, RunnerName: got.RunnerName, RunnerID: 42}}}); err == nil {
+				if err := e.Handle(t.Context(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: conflict, RunnerName: got.RunnerName, RunnerID: 42}}}); err == nil {
 					t.Fatal("conflicting start accepted")
 				}
 			}
 			if scenario == "no-match" {
-				if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: got.RunnerName, RunnerID: 42}}}); err != nil {
+				if err := e.Handle(t.Context(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: got.RunnerName, RunnerID: 42}}}); err != nil {
 					t.Fatal(err)
 				}
 				if !s.snapshot.Leases[0].Started {
@@ -187,8 +188,9 @@ func TestControllerAssignmentStopsOnStarted(t *testing.T) {
 	e, s, job, _ := assignmentFixture(t, &status, false)
 	drainAssignment(t, e)
 	entered := make(chan struct{})
+	var once sync.Once
 	e.assignmentREST = &http.Client{Transport: controllerRESTTransport(func(r *http.Request) (*http.Response, error) {
-		close(entered)
+		once.Do(func() { close(entered) })
 		<-r.Context().Done()
 		return nil, r.Context().Err()
 	})}
@@ -202,7 +204,7 @@ func TestControllerAssignmentStopsOnStarted(t *testing.T) {
 		t.Fatal("worker did not start")
 	}
 	lease := s.snapshot.Leases[0]
-	if err := e.Handle(context.Background(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: lease.RunnerName, RunnerID: 42}}}); err != nil {
+	if err := e.Handle(t.Context(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: lease.RunnerName, RunnerID: 42}}}); err != nil {
 		t.Fatal(err)
 	}
 	drainAssignment(t, e)

@@ -40,7 +40,6 @@ type cacheServiceConfig struct {
 	PrivateKeyFile   string   `json:"private_key_file"`
 	SigningKeyFile   string   `json:"signing_key_file"`
 	CacheDataCAFile  string   `json:"cache_data_ca_file"`
-	GitHubTokenFile  string   `json:"github_token_file"`
 	CentralURL       string   `json:"central_url"`
 	CentralTokenFile string   `json:"central_token_file"`
 	ArchiveBytes     int64    `json:"archive_bytes"`
@@ -48,7 +47,7 @@ type cacheServiceConfig struct {
 
 func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	var c cacheServiceConfig
-	fields := []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "github_token_file", "central_url", "central_token_file", "archive_bytes"}
+	fields := []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "central_url", "central_token_file", "archive_bytes"}
 	var object map[string]json.RawMessage
 	if json.Unmarshal(data, &object) != nil {
 		return c, grant.ErrInvalid
@@ -59,7 +58,7 @@ func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	if readCacheObject(data, fields) != nil || json.Unmarshal(data, &c) != nil {
 		return c, grant.ErrInvalid
 	}
-	for _, p := range []string{c.CertificateFile, c.PrivateKeyFile, c.SigningKeyFile, c.CacheDataCAFile, c.GitHubTokenFile, c.CentralTokenFile} {
+	for _, p := range []string{c.CertificateFile, c.PrivateKeyFile, c.SigningKeyFile, c.CacheDataCAFile, c.CentralTokenFile} {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
 			return c, grant.ErrInvalid
 		}
@@ -157,7 +156,6 @@ func ensureCacheServiceKey(path string) (ed25519.PrivateKey, error) {
 type cacheService struct {
 	config   cacheServiceConfig
 	central  cacheCentral
-	github   *http.Client
 	template cacheHost
 	ctx      context.Context
 	mu       sync.Mutex
@@ -251,7 +249,7 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return binding, ""
 		}
-		host.authority = &cacheServiceAuthority{github: githubCacheJobAuthority{client: s.github, assignments: cacheNoAssignments{}, regionID: s.config.RegionID, interval: time.Second, now: time.Now}, central: s.central, address: address, lease: lease}
+		host.authority = &cacheServiceAuthority{regionID: s.config.RegionID, central: s.central, address: address, lease: lease}
 		s.sessions[address.String()] = host
 	}
 	s.mu.Unlock()
@@ -264,7 +262,7 @@ func (s *cacheService) validLease(l cacheServiceLease, address netip.Addr, tenan
 	ip, err := netip.ParseAddr(l.MeshAddress)
 	j := l.Job
 	b := cacheGuestBinding{service: true, TenantID: l.TenantID, VMID: l.VMID, RunnerID: l.RunnerID, RunnerName: l.RunnerName, Repository: l.Repository, ExpiresAt: l.Deadline}
-	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.RunAttempt >= 0 && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
+	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.Verified && j.RunAttempt > 0 && l.RepositoryID > 0 && l.DefaultBranch != "" && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
 }
 func runCacheService(path string) error {
 	data, err := readProtectedCacheFile(path, true)
@@ -312,13 +310,9 @@ func runCacheService(path string) error {
 	if value := strings.TrimSpace(string(token)); len(token) <= 4096 && value != "" && !strings.ContainsAny(value, " \t\r\n") {
 		rotating.current.Store(&cacheCentralWithBuckets{cacheCentralHTTPS{origin: c.CentralURL, token: value, client: centralClient}})
 	}
-	github, err := newCacheRepositoryClient(c.GitHubTokenFile)
-	if err != nil {
-		return err
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := &cacheService{config: c, ctx: ctx, central: rotating, github: github, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	service := &cacheService{config: c, ctx: ctx, central: rotating, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
 	listener, err := net.Listen("tcp6", c.Listen)
 	if err != nil {
 		return err

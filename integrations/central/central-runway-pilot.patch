@@ -17,7 +17,7 @@ new file mode 100644
 index 0000000..8c21f7b
 --- /dev/null
 +++ b/central/api/runway.py
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,63 @@
 +import frappe
 +
 +from central.infrastructure import runway
@@ -58,11 +58,18 @@ index 0000000..8c21f7b
 +	job_display_name: str = "",
 +	job_workflow_ref: str = "",
 +	event_name: str = "",
++	ref: str = "",
++	sha: str = "",
++	repository_id: int = 0,
++	default_branch: str = "",
++	verified: bool = False,
++	verify_reason: str = "",
 +) -> dict:
 +	return runway.update_lease(
 +		pool, owner_id, fence, lease_id, event, runner_id, job_id, workflow_run_id,
 +		result, error, request_id, repository, request_labels,
 +		run_attempt, job_display_name, job_workflow_ref, event_name,
++		ref, sha, repository_id, default_branch, verified, verify_reason,
 +	)
 +
 +
@@ -220,7 +227,7 @@ new file mode 100644
 index 0000000..42dfe5f
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,311 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Lease",
@@ -259,6 +266,12 @@ index 0000000..42dfe5f
 +  "job_display_name",
 +  "job_workflow_ref",
 +  "event_name",
++  "ref",
++  "sha",
++  "repository_id",
++  "default_branch",
++  "verified",
++  "verify_reason",
 +  "started"
 + ],
 + "fields": [
@@ -454,6 +467,42 @@ index 0000000..42dfe5f
 +   "fieldname": "job_workflow_ref",
 +   "label": "Job Workflow Ref",
 +   "fieldtype": "Small Text",
++   "read_only": 1
++  },
++  {
++   "fieldname": "ref",
++   "fieldtype": "Small Text",
++   "label": "Ref",
++   "read_only": 1
++  },
++  {
++   "fieldname": "sha",
++   "fieldtype": "Data",
++   "label": "Sha",
++   "read_only": 1
++  },
++  {
++   "fieldname": "repository_id",
++   "fieldtype": "Data",
++   "label": "Repository Id",
++   "read_only": 1
++  },
++  {
++   "fieldname": "default_branch",
++   "fieldtype": "Small Text",
++   "label": "Default Branch",
++   "read_only": 1
++  },
++  {
++   "fieldname": "verified",
++   "fieldtype": "Check",
++   "label": "Verified",
++   "read_only": 1
++  },
++  {
++   "fieldname": "verify_reason",
++   "fieldtype": "Data",
++   "label": "Verify Reason",
 +   "read_only": 1
 +  },
 +  {
@@ -830,7 +879,7 @@ new file mode 100644
 index 0000000..3273173
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,326 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -912,6 +961,12 @@ index 0000000..3273173
 +		"job_display_name",
 +		"job_workflow_ref",
 +		"event_name",
++		"ref",
++		"sha",
++		"repository_id",
++		"default_branch",
++		"verified",
++		"verify_reason",
 +		"vm_id",
 +		"vm_state",
 +		"mesh_address",
@@ -927,6 +982,8 @@ index 0000000..3273173
 +		"id": lease.name,
 +		**result,
 +		"request_id": int(lease.request_id or 0),
++		"repository_id": int(lease.get("repository_id") or 0),
++		"verified": bool(lease.get("verified")),
 +		"started": bool(lease.started),
 +		"deadline": iso_utc(lease.deadline),
 +	}
@@ -1059,6 +1116,12 @@ index 0000000..3273173
 +	job_display_name: str = "",
 +	job_workflow_ref: str = "",
 +	event_name: str = "",
++	ref: str = "",
++	sha: str = "",
++	repository_id: int = 0,
++	default_branch: str = "",
++	verified: bool = False,
++	verify_reason: str = "",
 +) -> dict:
 +	_pool, lease = fenced_lease(pool, owner_id, fence, lease_id)
 +	# Missing evidence leaves earlier observations intact, including direct dispatch
@@ -1075,13 +1138,24 @@ index 0000000..3273173
 +		("job_display_name", job_display_name),
 +		("job_workflow_ref", job_workflow_ref),
 +		("event_name", event_name),
++		("ref", ref),
++		("sha", sha),
++		("repository_id", repository_id),
++		("default_branch", default_branch),
 +		("repository", repository),
 +		("request_labels", request_labels),
 +	)
 +	for field, value in identities:
 +		if value and lease.get(field) and str(lease.get(field)) != str(value):
 +			frappe.throw(_("Runner job identity changed within a lease."))
-+	if event == "acquire_requested":
++	if lease.get("verified") and (not verified and event == "verified" or verify_reason):
++		frappe.throw(_("Verified job evidence is immutable."))
++	if event == "verified":
++		if lease.phase in ("deleting", "deleted"):
++			frappe.throw(_("A retiring runner cannot verify work."))
++		lease.verified = int(bool(verified))
++		lease.verify_reason = str(verify_reason)[:140]
++	elif event == "acquire_requested":
 +		if not request_id:
 +			frappe.throw(_("Job acquisition identity must remain a positive request ID."))
 +		if lease.phase in ("deleting", "deleted"):
@@ -1366,7 +1440,7 @@ new file mode 100644
 index 0000000..550d62d
 --- /dev/null
 +++ b/central/runway.py
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,278 @@
 +"""Narrow regional cache authority. This credential is never a Central API key."""
 +
 +import secrets
@@ -1473,6 +1547,9 @@ index 0000000..550d62d
 +			"workflow_ref": lease.job_workflow_ref or "",
 +			"event_name": lease.event_name or "",
 +			"started": bool(lease.started),
++			"ref": lease.get("ref") or "",
++			"sha": lease.get("sha") or "",
++			"verified": bool(lease.get("verified")),
 +		}
 +	respond(
 +		{
@@ -1482,6 +1559,8 @@ index 0000000..550d62d
 +			"region": region,
 +			"repository": lease.repository
 +			or pool.repository_url.removeprefix("https://github.com/").rstrip("/"),
++			"repository_id": int(lease.get("repository_id") or 0),
++			"default_branch": lease.get("default_branch") or "",
 +			"vm_id": lease.vm_id,
 +			"mesh_address": address,
 +			"runner_id": int(lease.runner_id or 0),
@@ -1674,7 +1753,7 @@ new file mode 100644
 index 0000000..b12dfb6
 --- /dev/null
 +++ b/central/tests/test_runway.py
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,463 @@
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
 +from types import SimpleNamespace
@@ -1777,6 +1856,25 @@ index 0000000..b12dfb6
 +		self.assertEqual(document.phase, "deleting")
 +		for field, value in evidence.items():
 +			self.assertEqual(document.get(field), value)
++
++	def test_controller_verified_fields_are_immutable(self):
++		from central.api.runway import update_lease
++
++		lease = self.reserve()
++		frappe.db.set_value("Runner Lease", lease["id"], "phase", "running")
++		evidence = {
++			"job_id": str(uuid4()), "workflow_run_id": "4242", "run_attempt": "1",
++			"event_name": "push", "ref": "refs/heads/main", "sha": "abc123",
++			"job_workflow_ref": "example/ci/.github/workflows/ci.yml@refs/heads/main",
++			"repository_id": 123, "default_branch": "main", "verified": True,
++		}
++		result = update_lease(self.pool.name, self.owner, self.fence, lease["id"], "verified", **evidence)
++		self.assertTrue(result["verified"])
++		self.assertEqual(result["repository_id"], 123)
++		self.assertEqual(result["ref"], "refs/heads/main")
++		for field, value in {"ref": "refs/heads/other", "sha": "other", "run_attempt": "2", "event_name": "pull_request", "repository_id": 456, "default_branch": "other", "verified": False}.items():
++			with self.assertRaises(frappe.ValidationError):
++				update_lease(self.pool.name, self.owner, self.fence, lease["id"], "verified", **{**evidence, field: value})
 +
 +	def test_conflicting_job_evidence_is_refused_before_writing(self):
 +		lease = self.reserve()
@@ -2124,7 +2222,7 @@ new file mode 100644
 index 0000000..2825f76
 --- /dev/null
 +++ b/central/tests/test_runway_cache.py
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,316 @@
 +import json
 +from concurrent.futures import ThreadPoolExecutor
 +from threading import Barrier
@@ -2182,6 +2280,8 @@ index 0000000..2825f76
 +				"tenant_id",
 +				"region",
 +				"repository",
++				"repository_id",
++				"default_branch",
 +				"vm_id",
 +				"mesh_address",
 +				"runner_id",
@@ -2201,6 +2301,9 @@ index 0000000..2825f76
 +				"workflow_ref": "example/ci/.github/workflows/x.yml@refs/heads/main",
 +				"event_name": "push",
 +				"started": False,
++				"verified": False,
++				"ref": "",
++				"sha": "",
 +			},
 +		)
 +		from frappe.utils.response import build_response
@@ -2454,7 +2557,7 @@ new file mode 100644
 index 0000000..23765fc
 --- /dev/null
 +++ b/spec/RUNWAY.md
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,77 @@
 +# Runway internal runner pilot
 +
 +## Purpose
@@ -2526,7 +2629,9 @@ index 0000000..23765fc
 +Lease keys: lease, team, tenant_id, region, repository, vm_id, mesh_address,
 +runner_id, runner_name, job, deadline. Job is null before assignment/start;
 +otherwise keys are job_id, request_id, run_id, run_attempt, display_name,
-+workflow_ref, event_name, started. Attempt zero is unknown, never inferred.
++workflow_ref, event_name, started, ref, sha, verified. Attempt zero is unverified.
++The lease also includes repository_id and default_branch, verified by the controller.
++Only verified jobs may receive grants; the service holds no GitHub credential.
 +Bucket keys: team, tenant_id, bucket, endpoint, region, access_key, secret_key.
 +Reads are region-scoped; 404 means no result, 409 means ambiguous lease.
 +Errors have exactly `error` (`not_found` or `ambiguous`).

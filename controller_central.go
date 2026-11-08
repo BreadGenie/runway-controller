@@ -37,6 +37,12 @@ type pilotPool struct {
 }
 
 type pilotLease struct {
+	Ref            string    `json:"ref,omitempty"`
+	SHA            string    `json:"sha,omitempty"`
+	RepositoryID   int64     `json:"repository_id,omitempty"`
+	DefaultBranch  string    `json:"default_branch,omitempty"`
+	Verified       bool      `json:"verified,omitempty"`
+	VerifyReason   string    `json:"verify_reason,omitempty"`
 	RunAttempt     string    `json:"run_attempt,omitempty"`
 	JobDisplayName string    `json:"job_display_name,omitempty"`
 	JobWorkflowRef string    `json:"job_workflow_ref,omitempty"`
@@ -67,6 +73,12 @@ type pilotSnapshot struct {
 }
 
 type leaseEvent struct {
+	Ref            string `json:"ref,omitempty"`
+	SHA            string `json:"sha,omitempty"`
+	RepositoryID   int64  `json:"repository_id,omitempty"`
+	DefaultBranch  string `json:"default_branch,omitempty"`
+	Verified       bool   `json:"verified,omitempty"`
+	VerifyReason   string `json:"verify_reason,omitempty"`
 	RunAttempt     string `json:"run_attempt,omitempty"`
 	JobDisplayName string `json:"job_display_name,omitempty"`
 	JobWorkflowRef string `json:"job_workflow_ref,omitempty"`
@@ -255,7 +267,7 @@ func (c *centralRPC) Reserve(ctx context.Context, id string) (pilotLease, error)
 }
 func (c *centralRPC) Update(ctx context.Context, id, event string, fields leaseEvent) (pilotLease, error) {
 	var result pilotLease
-	values := map[string]any{"run_attempt": fields.RunAttempt, "job_display_name": fields.JobDisplayName, "job_workflow_ref": fields.JobWorkflowRef, "event_name": fields.EventName, "lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": fields.RequestLabels}
+	values := map[string]any{"ref": fields.Ref, "sha": fields.SHA, "repository_id": fields.RepositoryID, "default_branch": fields.DefaultBranch, "verified": fields.Verified, "verify_reason": fields.VerifyReason, "run_attempt": fields.RunAttempt, "job_display_name": fields.JobDisplayName, "job_workflow_ref": fields.JobWorkflowRef, "event_name": fields.EventName, "lease_id": id, "event": event, "runner_id": fields.RunnerID, "job_id": fields.JobID, "workflow_run_id": fields.WorkflowRunID, "request_id": fields.RequestID, "result": fields.Result, "error": fields.Error, "repository": fields.Repository, "request_labels": fields.RequestLabels}
 	err := c.call(ctx, "update_lease", values, &result)
 	return result, err
 }

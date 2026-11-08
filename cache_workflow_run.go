@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/BreadGenie/runway/cache/grant"
 )
@@ -45,4 +46,24 @@ func validateCacheWorkflowRun(data []byte, repositoryID, runID int64, frozen gra
 		return errCacheRepository
 	}
 	return nil
+}
+
+// cacheWorkflowContext derives context from REST, then applies the same run
+// validation used by standalone guests. The workflow ref disambiguates tags.
+func cacheWorkflowContext(data []byte, repositoryID, runID int64, workflowRef string) (grant.SetupContext, error) {
+	var run struct {
+		RunAttempt int64  `json:"run_attempt"`
+		Event      string `json:"event"`
+		HeadBranch string `json:"head_branch"`
+		HeadSHA    string `json:"head_sha"`
+	}
+	if json.Unmarshal(data, &run) != nil {
+		return grant.SetupContext{}, errCacheRepository
+	}
+	id, attempt, ref := strconv.FormatInt(runID, 10), strconv.FormatInt(run.RunAttempt, 10), "refs/heads/"+run.HeadBranch
+	c := grant.SetupContext{RunID: &id, RunAttempt: &attempt, EventName: &run.Event, Ref: &ref, SHA: &run.HeadSHA}
+	if !strings.HasSuffix(workflowRef, "@"+ref) {
+		return c, errCacheJobMismatch
+	}
+	return c, validateCacheWorkflowRun(data, repositoryID, runID, c)
 }
