@@ -1,6 +1,7 @@
 """Exercise the actual lease contract shipped in the Central integration patch."""
 
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -24,6 +25,15 @@ class CentralContractTests(unittest.TestCase):
     def update(self, lease, event='started', **fields):
         return contract.update(lease, {'pool': 'pool', 'owner_id': 'owner', 'fence': 1,
                                       'lease_id': lease['id'], 'event': event, **fields})
+
+    def test_runner_identity_storage_accepts_github_ids_above_signed_int32(self):
+        schema = json.loads(contract.added_file(
+            'central/infrastructure/doctype/runner_lease/runner_lease.json'))
+        field = next(field for field in schema['fields'] if field['fieldname'] == 'runner_id')
+        self.assertTrue(field['fieldtype'] == 'Long Int' or
+                        field['fieldtype'] == 'Int' and field.get('length', 0) > 11)
+        result = self.update(self.lease(runner_id=2**31 + 1), runner_id=2**31 + 1)
+        self.assertEqual(result['runner_id'], 2**31 + 1)
 
     def test_identity_cannot_be_replaced_through_the_route(self):
         for field, value in {'runner_id': 99, 'job_id': 'another-job', 'workflow_run_id': '999',

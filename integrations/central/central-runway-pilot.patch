@@ -241,7 +241,7 @@ new file mode 100644
 index 0000000..42dfe5f
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_lease/runner_lease.json
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,312 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Lease",
@@ -348,6 +348,7 @@ index 0000000..42dfe5f
 +   "fieldname": "runner_id",
 +   "label": "Runner Id",
 +   "fieldtype": "Int",
++   "length": 20,
 +   "read_only": 1
 +  },
 +  {
