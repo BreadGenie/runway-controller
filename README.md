@@ -13,7 +13,7 @@ The proposed product lets a team connect GitHub in Frappe Cloud and change `runs
 - Guest preparation and execution scripts, a Docker service-container smoke workflow, and a Docker-capable kernel recipe.
 - Small VM lifecycle tooling and documentation of the tested infrastructure boundaries.
 
-The pilot supports one concurrent runner per pool and a single-host administrative guest transport. It has no customer dashboard, billing integration, shared cache, or validated isolation for untrusted jobs. This repository does not install a working Frappe Cloud region by itself.
+The pilot supports one concurrent runner per pool and a single-host administrative guest transport. It has no customer dashboard, billing integration, or validated isolation for untrusted jobs. A regional Actions cache runs only on the standalone guest path (see [regional cache](specs/runway-regional-cache.md)); the controller pilot still uses GitHub's cache. This repository does not install a working Frappe Cloud region by itself.
 
 ## Build
 
@@ -39,6 +39,6 @@ See [development](docs/development.md) for the separate infrastructure and GitHu
 | [Development](docs/development.md) | Prerequisites and operator workflow |
 | [Roadmap](docs/roadmap.md) | Milestones and decisions for the Frappe team |
 
-The next milestone is a representative Frappe workflow and explicit network isolation, with broader failure drills for the internal pilot. Caching and larger-scale rollout follow compatibility and reliability measurements.
+The next milestone is a representative Frappe workflow and explicit network isolation, with broader failure drills for the internal pilot. The regional Actions cache is qualified on the standalone path; bringing it to the controller pilot and larger-scale rollout follow compatibility and reliability measurements.
 
 See [LICENSE](LICENSE) and [NOTICE](NOTICE.md) for licensing and attribution.
