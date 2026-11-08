@@ -9,13 +9,13 @@ class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.sha = "a" * 40
         self.pins = [{"repo": r, "version": v, "commit": "b" * 40}
-                     for r, v in (("actions/cache", "v4.3.0"), ("actions/setup-node", "v6.5.0"))]
+                     for r, v in (("actions/cache", "v4.3.0"), ("actions/setup-node", "v6.5.0"), ("astral-sh/setup-uv", "v6.8.0"))]
 
     def test_major_targets_only_and_new_major(self):
         tags = [{"name": n, "commit": {"sha": self.sha}} for n in ("v3", "v8", "v8.1.0")]
         tags.append({"name": "v9.0.0", "commit": {"sha": "c" * 40}})
         found = bot.candidates(self.pins, lambda url: json.dumps(tags).encode())
-        self.assertEqual(found, [(r, "v8.1.0", self.sha) for r in ("actions/cache", "actions/setup-node")])
+        self.assertEqual(found, [(r, "v8.1.0", self.sha) for r in ("actions/cache", "actions/setup-node", "astral-sh/setup-uv")])
 
     def test_pinned_target_is_noop(self):
         tags = [{"name": "v6", "commit": {"sha": "b" * 40}}]
@@ -65,3 +65,16 @@ class UpdateTests(unittest.TestCase):
         entries = bot.resolve(("actions/cache", "v8.0.0", self.sha), get)
         self.assertEqual(len(entries), 4)
         self.assertFalse(any(e["harness_only"] for e in entries))
+
+    def test_setup_uv_manifests_and_provision(self):
+        for version, ext in (("v6.8.0", "js"), ("v7.6.0", "cjs")):
+            manifest = f'runs:\n  main: "dist/setup/index.{ext}"\n  post: "dist/save-cache/index.{ext}"\n'.encode()
+            get = lambda url: manifest if url.endswith("action.yml") else b"uv bundle"
+            entries = bot.resolve(("astral-sh/setup-uv", version, self.sha), get)
+            self.assertEqual(len(entries), 3)
+            with tempfile.TemporaryDirectory() as directory:
+                bot.provision(entries, Path(directory), get)
+                self.assertTrue((Path(directory) / ("setup-uv-" + self.sha[:8]) / ("save-cache-index." + ext)).exists())
+            with self.assertRaises(ValueError):
+                bot.resolve(("astral-sh/setup-uv", version, self.sha),
+                            lambda url: b"  main: dist/unknown/index.js\n" if url.endswith("action.yml") else b"bundle")

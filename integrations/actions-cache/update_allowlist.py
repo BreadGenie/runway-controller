@@ -34,7 +34,7 @@ def tags(repo, get):
 
 def candidates(entries, get=fetch):
     result = []
-    for repo in ("actions/cache", "actions/setup-node"):
+    for repo in ("actions/cache", "actions/setup-node", "astral-sh/setup-uv"):
         pins = [e for e in entries if e["repo"] == repo]
         oldest = min(int(e["version"].split(".")[0][1:]) for e in pins)
         all_tags = tags(repo, get)
@@ -65,7 +65,7 @@ def manifest_paths(data, prefix=""):
         match = re.fullmatch(r"\s+(main|post):\s*['\"]?([A-Za-z0-9_./-]+)['\"]?\s*", line)
         if match:
             path = posixpath.normpath(prefix + match[2])
-            if not re.fullmatch(r"dist/[a-z-]+/index\.js", path):
+            if not re.fullmatch(r"dist/[a-z-]+/index\.(?:cjs|js)", path):
                 raise ValueError("unsupported entrypoint: " + path)
             paths.append(path)
     if not paths or len(paths) != len(set(paths)):
@@ -86,6 +86,9 @@ def resolve(item, get=fetch):
         paths.append("action.yml")
     expected = ({"dist/restore/index.js", "dist/save/index.js", "dist/restore-only/index.js", "dist/save-only/index.js"}
                 if repo == "actions/cache" else {"dist/setup/index.js", "dist/cache-save/index.js", "action.yml"})
+    if repo == "astral-sh/setup-uv":
+        extension = "cjs" if int(version.split(".")[0][1:]) >= 7 else "js"
+        expected = {f"dist/setup/index.{extension}", f"dist/save-cache/index.{extension}", "action.yml"}
     if set(paths) != expected or len(paths) != len(expected):
         raise ValueError("entrypoints require harness support: " + repr(paths))
     return [dict(repo=repo, version=version, commit=commit, path=p,
@@ -95,8 +98,8 @@ def resolve(item, get=fetch):
 
 def provision(entries, directory, get=fetch):
     for e in entries:
-        prefix = "actions-cache" if e["repo"] == "actions/cache" else "setup-node"
-        name = "action.yml" if e["harness_only"] else e["path"].split("/")[1] + "-index.js"
+        prefix = "actions-cache" if e["repo"] == "actions/cache" else e["repo"].split("/")[1]
+        name = "action.yml" if e["harness_only"] else e["path"].split("/")[1] + "-" + e["path"].split("/")[-1]
         path = directory / (prefix + "-" + e["commit"][:8]) / name
         if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == e["sha256"]:
             continue

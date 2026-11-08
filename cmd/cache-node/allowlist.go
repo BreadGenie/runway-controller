@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"regexp"
-	"strings"
 )
 
 //go:embed allowlist.json
@@ -73,9 +72,10 @@ func loadAllowlist(data []byte) map[string]map[string]bool {
 	version := regexp.MustCompile("^v[1-9][0-9]*\\.[0-9]+\\.[0-9]+$")
 	paths := map[string]map[string]bool{
 		"actions/cache":      {"dist/restore/index.js": true, "dist/save/index.js": true, "dist/restore-only/index.js": true, "dist/save-only/index.js": true},
+		"astral-sh/setup-uv": {"dist/setup/index.js": true, "dist/save-cache/index.js": true, "dist/setup/index.cjs": true, "dist/save-cache/index.cjs": true, "action.yml": true},
 		"actions/setup-node": {"dist/setup/index.js": true, "dist/cache-save/index.js": true, "action.yml": true},
 	}
-	result := map[string]map[string]bool{"cache": {}, "setup-node": {}}
+	result := map[string]map[string]bool{"actions/cache": {}, "actions/setup-node": {}, "astral-sh/setup-uv": {}}
 	seen := map[string]bool{}
 	for _, e := range entries {
 		key := e.Repo + "/" + e.Commit + "/" + e.Path
@@ -84,7 +84,7 @@ func loadAllowlist(data []byte) map[string]map[string]bool {
 		}
 		seen[key] = true
 		if !e.HarnessOnly {
-			result[strings.TrimPrefix(e.Repo, "actions/")][e.SHA256] = true
+			result[e.Repo][e.SHA256] = true
 		}
 	}
 	return result

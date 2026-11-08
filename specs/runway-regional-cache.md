@@ -4,6 +4,11 @@ Standalone deployment on blr-1 supports actions/cache v4.3.0 (`0057852bfaa89a567
 v5.1.0 (`caa296126883cff596d87d8935842f9db880ef25`), v6.1.0 (`55cc8345863c7cc4c66a329aec7e433d2d1c52a9`),
 and actions/setup-node v6.5.0 (`249970729cb0ef3589644e2896645e5dc5ba9c38`),
 v7.1.0 (`949feb2413d6458794dcd2491c4babbbce0c15c1`), using cache protocol v1.
+The source allowlist additionally supports astral-sh/setup-uv v6.8.0
+(`d0cc045d04ccac9d8b7881df0226f9e82c39688e`) and v7.6.0
+(`37802adc94f370d6bfd71619e3f0bf239e1f3b78`); deployment requires the normal
+wrapper/allowlist rollout. setup-uv's setup and post/save bundles use v1 REST
+when ACTIONS_CACHE_SERVICE_V2 is unset; their optional v2 Twirp paths are not used.
 Other traffic keeps its route.
 Only same-repository branch pushes and workflow_dispatch qualify; PRs, forks,
 tags, container jobs and unsupported revisions retain GitHub caching.
@@ -74,8 +79,9 @@ Rollback requires restoring both the launcher and runway `.previous` binaries.
 
 
 The routing source of truth is `cmd/cache-node/allowlist.json`: repository,
-release, full commit, entrypoint and SHA256. setup-node's action.yml is
-harness-only. cache-node embeds the file; invalid data disables all regional
+release, full commit, entrypoint and SHA256. setup-node and setup-uv action.yml files are
+harness-only. Repository identities use full owner/name in candidate detection,
+the strict loader and fallback notices. cache-node embeds the file; invalid data disables all regional
 routing without preventing Node execution. Non-candidates still perform no file I/O.
 
 The daily and manually dispatched `Cache allowlist` workflow tracks every major

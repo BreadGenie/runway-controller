@@ -15,6 +15,8 @@ import contextlib
 from pathlib import Path
 import shutil
 import socket
+import subprocess
+import platform
 import tempfile
 import threading
 
@@ -98,11 +100,11 @@ tls.connect = function() {
                 bundles = cache.fetch_bundles(version)
                 if args.node_wrapper:
                     # Runner-shaped paths are part of the wrapper allowlist gate.
-                    action_root = root / "_actions" / "actions" / kind / version["commit"]
+                    action_root = root / "_actions" / ("astral-sh" if kind == "setup-uv" else "actions") / kind / version["commit"]
                     action_root.mkdir(parents=True)
                     copies = {}
                     for bundle, source in bundles.items():
-                        target = action_root / bundle / "index.js"
+                        target = action_root / bundle / ("index.cjs" if source.endswith(".cjs") else "index.js")
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(source, target)
                         copies[bundle] = str(target)
@@ -121,6 +123,29 @@ tls.connect = function() {
                     content.mkdir()
                     inputs = {"path": str(content), "key": "relay-cache-key", "upload-chunk-size": "524288"}
                     restore, save = ("restore", "save") if mode == "main-post" else ("restore-only", "save-only")
+                elif kind == "setup-uv":
+                    # Preseed the tool cache with a real local uv binary; no downloads.
+                    uv = shutil.which("uv")
+                    require(bool(uv), "uv prerequisite missing")
+                    uv_version = subprocess.check_output([uv, "--version"], text=True).split()[1]
+                    tool = workspace.parent / "sidecar" / "runner_tools" / "uv" / uv_version / platform.machine()
+                    tool.mkdir(parents=True)
+                    shutil.copyfile(uv, tool / "uv")
+                    (tool / "uv").chmod(0o755)
+                    tool.with_suffix(".complete").touch()
+                    content = workspace / "uv-cache"
+                    content.mkdir()
+                    (workspace / "uv.lock").write_text("version = 1\n")
+                    inputs = {"version": uv_version, "enable-cache": "true",
+                              "cache-local-path": str(content), "prune-cache": "false",
+                              "cache-dependency-glob": "uv.lock", "working-directory": str(workspace),
+                              "restore-cache": "true", "save-cache": "true",
+                              "add-problem-matchers": "false", "cache-python": "false",
+                              "activate-environment": "false", "ignore-nothing-to-cache": "false",
+                              "ignore-empty-workdir": "false"}
+                    extra.update({"UV_NO_MODIFY_PATH": "1", "UV_CACHE_DIR": str(content),
+                                  "PATH": str(tool) + os.pathsep + os.environ["PATH"]})
+                    restore, save = "setup", "save-cache"
                 else:
                     (workspace / "package.json").write_text('{"name":"relay-fixture","private":true}')
                     (workspace / "yarn.lock").write_text('# yarn lockfile v1\n')
@@ -130,15 +155,17 @@ tls.connect = function() {
                     inputs = {"cache": "yarn"}
                     restore, save = "setup", "cache-save"
                 (content / "archive.bin").write_bytes(os.urandom(2 * 1024 * 1024))
-                expected = cache.file_tree_hashes(str(content))
                 rc, output, outputs, state = client.run_action(restore, inputs, "github-secret", str(workspace), extra_env=extra, timeout=30)
-                require(rc == 0 and outputs.get("cache-hit") != "true" and (state.get("CACHE_KEY") or mode == "only"), kind + " miss failed: " + output)
+                require(rc == 0 and outputs.get("cache-hit") != "true" and (state.get("CACHE_KEY") or state.get("cache-key") or mode == "only"), kind + " miss failed: " + output)
                 if args.fallback_url:
                     print(label + ": stopped service fell back; pinned action exited successfully", flush=True)
                     continue
+                expected = cache.file_tree_hashes(str(content))
                 post = dict(extra, **{"STATE_" + key: value for key, value in state.items()})
                 rc, output, _, _ = client.run_action(save, inputs, "github-secret", str(workspace), extra_env=post, timeout=30)
-                require(rc == 0 and "Cache saved with" in output, kind + " save failed: " + output)
+                saved = (("uv cache saved with key:" in output or "cache saved with the key:" in output)
+                         if kind == "setup-uv" else "Cache saved with" in output)
+                require(rc == 0 and saved, kind + " save failed: " + output)
                 shutil.rmtree(content)
                 content.mkdir()
                 rc, output, outputs, _ = client.run_action(restore, inputs, "github-secret", str(workspace), extra_env=extra, timeout=30)

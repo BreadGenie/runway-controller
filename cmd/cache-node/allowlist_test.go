@@ -17,6 +17,8 @@ func TestAllowlistFailsClosed(t *testing.T) {
 		[]byte("null"), bytes.Replace(allowlistData, []byte(`"harness_only": false`), []byte(`"harness_only": null`), 1),
 		bytes.Replace(allowlistData, []byte(`"repo":`), []byte(`"Repo":`), 1), []byte("[]"), []byte("{"), append(append([]byte{}, allowlistData...), []byte("{}")...),
 		bytes.Replace(allowlistData, []byte("actions/cache"), []byte("actions/unknown"), 1),
+		bytes.Replace(allowlistData, []byte("astral-sh/setup-uv"), []byte("actions/setup-uv"), 1),
+		bytes.Replace(allowlistData, []byte("dist/save-cache/index.cjs"), []byte("dist/unknown/index.cjs"), 1),
 		bytes.Replace(allowlistData, []byte(`"repo":`), []byte(`"extra": 1, "repo":`), 1),
 		bytes.Replace(allowlistData, []byte(`"repo":`), []byte(`"repo": "actions/cache", "repo":`), 1),
 	} {
@@ -25,7 +27,7 @@ func TestAllowlistFailsClosed(t *testing.T) {
 		}
 	}
 	got := loadAllowlist(allowlistData)
-	if len(got["cache"]) != 12 || len(got["setup-node"]) != 4 {
+	if len(got["actions/cache"]) != 12 || len(got["actions/setup-node"]) != 4 || len(got["astral-sh/setup-uv"]) != 4 {
 		t.Fatalf("lost original pins: %v", got)
 	}
 }
