@@ -319,3 +319,46 @@ Central provisioning, Atlas deployment and the guest TLS relay remain separate
 issues; no live regional deployment is qualified here.
 
 Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Central, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.
+
+## Service release and installation
+
+Build a tagged, clean commit with `scripts/build-cache-service-release.sh /tmp/runway-cache.tar.gz`
+using the Go version in go.mod (GNU tar and gzip required). The script builds the
+current tree, including uncommitted changes for local testing; publish only a
+clean tagged tree. Upload the archive manually to a GitHub release, then pin its
+HTTPS URL and the printed SHA256 in Atlas. There is no separate release workflow.
+Identical source, Go toolchain and dependencies produce identical archive bytes.
+The archive contains only `runway-cache/bin/runway`, `setup.sh`, two `systemd/`
+units, `SOURCE_COMMIT`, and `SHA256SUMS` (hashes all other files).
+
+Atlas verifies the archive hash before extracting and invokes `runway-cache/setup.sh`
+without arguments. Setup requires root, Bash and standard coreutils, and makes no
+network requests. Inputs are `RUNWAY_CONFIG` (default
+`/etc/runway/cache-service.json`), `RUNWAY_STORAGE_CA_FILE` (default
+`/etc/runway/storage-ca.pem`), and required `RUNWAY_DOMAIN`. `RUNWAY_ROOT` prefixes
+filesystem operations for offline tests; it does not redirect systemctl, so tests
+must supply a fake systemctl on PATH. Exit 0 means installed/unchanged; nonzero
+means refused or failed (2 for invalid arguments). No configuration secrets are
+printed. Setup copies an alternate RUNWAY_CONFIG to the canonical config location used
+by the units.
+
+Setup installs `/usr/local/bin/runway`, units, private state directories and a
+private release environment file. Changed files retain `.previous` copies;
+unchanged setup does not restart units. The data unit's ExecStartPre runs
+`cache-service-init`: Runway generates its signing key on first startup, preserves
+it on upgrades, creates the local TLS identity covering the operator domain,
+`internal-<operator-domain>` and loopback IP, and derives `/etc/runway/cache-data.json`
+with public signing-key trust. State and spools remain under `/var/lib/runway-cache`.
+The managed backend starts before enrolment and reads the credential on each
+bucket lookup. Central and storage CA trust are separate; empty storage CA uses
+system roots. Partial TLS identity is refused. Back up keys and journal together.
+
+Atlas contract correction required: its current `audience: "runway-cache"` is
+not a valid Runway grant audience. It must supply an HTTPS loopback data origin,
+for example `https://127.0.0.1:18445`, distinct from the guest and operator ports.
+Setup deliberately refuses the current invalid value. Atlas also unconditionally
+restarts services after the package installer returns, even when its pinned hash
+skips setup; setup's idempotence does not suppress that Atlas restart. Atlas's
+hash shortcut also means changes to derived config inputs require rerunning setup
+(or changing the pin); the service initialization reads the latest canonical JSON
+on every data-service restart.
