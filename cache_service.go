@@ -25,29 +25,38 @@ import (
 )
 
 type cacheServiceConfig struct {
-	OperatorListen   string `json:"operator_listen"`
-	CentralIssuer    string `json:"central_issuer"`
-	CentralJWKSURL   string `json:"central_jwks_url"`
-	CentralRegionID  int    `json:"central_region_id"`
-	CentralCAFile    string `json:"central_ca_file"`
-	Version          int    `json:"version"`
-	RegionID         string `json:"region_id"`
-	MeshRegionID     uint16 `json:"mesh_region_id"`
-	Listen           string `json:"listen"`
-	Audience         string `json:"audience"`
-	CertificateFile  string `json:"certificate_file"`
-	PrivateKeyFile   string `json:"private_key_file"`
-	SigningKeyFile   string `json:"signing_key_file"`
-	CacheDataCAFile  string `json:"cache_data_ca_file"`
-	GitHubTokenFile  string `json:"github_token_file"`
-	CentralURL       string `json:"central_url"`
-	CentralTokenFile string `json:"central_token_file"`
-	ArchiveBytes     int64  `json:"archive_bytes"`
+	OperatorListen   string   `json:"operator_listen"`
+	OperatorPeers    []string `json:"operator_peers,omitempty"`
+	CentralIssuer    string   `json:"central_issuer"`
+	CentralJWKSURL   string   `json:"central_jwks_url"`
+	CentralRegionID  int      `json:"central_region_id"`
+	CentralCAFile    string   `json:"central_ca_file"`
+	Version          int      `json:"version"`
+	RegionID         string   `json:"region_id"`
+	MeshRegionID     uint16   `json:"mesh_region_id"`
+	Listen           string   `json:"listen"`
+	Audience         string   `json:"audience"`
+	CertificateFile  string   `json:"certificate_file"`
+	PrivateKeyFile   string   `json:"private_key_file"`
+	SigningKeyFile   string   `json:"signing_key_file"`
+	CacheDataCAFile  string   `json:"cache_data_ca_file"`
+	GitHubTokenFile  string   `json:"github_token_file"`
+	CentralURL       string   `json:"central_url"`
+	CentralTokenFile string   `json:"central_token_file"`
+	ArchiveBytes     int64    `json:"archive_bytes"`
 }
 
 func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	var c cacheServiceConfig
-	if readCacheObject(data, []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "github_token_file", "central_url", "central_token_file", "archive_bytes"}) != nil || json.Unmarshal(data, &c) != nil {
+	fields := []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "github_token_file", "central_url", "central_token_file", "archive_bytes"}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(data, &object) != nil {
+		return c, grant.ErrInvalid
+	}
+	if _, ok := object["operator_peers"]; ok {
+		fields = append(fields, "operator_peers")
+	}
+	if readCacheObject(data, fields) != nil || json.Unmarshal(data, &c) != nil {
 		return c, grant.ErrInvalid
 	}
 	for _, p := range []string{c.CertificateFile, c.PrivateKeyFile, c.SigningKeyFile, c.CacheDataCAFile, c.GitHubTokenFile, c.CentralTokenFile} {
@@ -56,7 +65,7 @@ func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 		}
 	}
 	operator, err := netip.ParseAddrPort(c.OperatorListen)
-	if err != nil || !operator.Addr().IsLoopback() || operator.Port() == 0 || c.CentralIssuer == "" || c.CentralRegionID < 0 || c.CentralRegionID > 65535 || c.CentralJWKSURL != strings.TrimSuffix(c.CentralURL, "/")+"/api/method/central.api.jwks.get_jwks" || (c.CentralCAFile != "" && (!filepath.IsAbs(c.CentralCAFile) || filepath.Clean(c.CentralCAFile) != c.CentralCAFile)) {
+	if err != nil || operator.Port() == 0 || c.CentralIssuer == "" || c.CentralRegionID < 0 || c.CentralRegionID > 65535 || c.CentralJWKSURL != strings.TrimSuffix(c.CentralURL, "/")+"/api/method/central.api.jwks.get_jwks" || (c.CentralCAFile != "" && (!filepath.IsAbs(c.CentralCAFile) || filepath.Clean(c.CentralCAFile) != c.CentralCAFile)) {
 		return c, grant.ErrInvalid
 	}
 	addr, err := netip.ParseAddrPort(c.Listen)
@@ -67,6 +76,15 @@ func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	raw := ip.As16()
 	if !ip.Is6() || ip.Is4In6() || ip.Zone() != "" || raw[0] != 0xfd || raw[1] != 0xaa || binary.BigEndian.Uint16(raw[2:4]) != c.MeshRegionID {
 		return c, grant.ErrInvalid
+	}
+	if operator.Addr() != ip || operator.Port() == addr.Port() || !cacheOperatorMeshAddress(ip, c.MeshRegionID) {
+		return c, grant.ErrInvalid
+	}
+	for _, peer := range c.OperatorPeers {
+		ip, err := netip.ParseAddr(peer)
+		if err != nil || !cacheOperatorMeshAddress(ip, c.MeshRegionID) {
+			return c, grant.ErrInvalid
+		}
 	}
 	if _, err = grant.NewVerifier(map[string]ed25519.PublicKey{grant.KeyID(make([]byte, 32)): make([]byte, 32)}, c.Audience, c.RegionID); err != nil {
 		return c, err

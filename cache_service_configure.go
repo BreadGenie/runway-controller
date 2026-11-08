@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -129,9 +130,35 @@ func (h *cacheConfigure) authenticate(r *http.Request) bool {
 	exp, e2 := claims.GetExpirationTime()
 	return e1 == nil && e2 == nil && iat != nil && exp != nil && exp.After(iat.Time) && exp.Sub(iat.Time) <= 5*time.Minute && time.Since(iat.Time) <= 5*time.Minute+30*time.Second
 }
+
+// The transport peer is authoritative; forwarded headers cannot grant access.
+func cacheOperatorMeshAddress(ip netip.Addr, region uint16) bool {
+	if !ip.Is6() || ip.Is4In6() || ip.Zone() != "" {
+		return false
+	}
+	b := ip.As16()
+	return b[0] == 0xfd && b[1] == 0xaa && binary.BigEndian.Uint16(b[2:4]) == region && binary.BigEndian.Uint32(b[4:8]) == 0
+}
+
+func (h *cacheConfigure) allowedPeer(peer string) bool {
+	ap, err := netip.ParseAddrPort(peer)
+	if err != nil || !cacheOperatorMeshAddress(ap.Addr(), h.config.MeshRegionID) {
+		return false
+	}
+	if len(h.config.OperatorPeers) == 0 {
+		return true
+	}
+	for _, allowed := range h.config.OperatorPeers {
+		ip, err := netip.ParseAddr(allowed)
+		if err == nil && ip == ap.Addr() {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *cacheConfigure) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	peer, err := netip.ParseAddrPort(r.RemoteAddr)
-	if err != nil || !peer.Addr().IsLoopback() {
+	if !h.allowedPeer(r.RemoteAddr) {
 		http.Error(w, "configure refused", 403)
 		return
 	}

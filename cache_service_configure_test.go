@@ -28,7 +28,7 @@ func configureFixture(t *testing.T) (*cacheConfigure, ed25519.PrivateKey, *atomi
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]string{"kty": "OKP", "crv": "Ed25519", "kid": "key", "x": base64.RawURLEncoding.EncodeToString(pub)}}})
 	}))
 	t.Cleanup(jwks.Close)
-	h := &cacheConfigure{config: cacheServiceConfig{CentralURL: jwks.URL, CentralJWKSURL: jwks.URL, CentralIssuer: "central", CentralRegionID: 1, RegionID: "blr-1", CentralTokenFile: filepath.Join(t.TempDir(), "token")}, central: &cacheCentralRotating{}, client: jwks.Client(), store: writeCacheCredential}
+	h := &cacheConfigure{config: cacheServiceConfig{CentralURL: jwks.URL, CentralJWKSURL: jwks.URL, CentralIssuer: "central", CentralRegionID: 1, MeshRegionID: 1, RegionID: "blr-1", CentralTokenFile: filepath.Join(t.TempDir(), "token")}, central: &cacheCentralRotating{}, client: jwks.Client(), store: writeCacheCredential}
 	return h, key, calls
 }
 func configureToken(t *testing.T, key ed25519.PrivateKey, kid string, edit func(jwt.MapClaims)) string {
@@ -48,7 +48,7 @@ func configureToken(t *testing.T, key ed25519.PrivateKey, kid string, edit func(
 }
 func configureRequest(h *cacheConfigure, token, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest("POST", "https://operator/configure", strings.NewReader(body))
-	r.RemoteAddr = "127.0.0.1:9000"
+	r.RemoteAddr = "[fdaa:1::7]:9000"
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	} else {
@@ -227,5 +227,55 @@ func TestCacheCredentialProtectedDirectory(t *testing.T) {
 	raw, err := readProtectedCacheFile(path, true)
 	if err != nil || string(raw) != "secret" {
 		t.Fatal("protected credential unreadable")
+	}
+}
+
+// Any attempt to consume an unauthorised request body fails the test.
+type unreadConfigureBody struct{ t *testing.T }
+
+func (b unreadConfigureBody) Read([]byte) (int, error) {
+	b.t.Fatal("refused peer body read")
+	return 0, nil
+}
+func (b unreadConfigureBody) Close() error { return nil }
+
+func TestCacheConfigureNetworkBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name, peer string
+		allow      []string
+		status     int
+	}{
+		{"tenant zero", "[fdaa:1::7]:9000", nil, 401},
+		{"tenant", servicePeer, nil, 403},
+		{"other region", "[fdaa:2::7]:9000", nil, 403},
+		{"ipv4", "192.0.2.1:9000", nil, 403},
+		{"loopback4", "127.0.0.1:9000", nil, 403},
+		{"loopback6", "[::1]:9000", nil, 403},
+		{"mapped ipv4", "[::ffff:192.0.2.1]:9000", nil, 403},
+		{"zoned", "[fdaa:1::7%eth0]:9000", nil, 403},
+		{"malformed", "invalid", nil, 403},
+		{"listed", "[fdaa:1::7]:9000", []string{"fdaa:1::7"}, 401},
+		{"unlisted", "[fdaa:1::8]:9000", []string{"fdaa:1::7"}, 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, key, calls := configureFixture(t)
+			h.config.OperatorPeers = tc.allow
+			r := httptest.NewRequest("POST", "https://operator/configure", unreadConfigureBody{t})
+			r.RemoteAddr = tc.peer
+			if tc.status == 403 {
+				r.Header.Set("Authorization", "Bearer "+configureToken(t, key, "key", nil))
+			}
+			r.Header.Set("X-Forwarded-For", "fdaa:1::7")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.status || calls.Load() != 0 {
+				t.Fatalf("status %d; JWKS calls %d", w.Code, calls.Load())
+			}
+		})
+	}
+	h, key, _ := configureFixture(t)
+	h.config.OperatorPeers = []string{"fdaa:1::7"}
+	if w := configureRequest(h, configureToken(t, key, "key", nil), configureBody(h, "secret")); w.Code != 200 {
+		t.Fatal(w.Code)
 	}
 }

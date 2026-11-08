@@ -137,7 +137,7 @@ refuses grants from the other mode.
 ## Service mode
 
 `runway --action cache-service --config /etc/runway/cache-service.json` serves
-a direct guest mesh TLS listener and a separate loopback operator TLS listener.
+a direct guest mesh TLS listener and a separate operator mesh TLS listener.
 `POST /setup` carries the existing newline-framed
 setup wire v2 request and response; cache v1 `/_apis/artifactcache/...` and
 `/download/...` retain their paths on the same listener. The future guest relay
@@ -151,7 +151,7 @@ Configuration is a version-1 JSON object with exactly these required keys:
   "version": 1,
   "region_id": "blr-1",
   "mesh_region_id": 1,
-  "operator_listen": "127.0.0.1:8445",
+  "operator_listen": "[fdaa:1::10]:8445",
   "central_issuer": "central",
   "central_jwks_url": "https://central.example.com/api/method/central.api.jwks.get_jwks",
   "central_region_id": 1,
@@ -187,13 +187,23 @@ Central JWT issuer, currently `central`), `central_jwks_url` (the pinned origin'
 Region ID, 0–65535), and `region_id` (Central Region name). The numeric Central
 ID is independent of the mesh region ID.
 
-`operator_listen` must be a literal loopback address with a nonzero port. Central
-operators reach it through a host-side TLS passthrough proxy or an authenticated
-SSH tunnel terminating on the service VM; Atlas must provision that access path
-and the matching certificate name. Do not forward the guest listener or tenant
-traffic to it. The handler also refuses non-loopback connection peers and ignores
-forwarded headers. Only this listener accepts `POST /configure`; the guest
-listener explicitly refuses that path, including for established sessions.
+`operator_listen` must bind the same literal mesh address as `listen`, on a
+separate nonzero port. The service address must belong to tenant 0 in this
+mesh region. Central reaches it through the region's Atlas HTTP proxy, a
+privileged tenant-0 VM, over the WG mesh, like Cargo's route. Atlas must provision
+that route with TLS passthrough or TLS re-encryption to the operator port and
+the matching certificate name.
+
+Before reading any body or validating a token, the handler requires the actual
+connection peer to be an IPv6 mesh address with prefix `fdaa:<mesh_region_id>`
+and tenant bits equal to zero. Non-zero tenants, other regions, IPv4 (including
+mapped IPv4), loopback and scoped addresses are refused. Forwarded headers are
+ignored. Optional `operator_peers` is an array of literal in-region tenant-0
+IPv6 addresses; omitted or empty permits any such peer, while a nonempty list
+further restricts access to those exact addresses. For example,
+`"operator_peers": ["fdaa:1::7"]`. The network check and full JWT validation
+are independent requirements. Only this listener accepts `POST /configure`;
+the guest listener explicitly refuses that path, including for established sessions.
 
 Configure requires `Authorization: Bearer <JWT>` with an EdDSA signature from
 Central's JWKS, the exact pinned `iss`, a scalar `aud` equal to
