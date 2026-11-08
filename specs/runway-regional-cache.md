@@ -137,7 +137,8 @@ refuses grants from the other mode.
 ## Service mode
 
 `runway --action cache-service --config /etc/runway/cache-service.json` serves
-one direct mesh TLS listener. `POST /setup` carries the existing newline-framed
+a direct guest mesh TLS listener and a separate loopback operator TLS listener.
+`POST /setup` carries the existing newline-framed
 setup wire v2 request and response; cache v1 `/_apis/artifactcache/...` and
 `/download/...` retain their paths on the same listener. The future guest relay
 must map its setup exchange to `/setup` and proxy translator paths unchanged.
@@ -150,6 +151,11 @@ Configuration is a version-1 JSON object with exactly these required keys:
   "version": 1,
   "region_id": "blr-1",
   "mesh_region_id": 1,
+  "operator_listen": "127.0.0.1:8445",
+  "central_issuer": "central",
+  "central_jwks_url": "https://central.example.com/api/method/central.api.jwks.get_jwks",
+  "central_region_id": 1,
+  "central_ca_file": "",
   "listen": "[fdaa:1::10]:8443",
   "audience": "https://cache-data.example.internal:8444",
   "certificate_file": "/etc/runway/service.crt",
@@ -171,8 +177,48 @@ certificates and CA files may be readable but cannot be group/world writable.
 The signing key is generated locally on first start in an existing root-owned
 private directory and atomically published without replacing an existing key.
 Only its public key belongs in cache-data's trusted issuers; no private key or
-Central token goes to a guest. Central HTTPS uses system trust roots and token
-authentication; redirects are refused. TLS ingress requires TLS 1.3.
+Central token goes to a guest. Central HTTPS (including JWKS) uses system roots
+when `central_ca_file` is empty, or exclusively the PEM roots in that protected
+CA file when set. Redirects are refused. TLS ingress requires TLS 1.3.
+
+Atlas setup pins `central_url` (HTTPS origin), `central_issuer` (the actual
+Central JWT issuer, currently `central`), `central_jwks_url` (the pinned origin's
+`/api/method/central.api.jwks.get_jwks`), `central_region_id` (numeric Central
+Region ID, 0–65535), and `region_id` (Central Region name). The numeric Central
+ID is independent of the mesh region ID.
+
+`operator_listen` must be a literal loopback address with a nonzero port. Central
+operators reach it through a host-side TLS passthrough proxy or an authenticated
+SSH tunnel terminating on the service VM; Atlas must provision that access path
+and the matching certificate name. Do not forward the guest listener or tenant
+traffic to it. The handler also refuses non-loopback connection peers and ignores
+forwarded headers. Only this listener accepts `POST /configure`; the guest
+listener explicitly refuses that path, including for established sessions.
+
+Configure requires `Authorization: Bearer <JWT>` with an EdDSA signature from
+Central's JWKS, the exact pinned `iss`, a scalar `aud` equal to
+`runway-cache:<central_region_id>`, and exact scope `runway-cache-configure`.
+Cargo audiences, audience arrays, and `X-Cargo-Access-Token` authentication are
+refused. Both `iat` and `exp` are required: lifetime is at most five minutes,
+with 30 seconds of clock skew. JWKS responses are bounded to 64 KiB / 64 keys,
+cached for five minutes, and refetched on an unknown `kid`; fetch attempts are
+serialized and limited to one per second, including failed fetches.
+
+The JSON body has exactly `central_url`, `region`, and `credential`, with no
+null, duplicate, missing, or extra keys. Origin and Region name must exactly
+match configuration. Success is HTTP 200 with exactly `{"configured": true}`.
+The opaque credential is never logged. It is written to a mode-0600 temporary
+file in the existing root-owned private token directory, fsynced, renamed over
+`central_token_file`, and the directory fsynced before publishing an immutable
+Central client snapshot. In-flight requests finish using their original client;
+later requests use the replacement. A persistence error leaves the current
+in-memory client unchanged and refuses enrolment. A directory-fsync failure
+following rename may leave the new file on disk; operators must retry enrolment.
+
+An absent, unreadable, or invalid credential at startup leaves setup disabled
+while the operator listener remains available. No `cache_lease` or `cache_bucket`
+request is made before enrolment. Central read failures during rotation disable
+setup so jobs fall back to GitHub's cache.
 
 Caller identity comes exclusively from the direct connection's IPv6 peer,
 never forwarding headers. The layout is `fdaa | region (16) | tenant (32) |

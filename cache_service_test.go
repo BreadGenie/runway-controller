@@ -200,12 +200,12 @@ func TestCacheCentralRejectsContractMutations(t *testing.T) {
 }
 
 func TestCacheServiceConfig(t *testing.T) {
-	c := cacheServiceConfig{Version: 1, RegionID: "blr-1", MeshRegionID: 1, Listen: "[fdaa:1::10]:8443", Audience: "https://cache.example", CertificateFile: "/etc/cache.crt", PrivateKeyFile: "/etc/cache.key", SigningKeyFile: "/var/lib/cache/signing.key", CacheDataCAFile: "/etc/cache-ca.crt", GitHubTokenFile: "/etc/github", CentralURL: "https://central.example", CentralTokenFile: "/etc/central", ArchiveBytes: 1 << 30}
+	c := cacheServiceConfig{OperatorListen: "127.0.0.1:8445", CentralIssuer: "central", CentralJWKSURL: "https://central.example/api/method/central.api.jwks.get_jwks", CentralRegionID: 1, Version: 1, RegionID: "blr-1", MeshRegionID: 1, Listen: "[fdaa:1::10]:8443", Audience: "https://cache.example", CertificateFile: "/etc/cache.crt", PrivateKeyFile: "/etc/cache.key", SigningKeyFile: "/var/lib/cache/signing.key", CacheDataCAFile: "/etc/cache-ca.crt", GitHubTokenFile: "/etc/github", CentralURL: "https://central.example", CentralTokenFile: "/etc/central", ArchiveBytes: 1 << 30}
 	data, _ := json.Marshal(c)
 	if _, err := decodeCacheServiceConfig(data); err != nil {
 		t.Fatal(err)
 	}
-	for _, edit := range []func(*cacheServiceConfig){func(c *cacheServiceConfig) { c.Listen = "127.0.0.1:8443" }, func(c *cacheServiceConfig) { c.Listen = "[fdaa:2::10]:8443" }, func(c *cacheServiceConfig) { c.CentralURL = "http://central.example" }, func(c *cacheServiceConfig) { c.PrivateKeyFile = "relative" }, func(c *cacheServiceConfig) { c.ArchiveBytes = 0 }} {
+	for _, edit := range []func(*cacheServiceConfig){func(c *cacheServiceConfig) { c.Listen = "127.0.0.1:8443" }, func(c *cacheServiceConfig) { c.Listen = "[fdaa:2::10]:8443" }, func(c *cacheServiceConfig) { c.CentralURL = "http://central.example" }, func(c *cacheServiceConfig) { c.PrivateKeyFile = "relative" }, func(c *cacheServiceConfig) { c.ArchiveBytes = 0 }, func(c *cacheServiceConfig) { c.OperatorListen = "0.0.0.0:8445" }, func(c *cacheServiceConfig) { c.OperatorListen = "[fdaa:1::10]:8445" }, func(c *cacheServiceConfig) { c.CentralIssuer = "" }, func(c *cacheServiceConfig) { c.CentralJWKSURL = "https://other.example/keys" }, func(c *cacheServiceConfig) { c.CentralRegionID = -1 }, func(c *cacheServiceConfig) { c.CentralRegionID = 65536 }, func(c *cacheServiceConfig) { c.CentralCAFile = "relative" }} {
 		other := c
 		edit(&other)
 		data, _ := json.Marshal(other)

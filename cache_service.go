@@ -25,6 +25,11 @@ import (
 )
 
 type cacheServiceConfig struct {
+	OperatorListen   string `json:"operator_listen"`
+	CentralIssuer    string `json:"central_issuer"`
+	CentralJWKSURL   string `json:"central_jwks_url"`
+	CentralRegionID  int    `json:"central_region_id"`
+	CentralCAFile    string `json:"central_ca_file"`
 	Version          int    `json:"version"`
 	RegionID         string `json:"region_id"`
 	MeshRegionID     uint16 `json:"mesh_region_id"`
@@ -42,13 +47,17 @@ type cacheServiceConfig struct {
 
 func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	var c cacheServiceConfig
-	if readCacheObject(data, []string{"version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "github_token_file", "central_url", "central_token_file", "archive_bytes"}) != nil || json.Unmarshal(data, &c) != nil {
+	if readCacheObject(data, []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "github_token_file", "central_url", "central_token_file", "archive_bytes"}) != nil || json.Unmarshal(data, &c) != nil {
 		return c, grant.ErrInvalid
 	}
 	for _, p := range []string{c.CertificateFile, c.PrivateKeyFile, c.SigningKeyFile, c.CacheDataCAFile, c.GitHubTokenFile, c.CentralTokenFile} {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
 			return c, grant.ErrInvalid
 		}
+	}
+	operator, err := netip.ParseAddrPort(c.OperatorListen)
+	if err != nil || !operator.Addr().IsLoopback() || operator.Port() == 0 || c.CentralIssuer == "" || c.CentralRegionID < 0 || c.CentralRegionID > 65535 || c.CentralJWKSURL != strings.TrimSuffix(c.CentralURL, "/")+"/api/method/central.api.jwks.get_jwks" || (c.CentralCAFile != "" && (!filepath.IsAbs(c.CentralCAFile) || filepath.Clean(c.CentralCAFile) != c.CentralCAFile)) {
+		return c, grant.ErrInvalid
 	}
 	addr, err := netip.ParseAddrPort(c.Listen)
 	if err != nil || addr.Port() == 0 || !cacheHTTPSOrigin(c.CentralURL) || c.Version != 1 || c.ArchiveBytes <= 0 || c.ArchiveBytes > 1<<30 {
@@ -139,6 +148,10 @@ type cacheService struct {
 }
 
 func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/configure" {
+		http.Error(w, "configure refused", 403)
+		return
+	}
 	select {
 	case s.slots <- struct{}{}:
 		defer func() { <-s.slots }()
@@ -269,8 +282,17 @@ func runCacheService(path string) error {
 		return grant.ErrInvalid
 	}
 	token, err := readProtectedCacheFile(c.CentralTokenFile, true)
+	// Missing or unreadable credentials leave setup disabled until enrolment.
+	if err != nil {
+		token = nil
+	}
+	centralClient, err := cacheCentralClient(c)
 	if err != nil {
 		return err
+	}
+	rotating := &cacheCentralRotating{}
+	if value := strings.TrimSpace(string(token)); len(token) <= 4096 && value != "" && !strings.ContainsAny(value, " \t\r\n") {
+		rotating.current.Store(&cacheCentralWithBuckets{cacheCentralHTTPS{origin: c.CentralURL, token: value, client: centralClient}})
 	}
 	github, err := newCacheRepositoryClient(c.GitHubTokenFile)
 	if err != nil {
@@ -278,15 +300,25 @@ func runCacheService(path string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := &cacheService{config: c, ctx: ctx, central: cacheCentralWithBuckets{cacheCentralHTTPS{origin: c.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}}}, github: github, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	service := &cacheService{config: c, ctx: ctx, central: rotating, github: github, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
 	listener, err := net.Listen("tcp6", c.Listen)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 	server := &http.Server{Handler: service, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: cacheHostRequestLimit, WriteTimeout: cacheHostRequestLimit, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
+	operatorListener, err := net.Listen("tcp", c.OperatorListen)
+	if err != nil {
+		return err
+	}
+	defer operatorListener.Close()
+	operatorServer := &http.Server{Handler: &cacheConfigure{config: c, central: rotating, client: centralClient}, TLSConfig: server.TLSConfig.Clone(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
+	operatorErrors := make(chan error, 1)
+	go func() { operatorErrors <- operatorServer.ServeTLS(operatorListener, "", ""); _ = server.Close() }()
+	defer operatorServer.Close()
 	go func() {
 		<-ctx.Done()
+		_ = operatorServer.Close()
 		_ = server.Close()
 		service.mu.Lock()
 		defer service.mu.Unlock()
@@ -299,6 +331,13 @@ func runCacheService(path string) error {
 		}
 	}()
 	err = server.ServeTLS(listener, "", "")
+	select {
+	case operatorErr := <-operatorErrors:
+		if !errors.Is(operatorErr, http.ErrServerClosed) {
+			return operatorErr
+		}
+	default:
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
