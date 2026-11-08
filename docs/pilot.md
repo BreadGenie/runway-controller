@@ -138,7 +138,7 @@ Pool identity changes require a drained pool and a controller restart. Preserve 
 
 This is trusted internal compute. Firecracker separation and guest-local Docker do not establish safe access for public fork PRs or arbitrary customer code. The current setup has not validated network isolation from control-plane services, other tenants, or cloud metadata. No customer dashboard, billing, usage ledger, multi-host transport, or production host-drain policy is included.
 
-Cache entries still live in GitHub's own Actions cache service. Aligning the workspace layout fixed the yarn cache, which one runner type had been writing and the other unable to restore, and Runway operates no regional cache tier and no proxy or mirror in front of that service.
+For controller-provisioned guests, cache entries still live in GitHub's own Actions cache service. Aligning the workspace layout fixed the yarn cache, which one runner type had been writing and the other unable to restore. The regional cache tier ([spec](../specs/runway-regional-cache.md)) runs only on the standalone guest path and is not wired into this controller.
 
 Next, extend the verified restart and independent deadline checks with bootstrap response loss, ownership takeover, and GitHub outage cleanup. Performance has been measured on a real Frappe integration job; the next step is a benchmark with hardware matched to GitHub-hosted, then trials of a regional dependency cache and an OCI image cache. Keep cache trust and tenant boundaries explicit; reusable images must remain credential-free.
 
