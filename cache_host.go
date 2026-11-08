@@ -312,7 +312,11 @@ func (host *cacheHost) serve(parent context.Context) error {
 		host.current.Close()
 	}
 	host.mu.Unlock()
-	host.log(map[string]any{"event": "stopped", "vm_id": host.vmID})
+	host.mu.Lock()
+	enabled := host.setup != nil
+	host.mu.Unlock()
+	// A guest that never enabled setup ran its job on GitHub's cache.
+	host.log(map[string]any{"event": "stopped", "vm_id": host.vmID, "setup_enabled": enabled})
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

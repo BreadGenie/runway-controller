@@ -21,7 +21,7 @@ import (
 func TestEnvironment(t *testing.T) {
 	env := []string{"A=1", "ACTIONS_CACHE_URL=upstream", "ACTIONS_CACHE_SERVICE_V2=true", "ACTIONS_RUNTIME_TOKEN=secret", "ACTIONS_RESULTS_URL=artifact"}
 	for _, script := range []string{"/missing/unrelated.js", "/missing/_actions/actions/cache/v4/dist/restore/index.js"} {
-		got := environment([]string{"node", script}, env, func() bool { t.Fatal("unexpected setup"); return true })
+		got := environment([]string{"node", script}, env, func() bool { t.Fatal("unexpected setup"); return true }, func(string) {})
 		if !reflect.DeepEqual(got, env) {
 			t.Fatal(got)
 		}
@@ -34,20 +34,50 @@ func TestEnvironment(t *testing.T) {
 	if err := os.WriteFile(script, []byte("fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := environment([]string{"node", script}, env, func() bool { t.Fatal("hash mismatch reached setup"); return true }); !reflect.DeepEqual(got, env) {
+	if got := environment([]string{"node", script}, env, func() bool { t.Fatal("hash mismatch reached setup"); return true }, func(string) {}); !reflect.DeepEqual(got, env) {
 		t.Fatal(got)
 	}
 	hash := sha256.Sum256([]byte("fixture"))
 	key := hex.EncodeToString(hash[:])
 	bundles["cache"][key] = true
 	defer delete(bundles["cache"], key)
-	if got := environment([]string{"node", script}, env, func() bool { return false }); !reflect.DeepEqual(got, env) {
+	if got := environment([]string{"node", script}, env, func() bool { return false }, func(string) {}); !reflect.DeepEqual(got, env) {
 		t.Fatal(got)
 	}
-	got := environment([]string{"node", script}, env, func() bool { return true })
+	got := environment([]string{"node", script}, env, func() bool { return true }, func(string) {})
 	want := []string{"A=1", "ACTIONS_RUNTIME_TOKEN=secret", "ACTIONS_RESULTS_URL=artifact", "ACTIONS_CACHE_URL=" + route}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal(got)
+	}
+}
+
+func TestUnpinnedBundleIsReportedOnce(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "_actions/actions/setup-node/v6/dist/setup")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "index.js")
+	if err := os.WriteFile(script, []byte("moved tag"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("moved tag"))
+	var notices []string
+	notify := func(line string) { notices = append(notices, line) }
+	environment([]string{"node", script}, nil, func() bool { t.Fatal("unpinned bundle reached setup"); return true }, notify)
+	if len(notices) != 1 || !strings.Contains(notices[0], "actions/setup-node") || !strings.Contains(notices[0], "sha256:"+hex.EncodeToString(hash[:])[:12]) || !strings.Contains(notices[0], "GitHub's cache") {
+		t.Fatal(notices)
+	}
+	// Unrelated actions and pinned bundles say nothing.
+	notices = nil
+	environment([]string{"node", "/missing/unrelated.js"}, nil, func() bool { return false }, notify)
+	bundles["setup-node"][hex.EncodeToString(hash[:])] = true
+	defer delete(bundles["setup-node"], hex.EncodeToString(hash[:]))
+	environment([]string{"node", script}, nil, func() bool { return false }, notify)
+	if len(notices) != 0 {
+		t.Fatal(notices)
+	}
+	if line := unpinned("cache", "/missing/index.js", ""); !strings.Contains(line, "unreadable") {
+		t.Fatal(line)
 	}
 }
 
@@ -58,7 +88,10 @@ func TestFastPathDoesNotOpenScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	go func() { environment([]string{"node", path}, nil, func() bool { panic("setup") }); close(done) }()
+	go func() {
+		environment([]string{"node", path}, nil, func() bool { panic("setup") }, func(string) {})
+		close(done)
+	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
