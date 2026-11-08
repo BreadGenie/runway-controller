@@ -286,6 +286,9 @@ func (s *Server) authorize(r *http.Request, clock grant.Clock) (Scope, bool) {
 		if s.config.Buckets == nil {
 			return Scope{}, false
 		}
+		if _, err := s.config.Buckets.Bucket(r.Context(), claims.TenantID); err != nil {
+			return Scope{}, false
+		}
 		repository, _ = json.Marshal([]string{"managed", strconv.FormatInt(claims.TenantID, 10), strconv.FormatInt(claims.RepositoryID, 10)})
 	} else if s.config.Buckets != nil {
 		return Scope{}, false

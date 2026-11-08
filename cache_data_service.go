@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,7 @@ type cacheDataServiceConfig struct {
 	MaxArchiveBytes int64                `json:"max_archive_bytes"`
 	Disk            store.DiskConfig     `json:"disk"`
 	StorageBudget   *store.StorageBudget `json:"storage_budget,omitempty"`
+	Managed         *cacheManagedConfig  `json:"managed,omitempty"`
 	Garage          store.GarageConfig   `json:"garage"`
 }
 
@@ -59,9 +61,19 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 	if len(data) > 4096 || json.Unmarshal(data, &fields) != nil {
 		return config, store.Config{}, grant.ErrInvalid
 	}
-	required := []string{"version", "listen", "public_origin", "certificate_file", "private_key_file", "public_keys", "region_id", "state_dir", "quota_bytes", "total_bytes", "max_archive_bytes", "disk", "garage"}
+	required := []string{"version", "listen", "public_origin", "certificate_file", "private_key_file", "public_keys", "region_id", "state_dir", "quota_bytes", "total_bytes", "max_archive_bytes", "disk"}
+	if _, ok := fields["managed"]; ok {
+		required = append(required, "managed")
+	} else {
+		required = append(required, "garage")
+	}
 	if _, ok := fields["storage_budget"]; ok {
 		required = append(required, "storage_budget")
+	}
+	if raw, ok := fields["managed"]; ok {
+		if readCacheObject(raw, []string{"central_url", "central_token_file", "storage_ca_file", "prefix", "teams"}) != nil {
+			return config, store.Config{}, grant.ErrInvalid
+		}
 	}
 	if readCacheObject(data, required) != nil {
 		return config, store.Config{}, grant.ErrInvalid
@@ -81,6 +93,34 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 	}
 	if json.Unmarshal(data, &config) != nil {
 		return config, store.Config{}, grant.ErrInvalid
+	}
+	if m := config.Managed; m != nil {
+		if !cacheHTTPSOrigin(m.CentralURL) || !filepath.IsAbs(m.CentralTokenFile) || !filepath.IsAbs(m.StorageCAFile) || len(m.Teams) == 0 {
+			return config, store.Config{}, grant.ErrInvalid
+		}
+		var rawManaged map[string]json.RawMessage
+		var rawTeams map[string]json.RawMessage
+		if json.Unmarshal(fields["managed"], &rawManaged) != nil || json.Unmarshal(rawManaged["teams"], &rawTeams) != nil {
+			return config, store.Config{}, grant.ErrInvalid
+		}
+		names := make([]string, 0, len(rawTeams))
+		for name := range rawTeams {
+			id, err := strconv.ParseInt(name, 10, 64)
+			if err != nil || strconv.FormatInt(id, 10) != name {
+				return config, store.Config{}, grant.ErrInvalid
+			}
+			names = append(names, name)
+		}
+		if readCacheObject(rawManaged["teams"], names) != nil {
+			return config, store.Config{}, grant.ErrInvalid
+		}
+		seen := map[string]bool{}
+		for id, team := range m.Teams {
+			if id <= 0 || id > 4294967295 || team == "" || seen[team] {
+				return config, store.Config{}, grant.ErrInvalid
+			}
+			seen[team] = true
+		}
 	}
 	host, port, err := net.SplitHostPort(config.Listen)
 	address := net.ParseIP(host)
@@ -114,6 +154,25 @@ func runCacheDataService(configPath string) error {
 	config, core, err := decodeCacheDataServiceConfig(data)
 	if err != nil {
 		return grant.ErrInvalid
+	}
+	if m := config.Managed; m != nil {
+		token, err := readProtectedCacheFile(m.CentralTokenFile, true)
+		if err != nil {
+			return grant.ErrInvalid
+		}
+		ca, err := readProtectedCacheFile(m.StorageCAFile, false)
+		if err != nil {
+			return grant.ErrInvalid
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(ca) {
+			return grant.ErrInvalid
+		}
+		core.ManagedPrefix = m.Prefix
+		core.Buckets = &cacheBucketProvider{
+			central: cacheCentralHTTPS{origin: m.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}},
+			teams:   m.Teams, ca: string(ca),
+		}
 	}
 	certificate, certErr := readProtectedCacheFile(config.CertificateFile, false)
 	privateKey, keyErr := readProtectedCacheFile(config.PrivateKeyFile, true)

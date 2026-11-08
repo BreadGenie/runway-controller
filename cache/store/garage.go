@@ -105,7 +105,9 @@ func (store *garageStore) put(ctx context.Context, key string, file *os.File, si
 			return err
 		}
 		defer target.close()
-		return target.put(ctx, key, file, size)
+		err = target.put(ctx, key, file, size)
+		store.invalidateAuth(key, err)
+		return err
 	}
 	body := &seekableContextReader{ctx: ctx, SectionReader: io.NewSectionReader(file, 0, size)}
 	_, err := store.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &store.bucket, Key: &key, Body: body, ContentLength: aws.Int64(size)})
@@ -133,7 +135,9 @@ func (store *garageStore) get(ctx context.Context, key string, staged *spool, di
 			return err
 		}
 		defer target.close()
-		return target.get(ctx, key, staged, digest)
+		err = target.get(ctx, key, staged, digest)
+		store.invalidateAuth(key, err)
+		return err
 	}
 	result, err := store.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &store.bucket, Key: &key})
 	if err != nil {
@@ -163,7 +167,9 @@ func (store *garageStore) delete(ctx context.Context, key string) error {
 			return err
 		}
 		defer target.close()
-		return target.delete(ctx, key)
+		err = target.delete(ctx, key)
+		store.invalidateAuth(key, err)
+		return err
 	}
 	_, err := store.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &store.bucket, Key: &key})
 	return err

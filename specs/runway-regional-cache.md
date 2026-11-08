@@ -129,7 +129,7 @@ complete; failures refuse startup and retry the reset next time. Other service
 prefixes and standalone `prototype/` objects remain untouched. An existing
 journal verifies only indexed objects and never adopts unknown objects.
 The provider must honor deadlines and support concurrent credential lookups,
-including rotation; the Central implementation is a separate issue. The CLI's
+including rotation. The Central provider and process configuration are described below. The CLI's
 standalone Garage config accepts optional `ca_pem` for HTTPS; managed service
 wiring supplies the provider through `store.Config`. Old standalone journals
 and object keys require no migration. A store instance selects one mode and
@@ -188,9 +188,79 @@ fences remain per lease until its deadline; requests and live session counts
 are bounded. A service restart clears in-memory setup fences, as standalone
 host restart does. Setup work shares the existing 2.5-second budget.
 
-This first service issue retains existing grant/store scope. Tenant identity is
-carried into `grant.Authorization` as the namespace seam for issue 02; it is
-not yet a signed claim or a storage isolation boundary. Do not share this mode
-across mutually untrusted teams before that namespace change. Remote Garage,
-controller evidence recording, Central provisioning, Atlas deployment and the
-guest TLS relay are subsequent issues; no live service is qualified here.
+## Regional process layout (managed storage)
+
+Run two systemd units on the regional service VM. This reuses the existing TLS
+boundary and gives cache-data sole custody of its journal and staging disk.
+The service signs grants with the positive tenant from the verified Central
+lease; managed cache-data rejects standalone grants. No changes to main's two
+actions are needed.
+
+- `runway-cache-data.service`: `ExecStart=/usr/local/bin/runway --action cache-data --config /etc/runway/cache-data.json`
+- `runway-cache-service.service`: `After=runway-cache-data.service`,
+  `Requires=runway-cache-data.service`,
+  `ExecStart=/usr/local/bin/runway --action cache-service --config /etc/runway/cache-service.json`
+
+Install the unit templates from `deploy/regional-cache/systemd/`.
+Use `Restart=on-failure` for both units. Provision protected configuration and
+directories before starting either unit. Generate the service signing key
+locally (the service does this on first start), provision its public key in
+cache-data, then start both. Keep the signing key and journal across upgrades.
+Use a cache-data certificate whose SAN matches the service's audience, with
+that CA in `cache_data_ca_file`. Bind cache-data to loopback; resolve its
+audience hostname locally to loopback. The mesh listener stays on cache-service.
+
+Managed cache-data uses the existing version-1 config, bounds, TLS files,
+public keys and disk settings, but **replaces** the required `garage` object
+with this required `managed` object (the two cannot coexist):
+
+```json
+{
+  "managed": {
+    "central_url": "https://central.example.com",
+    "central_token_file": "/etc/runway/central-region-token",
+    "storage_ca_file": "/etc/runway/garage-ca.crt",
+    "prefix": "managed/blr-cache/",
+    "teams": {"2": "internal-team", "3": "another-team"}
+  }
+}
+```
+
+The example above is the replacement fragment, not a complete configuration.
+`teams` is a nonempty, durable, authoritative tenant-to-Central-team registry
+for this service prefix. Deployment must enroll each team here **before**
+enabling its pool and retain retired teams while their bucket may contain this
+prefix. Back up this configuration independently of the journal and restore it
+on VM recreation. Never rebuild it from active leases or currently enabled
+pools: those omit idle and retired tenants. Never prune it merely because
+Central returns 404. A deleted bucket requires explicit operator reconciliation
+of the registry after verifying its objects are gone. Central's current contract
+has no enumeration method; adding one and automating this registry is future
+Central provisioning work, not an invented read API.
+
+At cold start the provider enumerates the complete registry and freshly resolves
+**every** team through `cache_bucket`. The store also validates every resolved
+storage configuration before deleting anything. A missing team, malformed
+response, bad credentials or enumeration error refuses startup and writes no
+new journal. A storage error during deletion may leave a partly cleared
+*unindexed* prefix; serving still never starts, and the next startup retries.
+Existing journals never run the cold reset, so reset cannot delete objects
+that a retained journal references. Reset deletes only this service prefix
+and preserves other prefixes in every bucket.
+
+Central responses use the same bounded HTTPS token client and exact JSON
+contract as leases; redirects are refused. Tenant identity must match the
+registry. Each tenant's endpoint, region, bucket and credentials are cached for
+at most 30 seconds, with no stale-on-error behavior. Storage 401/403 or S3
+authentication errors invalidate that tenant's credentials, causing a re-read
+on the next operation. Failed writes are not automatically replayed. Explicit
+rotation can also be picked up by restarting cache-data, or within the TTL.
+Storage uses the locally pinned CA file, never ambient roots. Credentials stay
+in process memory and are absent from journals, grants and logs.
+
+Setup and renewal freshly check Central bucket availability as well as lease
+authority. Data API authorization checks bucket availability (using the bounded
+credential cache); errors refuse requests. Downloads still require their
+short-lived journaled ticket and a successful tenant-routed storage read.
+Central provisioning, Atlas deployment and the guest TLS relay remain separate
+issues; no live regional deployment is qualified here.

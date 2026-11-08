@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway/cache/store"
 )
 
 type cacheServiceJob struct {
@@ -51,30 +52,40 @@ func cacheHTTPSOrigin(value string) bool {
 	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && (u.Path == "" || u.Path == "/")
 }
 
-func (central cacheCentralHTTPS) lease(ctx context.Context, address netip.Addr) (cacheServiceLease, error) {
-	var lease cacheServiceLease
-	if !cacheHTTPSOrigin(central.origin) || central.token == "" || strings.ContainsAny(central.token, " \t\r\n") {
-		return lease, grant.ErrInvalid
+// read shares bounded, non-redirecting token transport across the two methods.
+func (central cacheCentralHTTPS) read(ctx context.Context, method string, query url.Values) ([]byte, error) {
+	if !cacheHTTPSOrigin(central.origin) || central.client == nil || central.token == "" || strings.ContainsAny(central.token, " \t\r\n") {
+		return nil, grant.ErrInvalid
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(central.origin, "/")+"/api/method/central.runway.cache_lease?address="+url.QueryEscape(address.String()), nil)
+	ctx, cancel := context.WithTimeout(ctx, cacheHostSetupBudget)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(central.origin, "/")+"/api/method/central.runway."+method+"?"+query.Encode(), nil)
 	if err != nil {
-		return lease, err
+		return nil, grant.ErrInvalid
 	}
 	request.Header.Set("Authorization", "token "+central.token)
-	// Never forward the regional credential through a redirect.
 	client := *central.client
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	response, err := client.Do(request)
 	if err != nil {
-		return lease, err
+		return nil, grant.ErrInvalid
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return lease, errCacheJobNotFound
+		return nil, errCacheJobNotFound
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, 4097))
 	if err != nil || len(data) > 4096 || !utf8.Valid(data) {
-		return lease, grant.ErrInvalid
+		return nil, grant.ErrInvalid
+	}
+	return data, nil
+}
+
+func (central cacheCentralHTTPS) lease(ctx context.Context, address netip.Addr) (cacheServiceLease, error) {
+	var lease cacheServiceLease
+	data, err := central.read(ctx, "cache_lease", url.Values{"address": {address.String()}})
+	if err != nil {
+		return lease, err
 	}
 	// job is the contract's only nullable field. Validate its presence separately.
 	var fields map[string]json.RawMessage
@@ -105,6 +116,28 @@ func (central cacheCentralHTTPS) lease(ctx context.Context, address netip.Addr) 
 		return lease, grant.ErrInvalid
 	}
 	return lease, nil
+}
+
+func (central cacheCentralHTTPS) bucket(ctx context.Context, team string, tenant int64, ca string) (store.GarageConfig, error) {
+	var answer struct {
+		Team      string `json:"team"`
+		TenantID  int64  `json:"tenant_id"`
+		Bucket    string `json:"bucket"`
+		Endpoint  string `json:"endpoint"`
+		Region    string `json:"region"`
+		AccessKey string `json:"access_key"`
+		SecretKey string `json:"secret_key"`
+	}
+	data, err := central.read(ctx, "cache_bucket", url.Values{"team": {team}})
+	if err != nil {
+		return store.GarageConfig{}, err
+	}
+	if readCacheObject(data, []string{"team", "tenant_id", "bucket", "endpoint", "region", "access_key", "secret_key"}) != nil || json.Unmarshal(data, &answer) != nil ||
+		answer.Team != team || answer.TenantID != tenant || tenant <= 0 || tenant > 4294967295 ||
+		!cacheHTTPSOrigin(answer.Endpoint) || answer.Bucket == "" || strings.ContainsAny(answer.Bucket, "/\\") || answer.Region == "" || answer.AccessKey == "" || answer.SecretKey == "" {
+		return store.GarageConfig{}, grant.ErrInvalid
+	}
+	return store.GarageConfig{Endpoint: answer.Endpoint, Region: answer.Region, Bucket: answer.Bucket, AccessKey: answer.AccessKey, SecretKey: answer.SecretKey, CAPEM: ca}, nil
 }
 
 // Exact top-level decoding, allowing only job to be null.

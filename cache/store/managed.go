@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 // BucketProvider supplies current bucket credentials without putting them in
@@ -42,6 +43,12 @@ func (store *garageStore) reset(ctx context.Context) error {
 	if err != nil {
 		return errors.New("team bucket enumeration unavailable")
 	}
+	targets := []*garageStore{}
+	defer func() {
+		for _, target := range targets {
+			target.close()
+		}
+	}()
 	seen := map[int64]bool{}
 	for _, tenant := range tenants {
 		if seen[tenant] {
@@ -52,8 +59,10 @@ func (store *garageStore) reset(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		targets = append(targets, target)
+	}
+	for _, target := range targets {
 		err = target.clearPrefix(ctx, store.prefix)
-		target.close()
 		if err != nil {
 			return errors.New("managed cache reset failed")
 		}
@@ -83,5 +92,27 @@ func (store *garageStore) clearPrefix(ctx context.Context, prefix string) error 
 			return errors.New("invalid storage pagination")
 		}
 		token = page.NextContinuationToken
+	}
+}
+
+// Auth failures never use stale credentials on the next operation. Failed PUTs
+// are not replayed automatically: the caller can retry with a fresh reservation.
+func (store *garageStore) invalidateAuth(key string, err error) {
+	var api smithy.APIError
+	var response interface{ HTTPStatusCode() int }
+	auth := errors.As(err, &response) && (response.HTTPStatusCode() == 401 || response.HTTPStatusCode() == 403)
+	if errors.As(err, &api) {
+		switch api.ErrorCode() {
+		case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken":
+			auth = true
+		}
+	}
+	if !auth {
+		return
+	}
+	if provider, ok := store.provider.(interface{ Invalidate(int64) }); ok {
+		part, _, _ := strings.Cut(strings.TrimPrefix(key, store.prefix), "/")
+		tenant, _ := strconv.ParseInt(part, 10, 64)
+		provider.Invalidate(tenant)
 	}
 }

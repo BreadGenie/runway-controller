@@ -1,0 +1,15 @@
+[Unit]
+Description=Runway regional cache ingress
+After=network-online.target runway-cache-data.service
+Wants=network-online.target
+Requires=runway-cache-data.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/runway --action cache-service --config /etc/runway/cache-service.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

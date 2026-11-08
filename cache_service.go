@@ -278,7 +278,7 @@ func runCacheService(path string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := &cacheService{config: c, ctx: ctx, central: cacheCentralHTTPS{origin: c.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}}, github: github, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	service := &cacheService{config: c, ctx: ctx, central: cacheCentralWithBuckets{cacheCentralHTTPS{origin: c.CentralURL, token: strings.TrimSpace(string(token)), client: &http.Client{Timeout: cacheHostSetupBudget}}}, github: github, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
 	listener, err := net.Listen("tcp6", c.Listen)
 	if err != nil {
 		return err

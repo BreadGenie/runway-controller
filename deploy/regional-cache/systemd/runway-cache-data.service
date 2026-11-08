@@ -1,0 +1,14 @@
+[Unit]
+Description=Runway regional managed cache data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/runway --action cache-data --config /etc/runway/cache-data.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
