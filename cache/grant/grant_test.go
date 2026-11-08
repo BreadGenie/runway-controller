@@ -40,6 +40,7 @@ func TestRejectTamperedUnknownIssuerAndWrongAudience(t *testing.T) {
 	token, _ := sign(key, c, clock)
 	for _, change := range []func(*Claims){
 		func(c *Claims) { c.RepositoryID++ },
+		func(c *Claims) { c.TenantID = 2 },
 		func(c *Claims) { c.Audience = "https://other.example.test" },
 		func(c *Claims) { c.RegionID = "other" },
 		func(c *Claims) { c.KeyID = strings.Repeat("a", 64) },
@@ -142,5 +143,30 @@ func TestInvalidScopeAndKeyCustody(t *testing.T) {
 	key[63] ^= 1
 	if _, err := sign(key, c, clock); err == nil {
 		t.Fatal("inconsistent private key accepted")
+	}
+}
+
+func TestOptionalTenantSignedAndBounded(t *testing.T) {
+	key, c, clock, v := fixture(t)
+	legacy := mustJSON(t, c)
+	if strings.Contains(string(legacy), "tenant_id") {
+		t.Fatal("standalone encoding changed")
+	}
+	for _, id := range []int64{0, 1, 4294967295} {
+		c.TenantID = id
+		token, err := sign(key, c, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := v.Verify(token, clock)
+		if err != nil || got.TenantID != id {
+			t.Fatal("tenant did not round trip", got, err)
+		}
+	}
+	for _, id := range []int64{-1, 4294967296} {
+		c.TenantID = id
+		if _, err := sign(key, c, clock); err == nil {
+			t.Fatal("invalid tenant signed", id)
+		}
 	}
 }

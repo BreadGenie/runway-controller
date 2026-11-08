@@ -107,3 +107,30 @@ job and uses the automatic GITHUB_TOKEN; no additional secret is required.
 Organization policy must permit these permissions. PRs created with GITHUB_TOKEN
 do not trigger ordinary pull_request workflows; the bot runs its checks before
 creating the PR. Required external checks may need a human-triggered run.
+
+Managed storage uses signed optional `tenant_id` claims (positive 32-bit Central
+tenant IDs); omission retains the original standalone grant encoding. Repository
+scope keys are canonical JSON tuples: `["managed","<tenant>","<repository>"]`
+versus the unchanged `["standalone","<region>","<repository>"]`. Ref priority,
+restore keys, versions and per-repository quota semantics are unchanged.
+
+The store's `BucketProvider` enumerates known tenants and supplies each tenant's
+current bucket/credentials. Managed mode requires HTTPS with an explicitly
+pinned PEM CA, normal hostname verification and finite transport/storage
+deadlines; there is no skip-verification option. Standalone still accepts
+literal-loopback HTTP. Credentials are absent from grants and journals.
+
+A managed service configures a stable, exclusively owned
+`managed/<service-id>/` prefix (service ID: letters, digits, hyphen, underscore).
+Objects use `<prefix><tenant>/<entry-id>` within each team's bucket. On a fresh
+journal, startup enumerates all known tenant buckets and deletes only that
+service prefix before persisting an empty index or serving. Enumeration must be
+complete; failures refuse startup and retry the reset next time. Other service
+prefixes and standalone `prototype/` objects remain untouched. An existing
+journal verifies only indexed objects and never adopts unknown objects.
+The provider must honor deadlines and support concurrent credential lookups,
+including rotation; the Central implementation is a separate issue. The CLI's
+standalone Garage config accepts optional `ca_pem` for HTTPS; managed service
+wiring supplies the provider through `store.Config`. Old standalone journals
+and object keys require no migration. A store instance selects one mode and
+refuses grants from the other mode.

@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -85,6 +86,26 @@ func (g *Garage) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("ETag", `"fixture"`)
 	case http.MethodGet:
+		if r.URL.Query().Get("list-type") == "2" {
+			type item struct{ Key string }
+			result := struct {
+				XMLName     xml.Name
+				Contents    []item
+				IsTruncated bool
+			}{XMLName: xml.Name{Local: "ListBucketResult"}}
+			for key := range g.Objects {
+				if strings.HasPrefix(key, r.URL.Path) {
+					object := strings.TrimPrefix(strings.TrimPrefix(key, r.URL.Path), "/")
+					if strings.HasPrefix(object, r.URL.Query().Get("prefix")) {
+						result.Contents = append(result.Contents, item{object})
+					}
+				}
+			}
+			g.Mu.Unlock()
+			w.Header().Set("Content-Type", "application/xml")
+			_ = xml.NewEncoder(w).Encode(result)
+			return
+		}
 		data, ok := g.Objects[r.URL.Path]
 		gate := g.Gate
 		if g.GateKey != "" && !strings.HasSuffix(r.URL.Path, "/"+g.GateKey) {
@@ -155,6 +176,7 @@ func NewSigner(t testing.TB, origin string) *Signer {
 
 // Job names a grant. Empty fields take defaults; Write "" makes it read-only.
 type Job struct {
+	TenantID     int64
 	JobID        string
 	RepositoryID int64
 	Read         []string
@@ -184,7 +206,7 @@ func (signer *Signer) Grant(t testing.TB, job Job) string {
 	}
 	clock := grant.Clock{Earliest: job.Now, Latest: job.Now}
 	token, err := grant.Issue(signer.Key, signer.Origin, grant.Authorization{
-		RegionID: signer.Region, JobID: job.JobID, RunID: 12, RunAttempt: 1, RepositoryID: job.RepositoryID,
+		TenantID: job.TenantID, RegionID: signer.Region, JobID: job.JobID, RunID: 12, RunAttempt: 1, RepositoryID: job.RepositoryID,
 		ReadRefs: job.Read, WriteRef: job.Write, Deadline: job.Now.Add(job.Lifetime),
 	}, clock)
 	if err != nil {

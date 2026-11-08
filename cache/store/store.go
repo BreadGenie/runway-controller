@@ -23,13 +23,16 @@ import (
 	"github.com/BreadGenie/runway/cache/grant"
 )
 
-// Config bounds one service. Every field is required except StorageBudget.
+// Config bounds one service. Garage selects standalone mode; Buckets and
+// ManagedPrefix select managed mode. StorageBudget is optional.
 type Config struct {
 	PublicOrigin    string // fixed HTTPS origin; the grant audience
 	Verifier        *grant.Verifier
 	Clock           func(context.Context) (grant.Clock, error)
 	StateDir        string
 	Disk            DiskConfig
+	Buckets         BucketProvider // nil selects standalone storage
+	ManagedPrefix   string         // stable service-owned prefix: managed/<identifier>/
 	Garage          GarageConfig
 	StorageBudget   *StorageBudget // nil selects DefaultStorageBudget
 	QuotaBytes      int64          // per repository
@@ -63,7 +66,12 @@ func (config Config) validate() error {
 		config.TotalBytes < config.QuotaBytes || config.TotalBytes > maxTotalBytes {
 		return errors.New("invalid cache store configuration")
 	}
-	if err := config.Garage.validate(); err != nil {
+	if config.Buckets != nil {
+		part := strings.TrimSuffix(strings.TrimPrefix(config.ManagedPrefix, "managed/"), "/")
+		if strings.Trim(part, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" || part == "" || strings.ContainsAny(part, "/\\") || config.ManagedPrefix != "managed/"+part+"/" || len(part) > 128 {
+			return errors.New("invalid managed prefix")
+		}
+	} else if err := config.Garage.validate(); err != nil {
 		return err
 	}
 	if config.StorageBudget != nil {
@@ -141,7 +149,11 @@ func New(config Config) (*Server, error) {
 	if _, err := s.observe(context.Background()); err != nil {
 		return nil, errors.New("cache time observation unavailable")
 	}
-	s.store = newGarageStore(config.Garage, budget)
+	if config.Buckets != nil {
+		s.store = &garageStore{provider: config.Buckets, prefix: config.ManagedPrefix, budget: budget}
+	} else {
+		s.store = newGarageStore(config.Garage, budget)
+	}
 	pool, err := openSpoolPool(config.Disk.Directory, config.Disk.PhysicalBytes)
 	if err != nil {
 		s.store.close()
@@ -270,6 +282,14 @@ func (s *Server) authorize(r *http.Request, clock grant.Clock) (Scope, bool) {
 	// Canonical tuples prevent separator collisions and keep the stable numeric
 	// repository identity independent of mutable owner/repository names.
 	repository, _ := json.Marshal([]string{scopeTenant, claims.RegionID, strconv.FormatInt(claims.RepositoryID, 10)})
+	if claims.TenantID != 0 {
+		if s.config.Buckets == nil {
+			return Scope{}, false
+		}
+		repository, _ = json.Marshal([]string{"managed", strconv.FormatInt(claims.TenantID, 10), strconv.FormatInt(claims.RepositoryID, 10)})
+	} else if s.config.Buckets != nil {
+		return Scope{}, false
+	}
 	subject, _ := json.Marshal([]string{claims.JobID, strconv.FormatInt(claims.RequestID, 10), strconv.FormatInt(claims.RunID, 10), strconv.FormatInt(claims.RunAttempt, 10)})
 	return Scope{Subject: string(subject), Repository: string(repository), ReadRefs: claims.ReadRefs, WriteRef: claims.WriteRef, ExpiresAt: time.Unix(claims.ExpiresAt, 0)}, true
 }
@@ -529,7 +549,7 @@ func (s *Server) publish(ctx context.Context, e *entry, scope Scope) int {
 		return http.StatusUnauthorized
 	}
 	// Journal the object intent before the PUT so a crash leaves it deletable.
-	e.digest, e.objectKey = digest, s.namespace+strconv.FormatInt(e.id, 10)
+	e.digest, e.objectKey = digest, s.objectKey(e.repository, e.id)
 	persisted := s.persist() == nil
 	s.mu.Unlock()
 	if !persisted {
@@ -662,4 +682,21 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeContent(w, r, "cache", e.created, io.NewSectionReader(staged.file, 0, e.size))
+}
+
+func (s *Server) objectKey(repository string, id int64) string {
+	if s.config.Buckets != nil {
+		var parts []string
+		if json.Unmarshal([]byte(repository), &parts) != nil || len(parts) != 3 || parts[0] != "managed" {
+			return ""
+		}
+		tenant, err := strconv.ParseInt(parts[1], 10, 64)
+		repo, repoErr := strconv.ParseInt(parts[2], 10, 64)
+		canonical, _ := json.Marshal(parts)
+		if err != nil || repoErr != nil || tenant <= 0 || tenant > 4294967295 || repo <= 0 || parts[1] != strconv.FormatInt(tenant, 10) || parts[2] != strconv.FormatInt(repo, 10) || string(canonical) != repository {
+			return ""
+		}
+		return s.namespace + parts[1] + "/" + strconv.FormatInt(id, 10)
+	}
+	return s.namespace + strconv.FormatInt(id, 10)
 }

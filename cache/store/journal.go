@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -54,6 +53,9 @@ func ticketKey(token string) string {
 }
 
 func (s *Server) storage() diskStorage {
+	if s.config.Buckets != nil {
+		return diskStorage{Endpoint: "managed", Bucket: s.config.ManagedPrefix}
+	}
 	return diskStorage{Endpoint: s.config.Garage.Endpoint, Region: s.config.Garage.Region, Bucket: s.config.Garage.Bucket}
 }
 
@@ -86,6 +88,15 @@ func (s *Server) openState() error {
 func (s *Server) recover() error {
 	f, err := openStateFile(s.stateDir, "state.json", syscall.O_RDONLY)
 	if os.IsNotExist(err) {
+		if s.config.Buckets != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.budget.RecoveryMaxSeconds)*time.Second)
+			defer cancel()
+			if err := s.store.reset(ctx); err != nil {
+				return err
+			}
+			s.namespace = s.config.ManagedPrefix
+			return s.persist()
+		}
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
 			return err
@@ -100,14 +111,19 @@ func (s *Server) recover() error {
 	err = json.NewDecoder(io.LimitReader(f, 2<<20)).Decode(&d)
 	f.Close()
 	hexPart := strings.TrimSuffix(strings.TrimPrefix(d.Namespace, objectPrefix), "/")
-	if _, hexErr := hex.DecodeString(hexPart); err != nil || hexErr != nil || len(hexPart) != 32 || d.Namespace != objectPrefix+hexPart+"/" ||
+	_, hexErr := hex.DecodeString(hexPart)
+	validNamespace := hexErr == nil && len(hexPart) == 32 && d.Namespace == objectPrefix+hexPart+"/"
+	if s.config.Buckets != nil {
+		validNamespace = d.Namespace == s.config.ManagedPrefix
+	}
+	if err != nil || !validNamespace ||
 		d.Version != 1 || d.Storage != s.storage() || d.PublicOrigin != s.config.PublicOrigin || len(d.Entries) > maxEntries || len(d.Tickets) > maxTickets || d.NextID < 0 {
 		return errors.New("invalid cache state")
 	}
 	s.namespace, s.nextID = d.Namespace, d.NextID
 	objects, bytes := 0, int64(0)
 	for _, v := range d.Entries {
-		if v.ID <= 0 || v.ID > d.NextID || s.entries[v.ID] != nil || v.Size <= 0 || v.Size > s.config.MaxArchiveBytes || v.Repository == "" || v.Ref == "" || v.Subject == "" || !validKey(v.Key) || v.Version == "" || v.Created.IsZero() || v.Accessed.IsZero() || v.Object != "" && v.Object != fmt.Sprintf("%s%d", s.namespace, v.ID) || v.Published && v.Object == "" {
+		if s.objectKey(v.Repository, v.ID) == "" || v.ID <= 0 || v.ID > d.NextID || s.entries[v.ID] != nil || v.Size <= 0 || v.Size > s.config.MaxArchiveBytes || v.Repository == "" || v.Ref == "" || v.Subject == "" || !validKey(v.Key) || v.Version == "" || v.Created.IsZero() || v.Accessed.IsZero() || v.Object != "" && v.Object != s.objectKey(v.Repository, v.ID) || v.Published && v.Object == "" {
 			return errors.New("invalid cache entry")
 		}
 		// No upload resumes across a restart: unpublished entries stay hidden.

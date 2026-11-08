@@ -67,6 +67,14 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 		return config, store.Config{}, grant.ErrInvalid
 	}
 	for name, names := range cacheDataNestedFields {
+		if name == "garage" {
+			var garageFields map[string]json.RawMessage
+			if json.Unmarshal(fields[name], &garageFields) == nil {
+				if _, ok := garageFields["ca_pem"]; ok {
+					names = append(append([]string(nil), names...), "ca_pem")
+				}
+			}
+		}
 		if raw, ok := fields[name]; ok && readCacheObject(raw, names) != nil {
 			return config, store.Config{}, grant.ErrInvalid
 		}

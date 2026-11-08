@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -20,8 +22,10 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-// GarageConfig selects the loopback Garage S3 endpoint and its bucket-scoped key.
+// GarageConfig selects a pinned-CA HTTPS or literal-loopback HTTP S3 endpoint
+// and its bucket-scoped key. No ambient credentials or root CAs are used.
 type GarageConfig struct {
+	CAPEM     string `json:"ca_pem,omitempty"`
 	Endpoint  string `json:"endpoint"`
 	Region    string `json:"region"`
 	Bucket    string `json:"bucket"`
@@ -31,18 +35,31 @@ type GarageConfig struct {
 
 func (config GarageConfig) validate() error {
 	u, err := url.Parse(config.Endpoint)
-	if err != nil || u.Scheme != "http" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Path != "" && u.Path != "/" ||
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Path != "" && u.Path != "/" ||
 		config.Region == "" || config.Bucket == "" || strings.ContainsAny(config.Bucket, "/\\") || config.AccessKey == "" || config.SecretKey == "" {
 		return errors.New("invalid Garage configuration")
 	}
 	port, err := strconv.Atoi(u.Port())
-	if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() || err != nil || port < 1 || port > 65535 {
+	if u.Port() != "" && (err != nil || port < 1 || port > 65535) {
+		return errors.New("invalid Garage port")
+	}
+	if u.Scheme == "https" {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM([]byte(config.CAPEM)) {
+			return errors.New("invalid Garage CA")
+		}
+		return nil
+	}
+	if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() || u.Port() == "" || config.CAPEM != "" {
 		return errors.New("Garage must listen on loopback")
 	}
 	return nil
 }
 
 type garageStore struct {
+	provider  BucketProvider
+	prefix    string
+	budget    StorageBudget
 	client    *s3.Client
 	bucket    string
 	transport *http.Transport
@@ -53,6 +70,12 @@ func newGarageStore(config GarageConfig, budget StorageBudget) *garageStore {
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 5 * time.Second, MaxIdleConns: 4, IdleConnTimeout: 30 * time.Second,
+	}
+	if config.CAPEM != "" {
+		roots := x509.NewCertPool()
+		roots.AppendCertsFromPEM([]byte(config.CAPEM))
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+		transport.TLSHandshakeTimeout = 5 * time.Second
 	}
 	client := s3.New(s3.Options{
 		Region: config.Region, BaseEndpoint: aws.String(config.Endpoint), UsePathStyle: true,
@@ -68,10 +91,22 @@ func newGarageStore(config GarageConfig, budget StorageBudget) *garageStore {
 	return &garageStore{client: client, bucket: config.Bucket, transport: transport}
 }
 
-func (store *garageStore) close() { store.transport.CloseIdleConnections() }
+func (store *garageStore) close() {
+	if store.transport != nil {
+		store.transport.CloseIdleConnections()
+	}
+}
 
 // put uploads size bytes of file. The body is seekable so the SDK can sign it.
 func (store *garageStore) put(ctx context.Context, key string, file *os.File, size int64) error {
+	if store.provider != nil {
+		target, err := store.route(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer target.close()
+		return target.put(ctx, key, file, size)
+	}
 	body := &seekableContextReader{ctx: ctx, SectionReader: io.NewSectionReader(file, 0, size)}
 	_, err := store.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &store.bucket, Key: &key, Body: body, ContentLength: aws.Int64(size)})
 	return err
@@ -92,6 +127,14 @@ func (reader *seekableContextReader) Read(data []byte) (int, error) {
 // get writes the object into an unused spool while hashing it, and fails with
 // errArchiveIntegrity unless the length and digest match exactly.
 func (store *garageStore) get(ctx context.Context, key string, staged *spool, digest [32]byte) error {
+	if store.provider != nil {
+		target, err := store.route(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer target.close()
+		return target.get(ctx, key, staged, digest)
+	}
 	result, err := store.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &store.bucket, Key: &key})
 	if err != nil {
 		return err
@@ -114,6 +157,14 @@ func (store *garageStore) get(ctx context.Context, key string, staged *spool, di
 }
 
 func (store *garageStore) delete(ctx context.Context, key string) error {
+	if store.provider != nil {
+		target, err := store.route(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer target.close()
+		return target.delete(ctx, key)
+	}
 	_, err := store.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &store.bucket, Key: &key})
 	return err
 }

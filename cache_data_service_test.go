@@ -118,6 +118,7 @@ func TestCacheDataServiceConfigurationIsFiniteAndStrict(t *testing.T) {
 		"missing":           strings.Replace(string(encoded), `"version":1,`, "", 1),
 		"null":              strings.Replace(string(encoded), `"version":1`, `"version":null`, 1),
 		"token mode":        strings.Replace(string(encoded), `"version":1`, `"version":1,"tokens":{"fixture":{}}`, 1),
+		"skip verify":       strings.Replace(string(encoded), `"bucket":`, `"insecure_skip_verify":true,"bucket":`, 1),
 		"unknown nested":    strings.Replace(string(encoded), `"bucket":`, `"admin_token":"secret","bucket":`, 1),
 		"duplicate nested":  strings.Replace(string(encoded), `"bucket":`, `"bucket":"other","bucket":`, 1),
 		"lifetime":          strings.Replace(string(encoded), `"version":1`, `"version":1,"lifetime_seconds":60`, 1),
