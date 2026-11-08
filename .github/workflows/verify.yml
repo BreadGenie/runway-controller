@@ -28,6 +28,8 @@ jobs:
           python3 -m unittest discover -s guest -p '*_test.py'
           python3 -m unittest discover -s examples -p '*_test.py'
           python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s integrations/actions-cache
+          python3 -m unittest discover -s integrations/actions-runner
       - name: Shell checks
         run: |
           for script in guest/*.sh scripts/*.sh; do

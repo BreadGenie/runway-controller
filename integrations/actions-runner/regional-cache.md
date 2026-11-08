@@ -78,3 +78,39 @@ launch cleanup stop the unit, unmount `vsock/`, then remove the jail with
 home) and the root-owned `0711` jail base. It refuses installation while any
 binding file exists in `/run/runway-cache/bindings`; tear down guests first.
 Rollback requires restoring both the launcher and runway `.previous` binaries.
+
+
+The routing source of truth is `cmd/cache-node/allowlist.json`: repository,
+release, full commit, entrypoint and SHA256. setup-node's action.yml is
+harness-only. cache-node embeds the file; invalid data disables all regional
+routing without preventing Node execution. Non-candidates still perform no file I/O.
+
+The daily and manually dispatched `Cache allowlist` workflow tracks every major
+tag at or above the oldest pinned major, including newly published majors. It
+ignores releases without a major tag, retains every tested pin, resolves manifests
+and fetches bundles by full commit. It runs vet, race tests and every pinned relay
+scenario before opening an idempotent `bot/cache-allowlist-<versions>` PR. Failures
+appear in the run summary and produce no PR. Review and merge the PR, then rebuild
+and deploy the wrapper through the normal deployment process.
+
+Manual fallback from the repository root:
+
+```sh
+python3 -I integrations/actions-cache/update_allowlist.py --dry-run
+python3 -I integrations/actions-cache/update_allowlist.py --fetch-dir /tmp/runway-cache-clients
+RUNWAY_CACHE_VENDOR=/tmp/runway-cache-clients RUNWAY_CACHE_CLIENT_TEST=1 go test -race ./cache/transport -run TestPinnedClientsThroughRelay -v
+```
+
+The update command appends candidates; review its JSON diff and run all workflow
+checks before committing. `--fetch-dir` provisions hash-checked files into a
+chosen cache directory. Tests remain offline and use `RUNWAY_CACHE_VENDOR`, or
+the existing gitignored `.scratch/runway-regional-cache/vendor/` by default.
+Node, Yarn classic and zstd are required.
+
+Enable repository Settings → Actions → General → Workflow permissions →
+**Allow GitHub Actions to create and approve pull requests** for automated PRs.
+The workflow grants contents/write and pull-requests/write only to its update
+job and uses the automatic GITHUB_TOKEN; no additional secret is required.
+Organization policy must permit these permissions. PRs created with GITHUB_TOKEN
+do not trigger ordinary pull_request workflows; the bot runs its checks before
+creating the PR. Required external checks may need a human-triggered run.

@@ -1,0 +1,86 @@
+name: Cache allowlist
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cache-allowlist
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUNWAY_CACHE_VENDOR: ${{ runner.temp }}/cache-clients
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Resolve and provision immutable clients
+        id: resolve
+        run: python3 -I integrations/actions-cache/update_allowlist.py --fetch-dir "$RUNWAY_CACHE_VENDOR"
+      - name: Check for existing PR
+        if: steps.resolve.outputs.branch != ''
+        id: existing
+        env:
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          count=$(gh pr list --head "$BRANCH" --state open --json number --jq length)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Install client prerequisites
+        if: steps.resolve.outputs.branch != '' && steps.existing.outputs.count == '0'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          npm install --global yarn@1.22.22
+      - name: Verify candidates
+        if: steps.resolve.outputs.branch != '' && steps.existing.outputs.count == '0'
+        id: verify
+        env:
+          GH_TOKEN: ''
+        run: |
+          set -o pipefail
+          go vet ./...
+          go test -race ./...
+          python3 -m unittest discover -s integrations/actions-cache
+          python3 -m unittest discover -s integrations/actions-runner
+          RUNWAY_CACHE_CLIENT_TEST=1 go test -race ./cache/transport -run TestPinnedClientsThroughRelay -v | tee "$RUNNER_TEMP/client-results.txt"
+      - name: Report failed candidates
+        if: failure()
+        run: |
+          echo 'Candidate verification failed; no PR was created. See failed step logs for details.' >> "$GITHUB_STEP_SUMMARY"
+          if test -f "$RUNNER_TEMP/client-results.txt"; then
+            cat "$RUNNER_TEMP/client-results.txt" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Open verified allowlist PR
+        if: success() && steps.resolve.outputs.branch != '' && steps.existing.outputs.count == '0'
+        env:
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/pr-body.md"
+          printf '## Summary\n\n```text\nresolve major tags -> append immutable hashes -> verify relay scenarios -> review PR\n```\n\n' > "$body"
+          cat "$GITHUB_STEP_SUMMARY" >> "$body"
+          printf '\n## Evidence\n\nBefore: these major-tag targets were absent from the allowlist. After: candidate hashes pass the checks below.\n\nVerified with go vet, go test -race ./..., Python suites and pinned-client relay scenarios.\n\n' >> "$body"
+          cat "$RUNNER_TEMP/client-results.txt" >> "$body"
+          printf '\nWorkflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$body"
+          printf '\n## Merge Danger\n\n**Door:** two-way; revert added entries and rebuild the wrapper.\n\n**Blast Radius:** cache; newly pinned bundles become eligible for regional routing after deployment.\n' >> "$body"
+          git switch -C "$BRANCH"
+          git add cmd/cache-node/allowlist.json
+          git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "feat(cache): allowlist verified action releases"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$BRANCH"
+          gh pr create --base main --head "$BRANCH" --title "feat(cache): allowlist verified action releases" --body-file "$body"

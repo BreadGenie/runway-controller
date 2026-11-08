@@ -8,7 +8,7 @@ import signal
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
-VENDOR = ROOT / '.scratch/runway-regional-cache/vendor'
+VENDOR = Path(os.environ.get('RUNWAY_CACHE_VENDOR', ROOT / '.scratch/runway-regional-cache/vendor'))
 NODE_DEFAULT = shutil.which('node') or os.path.expanduser('~/.local/opt/node/bin/node')
 YARN_BIN = os.environ.get('YARN_BIN') or shutil.which('yarn') or ''
 
@@ -28,40 +28,21 @@ def pinned_version(kind, release, commit, hashes):
             "directory": prefix + "-" + commit[:8], "bundles": bundles}
 
 
-PINNED_VERSIONS = {
-    "cache": [
-        pinned_version("cache", "v4.3.0", "0057852bfaa89a56745cba8c7296529d2fc39830", {
-            "restore": "d7b9163d46eb2a31a2ba58c40fa8a8c342d19b9211676ca6a32809d298352475",
-            "save": "5274b49a495e746792cb5f50a6068f780eb5080b8510a9dbbd905e350d8d8f07",
-            "restore-only": "f740b8f77a9eeb0223d54b55e14df240e7ad6338e9648730d8e4551cf78ae172",
-            "save-only": "7f64677407a4befe523854fb28794faa4e2d344dfed5d6cd4887fa9ae5428b3f",
-        }),
-        pinned_version("cache", "v5.1.0", "caa296126883cff596d87d8935842f9db880ef25", {
-            "restore": "a49301428b4c5477522c00f6464566457ed327d64ae5f80f8c12e762fb2ea9a2",
-            "save": "b969065795aaf5c6d20ba158e910be5d353eefb02eb2785263eb32e13090c066",
-            "restore-only": "6255afaa3956351b8cfefc1e82f026b4db418a10678a8eaddf3d6c55f81744de",
-            "save-only": "7fb63f90f06ce6a10f39d40a113f99791bffdedad5394cdad5b4dfaa644559cb",
-        }),
-        pinned_version("cache", "v6.1.0", "55cc8345863c7cc4c66a329aec7e433d2d1c52a9", {
-            "restore": "79a05f72974c12e3796bf09c897fce453a855f5f4a4abc980be6f671c545954d",
-            "save": "9193aa9dbe5025f2bf39802ae241470af35c5e5737fd4bec6e1d6dbaad153bb4",
-            "restore-only": "8522c6be9a4650a3b1571f7222293f262cc4c4708fbe061d8ed04654d476cf16",
-            "save-only": "0d3cf341a79cdc0a8ce5a71103f46174e12cf4f98db46f15b8e604932eefd487",
-        }),
-    ],
-    "setup-node": [
-        pinned_version("setup-node", "v6.5.0", "249970729cb0ef3589644e2896645e5dc5ba9c38", {
-            "setup": "842178c4df5924b2a7061efec35f9d7c7e3c7d84f49bc561689786c5c6fb2720",
-            "cache-save": "b5876872e7ca73333940c70f4cc50be6cef4d6021e72612f577575a97df8701d",
-            "action.yml": "ad45f1922115116fb4706651d0a9262332bc4e4f11eb2021e09789dd1af18085",
-        }),
-        pinned_version("setup-node", "v7.1.0", "949feb2413d6458794dcd2491c4babbbce0c15c1", {
-            "setup": "61462d80fd9850ceb0fd072b80777ce297f537fb2ec2d7c8d87983e80ce7e4fa",
-            "cache-save": "207a598f869d4f64eeb5a3d9e1e847472bba56120b7b12c40f35900d53fd58e4",
-            "action.yml": "84cd55863dbadfb83ed786c0bb4336553c2f4ceb52e102fccec01848f1977387",
-        }),
-    ],
-}
+def load_versions():
+    import json
+    grouped = {}
+    for entry in json.loads((ROOT / "cmd/cache-node/allowlist.json").read_text()):
+        kind = entry["repo"].removeprefix("actions/")
+        key = (kind, entry["version"], entry["commit"])
+        name = "action.yml" if entry["harness_only"] else entry["path"].split("/")[1]
+        grouped.setdefault(key, {})[name] = entry["sha256"]
+    result = {}
+    for (kind, release, commit), hashes in grouped.items():
+        result.setdefault(kind, []).append(pinned_version(kind, release, commit, hashes))
+    return result
+
+
+PINNED_VERSIONS = load_versions()
 
 
 def client_cases():
