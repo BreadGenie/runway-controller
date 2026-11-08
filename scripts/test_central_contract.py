@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+import sys
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location(
     'central_contract', Path(__file__).resolve().parents[1] / 'integrations/central/contract_harness.py'
@@ -25,6 +27,40 @@ class CentralContractTests(unittest.TestCase):
     def update(self, lease, event='started', **fields):
         return contract.update(lease, {'pool': 'pool', 'owner_id': 'owner', 'fence': 1,
                                       'lease_id': lease['id'], 'event': event, **fields})
+
+    def test_pool_placement_rules_are_optional_and_require_an_array_of_objects(self):
+        namespace = {'frappe': SimpleNamespace(parse_json=json.loads, throw=contract.reject),
+                     '_': lambda value: value}
+        contract.load_functions('central/infrastructure/runway.py', ['pool_placement_rules'], namespace)
+        read = namespace['pool_placement_rules']
+        self.assertEqual(read({}), [])
+        rules = [{'resource': 'metal_server', 'operator': 'has', 'tags': {'lab': 'blr'}}]
+        self.assertEqual(read({'placement_rules': json.dumps(rules)}), rules)
+        for invalid in ('{}', 'null', '[1]', '["host"]'):
+            with self.subTest(invalid=invalid), self.assertRaises(contract.ContractError):
+                read({'placement_rules': invalid})
+
+    @unittest.skipIf(sys.version_info < (3, 14), 'pilot integration requires Python 3.14')
+    def test_runner_create_forwards_placement_without_changing_default(self):
+        sent = []
+        namespace = {'frappe': SimpleNamespace(db=SimpleNamespace(commit=lambda: None)),
+                     'pool_placement_rules': lambda pool: json.loads(pool.get('placement_rules') or '[]'),
+                     'client_for_pool': lambda pool: SimpleNamespace(
+                         create_vm=lambda payload: sent.append(payload.copy()) or {'id': 'vm'}),
+                     'save_internal': lambda lease: None,
+                     'AtlasRejected': RuntimeError, 'AtlasRequestUncertain': OSError,
+                     'AtlasConnectionError': ConnectionError}
+        contract.load_functions('central/integrations/runway.py', ['create_vm'], namespace)
+        pool = contract.Document(image_id='image', cpu_millicores=1000, memory_mib=1024,
+                                 disk_mib=4096, ssh_public_key='public', name='pool', team='team')
+        lease = contract.Document(runner_name='runner', name='lease', reload=lambda: None)
+        namespace['create_vm'](pool, lease)
+        self.assertNotIn('placement_rules', sent[-1])
+        rules = [{'resource': 'metal_server', 'operator': 'has', 'tags': {'lab': 'blr'}}]
+        pool.placement_rules = json.dumps(rules)
+        namespace['create_vm'](pool, lease)
+        self.assertEqual(sent[-1]['placement_rules'], rules)
+        self.assertEqual(lease.vm_id, 'vm')
 
     def test_runner_identity_storage_accepts_github_ids_above_signed_int32(self):
         schema = json.loads(contract.added_file(
