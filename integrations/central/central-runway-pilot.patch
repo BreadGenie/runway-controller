@@ -1366,7 +1366,7 @@ new file mode 100644
 index 0000000..550d62d
 --- /dev/null
 +++ b/central/runway.py
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,273 @@
 +"""Narrow regional cache authority. This credential is never a Central API key."""
 +
 +import secrets
@@ -1503,8 +1503,18 @@ index 0000000..550d62d
 +
 +
 +@frappe.whitelist(methods=["GET"])
-+def cache_bucket(team: str):
++def cache_bucket(team: str | None = None, tenant_id: str | None = None):
 +	region = cache_region()
++	# Managed cache-data knows the signed tenant, not Central's Team name.
++	if team is None and tenant_id is not None:
++		if not tenant_id.isdecimal() or not 0 < int(tenant_id) <= 4294967295:
++			return respond({"error": "not_found"}, 404)
++		teams = frappe.get_all("Team", filters={"tenant_id": int(tenant_id)}, pluck="name", limit=2)
++		if len(teams) != 1:
++			return respond({"error": "not_found"}, 404)
++		team = teams[0]
++	elif tenant_id is not None or team is None:
++		return respond({"error": "not_found"}, 404)
 +	if not frappe.db.exists("Team", team):
 +		return respond({"error": "not_found"}, 404)
 +	name = frappe.db.exists("Team Service", {**bucket_filters(team, region), "status": "Active"})

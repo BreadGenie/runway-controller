@@ -79,3 +79,9 @@ run the bench's Python with `-m frappe.utils.bench_helper frappe` from its `site
 directory. Reload the test-site DocTypes from that copy first; this avoids
 modifying the dirty pilot checkout. Use the vendored MariaDB 11.8.6 for the local
 bench data directory. The cache test module also inherits the pilot lease tests.
+
+Managed cache-data calls `cache_bucket?tenant_id=<signed tenant>` because grants
+carry the tenant identity rather than the Central Team name. The regional read
+credential may use either `team` or `tenant_id`, never both. The latter must map
+to exactly one Team; missing, invalid or ambiguous mappings fail closed with
+`{"error":"not_found"}`. Response keys are identical to the team lookup.
