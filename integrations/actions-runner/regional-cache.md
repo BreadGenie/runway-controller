@@ -8,10 +8,16 @@ no runner patch or Runner.Worker build is needed.
 
 Supported bundle identities:
 
-- actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830: restore, save,
-  restore-only and save-only dist/index.js bundles (main/post).
-- actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38: setup and
-  cache-save dist/index.js bundles (main/post).
+- actions/cache v4.3.0 (`0057852bfaa89a56745cba8c7296529d2fc39830`): restore, save,
+  restore-only and save-only bundles.
+- actions/cache v5.1.0 (`caa296126883cff596d87d8935842f9db880ef25`): restore, save,
+  restore-only and save-only bundles.
+- actions/cache v6.1.0 (`55cc8345863c7cc4c66a329aec7e433d2d1c52a9`): restore, save,
+  restore-only and save-only bundles.
+- actions/setup-node v6.5.0 (`249970729cb0ef3589644e2896645e5dc5ba9c38`): setup and
+  cache-save bundles.
+- actions/setup-node v7.1.0 (`949feb2413d6458794dcd2491c4babbbce0c15c1`): setup and
+  cache-save bundles.
 
 The manifests have no pre entrypoints. Routing requires both the matching
 _actions/actions directory and a pinned SHA256 of the script bytes. Mutable tags
@@ -37,9 +43,10 @@ A script under `_actions/actions/{cache,setup-node}/` that is not allowlisted
 (for example after a moved `@v4`/`@v6` tag) writes one line to its step log:
 `runway-cache: actions/NAME bundle sha256:PREFIX (FILE) is not on the
 regional-cache allowlist; this step uses GitHub's cache`. cache-host's `stopped`
-event records `setup_enabled`. Newer releases checked so far (cache v5.1.0 and
-v6.1.0, setup-node v7.1.0) still use cache protocol v1, so allowlisting one
-needs only its hashes and a passing pinned-client run.
+event records `setup_enabled`. All supported releases passed the offline pinned-client
+tests through the relay using cache protocol v1. setup-node v7.1.0 is tested
+with `ACTIONS_CACHE_MODE` unset, matching the runner environment. Future releases
+need their hashes and a passing pinned-client run before allowlisting.
 
 cache-relay forwards bounded connections to vsock 1027. Its 330-second idle
 limit covers large-save finalization. The installer stages the static wrapper,
