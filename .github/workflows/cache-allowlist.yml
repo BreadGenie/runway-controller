@@ -17,8 +17,10 @@ jobs:
       pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RUNWAY_CACHE_VENDOR: ${{ runner.temp }}/cache-clients
     steps:
+      # The runner context is not available in job-level env.
+      - name: Choose the client vendor directory
+        run: echo "RUNWAY_CACHE_VENDOR=$RUNNER_TEMP/cache-clients" >> "$GITHUB_ENV"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: main
