@@ -86,7 +86,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 		return rest.Client().Do(clone)
 	})}
 	f.setup = authority.setup
-	f.lease = cacheServiceLease{Lease: "e2e-lease", Team: "team-a", TenantID: 2, Region: "blr-1", Repository: fixtureRepository, VMID: "vm-7", MeshAddress: "fdaa:1:0:2::7", RunnerID: 219, RunnerName: authority.binding.RunnerName, Deadline: time.Now().Add(time.Hour), Job: &cacheServiceJob{JobID: authority.release.JobID, RunID: 41867135947, RunAttempt: 1, DisplayName: "Integration (mariadb, 1)", WorkflowRef: fixtureWorkflow, EventName: "workflow_dispatch"}}
+	f.lease = cacheServiceLease{Lease: "e2e-lease", Team: "team-a", TenantID: 2, Region: "blr-1", Repository: fixtureRepository, RepositoryID: 580439734, DefaultBranch: "develop", VMID: "vm-7", MeshAddress: "fdaa:1:0:2::7", RunnerID: 219, RunnerName: authority.binding.RunnerName, Deadline: time.Now().Add(time.Hour), Job: &cacheServiceJob{Verified: true, Ref: fixtureRef, SHA: fixtureSHA, JobID: authority.release.JobID, RunID: 41867135947, RunAttempt: 1, DisplayName: "Integration (mariadb, 1)", WorkflowRef: fixtureWorkflow, EventName: "workflow_dispatch"}}
 	// Offline S3 fake, explicitly not a Garage qualification. Separate listeners
 	// and buckets make accidental cross-team routing observable.
 	f.storage = map[int64]*managedS3{}
@@ -180,7 +180,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 	f.data.Restart(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, github: gh.client, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
+	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
 	f.guest = httptest.NewUnstartedServer(managedPeer(f.service, servicePeer))
 	f.guest.Config.IdleTimeout = 5 * time.Second
 	f.guest.StartTLS()
@@ -212,12 +212,22 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 		t.Fatal(err)
 	}
 	drainAssignment(t, engine)
+	deadline := time.Now().Add(5 * time.Second)
+	for !pilot.snapshot.Leases[0].Verified && time.Now().Before(deadline) {
+		if err := engine.verifyJobs(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	persisted := pilot.snapshot.Leases[0]
+	if !persisted.Verified {
+		t.Fatal("controller verification failed", persisted.VerifyReason)
+	}
 	if persisted.JobID != job.JobID || persisted.Started {
 		t.Fatal("controller failed to persist early assignment")
 	}
 	attempt, _ := strconv.ParseInt(persisted.RunAttempt, 10, 64)
-	f.lease.Job = &cacheServiceJob{JobID: persisted.JobID, RunID: job.WorkflowRunID, RunAttempt: attempt, DisplayName: persisted.JobDisplayName, WorkflowRef: persisted.JobWorkflowRef, EventName: persisted.EventName, Started: persisted.Started}
+	f.lease.Job = &cacheServiceJob{Verified: persisted.Verified, Ref: persisted.Ref, SHA: persisted.SHA, JobID: persisted.JobID, RunID: job.WorkflowRunID, RunAttempt: attempt, DisplayName: persisted.JobDisplayName, WorkflowRef: persisted.JobWorkflowRef, EventName: persisted.EventName, Started: persisted.Started}
 	return f
 }
 

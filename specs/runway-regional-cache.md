@@ -162,7 +162,6 @@ Configuration is a version-1 JSON object with exactly these required keys:
   "private_key_file": "/etc/runway/service.key",
   "signing_key_file": "/var/lib/runway-cache/signing.key",
   "cache_data_ca_file": "/etc/runway/cache-data-ca.crt",
-  "github_token_file": "/etc/runway/github-token",
   "central_url": "https://central.example.com",
   "central_token_file": "/etc/runway/central-region-token",
   "archive_bytes": 1073741824
@@ -235,10 +234,11 @@ never forwarding headers. The layout is `fdaa | region (16) | tenant (32) |
 padding (48) | VM (16)`; other prefixes, regions, IPv4 and tenant zero are
 refused. Central must return that exact address, tenant and configured region,
 an unexpired lease and job evidence. Missing, ambiguous, malformed or failed
-lookups disable setup. GitHub REST then confirms the runner's in-progress job,
-display name, run and attempt, followed by the existing repository, event,
-branch, SHA, same-repository head and workflow-ref checks. Renewal rechecks
-Central identity and GitHub job liveness. One enabled setup and nonce replay
+lookups disable setup. The controller confirms the runner's in-progress job,
+display name, run and attempt, repository, event, branch, SHA, same-repository
+head and workflow ref using GitHub REST. Setup requires verified lease fields
+to match the guest context. Renewal rechecks the same active verified lease
+and job in Central. One enabled setup and nonce replay
 fences remain per lease until its deadline; requests and live session counts
 are bounded. A service restart clears in-memory setup fences, as standalone
 host restart does. Setup work shares the existing 2.5-second budget.
@@ -317,3 +317,5 @@ credential cache); errors refuse requests. Downloads still require their
 short-lived journaled ticket and a successful tenant-routed storage read.
 Central provisioning, Atlas deployment and the guest TLS relay remain separate
 issues; no live regional deployment is qualified here.
+
+Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Central, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.

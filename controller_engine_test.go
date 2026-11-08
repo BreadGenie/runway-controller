@@ -77,6 +77,13 @@ func (s *memoryPilotStore) Update(_ context.Context, id, event string, fields le
 		if l.Phase == "deleted" || l.Phase == "deleting" {
 			return pilotLease{}, errors.New("retiring lease")
 		}
+	case "verified":
+		l.Verified = fields.Verified
+		l.VerifyReason = fields.VerifyReason
+		l.Ref = fields.Ref
+		l.SHA = fields.SHA
+		l.RepositoryID = fields.RepositoryID
+		l.DefaultBranch = fields.DefaultBranch
 	case "acquired":
 		if l.RequestID <= 0 || (l.AcquireState != "pending" && l.AcquireState != "acquired") {
 			return pilotLease{}, errors.New("missing acquisition intent")

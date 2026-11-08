@@ -17,6 +17,9 @@ import (
 )
 
 type cacheServiceJob struct {
+	Ref         string `json:"ref"`
+	SHA         string `json:"sha"`
+	Verified    bool   `json:"verified"`
 	JobID       string `json:"job_id"`
 	RequestID   int64  `json:"request_id"`
 	RunID       int64  `json:"run_id"`
@@ -27,17 +30,19 @@ type cacheServiceJob struct {
 	Started     bool   `json:"started"`
 }
 type cacheServiceLease struct {
-	Lease       string           `json:"lease"`
-	Team        string           `json:"team"`
-	TenantID    uint32           `json:"tenant_id"`
-	Region      string           `json:"region"`
-	Repository  string           `json:"repository"`
-	VMID        string           `json:"vm_id"`
-	MeshAddress string           `json:"mesh_address"`
-	RunnerID    int64            `json:"runner_id"`
-	RunnerName  string           `json:"runner_name"`
-	Job         *cacheServiceJob `json:"job"`
-	Deadline    time.Time        `json:"deadline"`
+	RepositoryID  int64            `json:"repository_id"`
+	DefaultBranch string           `json:"default_branch"`
+	Lease         string           `json:"lease"`
+	Team          string           `json:"team"`
+	TenantID      uint32           `json:"tenant_id"`
+	Region        string           `json:"region"`
+	Repository    string           `json:"repository"`
+	VMID          string           `json:"vm_id"`
+	MeshAddress   string           `json:"mesh_address"`
+	RunnerID      int64            `json:"runner_id"`
+	RunnerName    string           `json:"runner_name"`
+	Job           *cacheServiceJob `json:"job"`
+	Deadline      time.Time        `json:"deadline"`
 }
 
 type cacheCentral interface {
@@ -101,7 +106,7 @@ func (central cacheCentralHTTPS) lease(ctx context.Context, address netip.Addr) 
 		fields["job"] = json.RawMessage(`{}`)
 	}
 	normalized, _ := json.Marshal(fields)
-	if readCacheObject(normalized, []string{"lease", "team", "tenant_id", "region", "repository", "vm_id", "mesh_address", "runner_id", "runner_name", "job", "deadline"}) != nil {
+	if readCacheObject(normalized, []string{"lease", "team", "tenant_id", "region", "repository", "repository_id", "default_branch", "vm_id", "mesh_address", "runner_id", "runner_name", "job", "deadline"}) != nil {
 		return lease, grant.ErrInvalid
 	}
 	// A token decoder handles arbitrary whitespace around nullable job values.
@@ -113,7 +118,7 @@ func (central cacheCentralHTTPS) lease(ctx context.Context, address netip.Addr) 
 	}
 	if string(job) == "null" {
 		lease.Job = nil
-	} else if readCacheObject(job, []string{"job_id", "request_id", "run_id", "run_attempt", "display_name", "workflow_ref", "event_name", "started"}) != nil {
+	} else if readCacheObject(job, []string{"job_id", "request_id", "run_id", "run_attempt", "display_name", "workflow_ref", "event_name", "started", "ref", "sha", "verified"}) != nil {
 		return lease, grant.ErrInvalid
 	}
 	return lease, nil
@@ -175,39 +180,34 @@ func cacheLeaseExact(data []byte) error {
 }
 
 type cacheServiceAuthority struct {
-	github  githubCacheJobAuthority
-	central cacheCentral
-	address netip.Addr
-	lease   cacheServiceLease
+	regionID string
+	central  cacheCentral
+	address  netip.Addr
+	lease    cacheServiceLease
 }
 
 func (a *cacheServiceAuthority) resolve(ctx context.Context, b cacheGuestBinding, _ int64) (cacheJobRelease, error) {
 	j := a.lease.Job
-	if j == nil {
+	if j == nil || !j.Verified {
 		return cacheJobRelease{}, errCacheJobNotFound
 	}
-	// The scale-set messages carry no run attempt, so a lease may not know it (0);
-	// GitHub REST then supplies the run's current attempt. A known one must agree.
-	attempt := j.RunAttempt
-	confirmed, job, err := a.github.confirmREST(ctx, b, j.RunID, &attempt)
-	if err != nil {
-		return cacheJobRelease{}, err
-	}
-	if job.Name != j.DisplayName || (j.RunAttempt != 0 && attempt != j.RunAttempt) {
-		return cacheJobRelease{}, errCacheJobMismatch
-	}
-	confirmed.WorkflowRef = j.WorkflowRef
-	return cacheJobRelease{JobID: j.JobID, RequestID: j.RequestID, Stop: b.ExpiresAt, Confirmed: &confirmed}, nil
+	return cacheJobRelease{JobID: j.JobID, RequestID: j.RequestID, Stop: b.ExpiresAt, Confirmed: &cacheJobConfirmation{RunID: j.RunID, RunAttempt: j.RunAttempt, WorkflowRef: j.WorkflowRef, Source: "controller_verified"}}, nil
 }
 func (a *cacheServiceAuthority) authorize(ctx context.Context, b cacheGuestBinding, r cacheJobRelease, s grant.SetupRequest) (cacheJobGrant, error) {
 	current, err := a.central.lease(ctx, a.address)
-	if err != nil || !cacheSameLease(current, a.lease) || !time.Now().Before(current.Deadline) {
+	if err != nil || !cacheSameLease(current, a.lease) || !time.Now().Before(current.Deadline) || current.Job == nil || !current.Job.Verified {
 		return cacheJobGrant{}, errCacheJobMismatch
 	}
-	if s.Context.EventName == nil || *s.Context.EventName != a.lease.Job.EventName {
-		return cacheJobGrant{}, errCacheJobMismatch
+	j, c := current.Job, s.Context
+	for _, pair := range []struct {
+		got  *string
+		want string
+	}{{c.Repository, current.Repository}, {c.RunID, strconv.FormatInt(j.RunID, 10)}, {c.RunAttempt, strconv.FormatInt(j.RunAttempt, 10)}, {c.Ref, j.Ref}, {c.SHA, j.SHA}, {c.EventName, j.EventName}, {c.RefType, "branch"}, {c.BaseRef, ""}, {c.HeadRef, ""}} {
+		if pair.got == nil || *pair.got != pair.want {
+			return cacheJobGrant{}, errCacheJobMismatch
+		}
 	}
-	return a.github.authorize(ctx, b, r, s)
+	return cacheJobGrant{Authorization: grant.Authorization{TenantID: int64(b.TenantID), RegionID: a.regionID, JobID: j.JobID, RequestID: j.RequestID, RunID: j.RunID, RunAttempt: j.RunAttempt, Deadline: current.Deadline}, Policy: grant.RepositoryPolicy{Repository: current.Repository, RepositoryID: current.RepositoryID, DefaultBranch: current.DefaultBranch}}, nil
 }
 func cacheSameLease(a, b cacheServiceLease) bool {
 	if a.Job == nil || b.Job == nil {
@@ -220,14 +220,3 @@ func cacheSameLease(a, b cacheServiceLease) bool {
 	b.Job = nil
 	return a == b && aj == bj
 }
-
-// Service confirmations always use REST, including renewal; no assignment files.
-type cacheNoAssignments struct{}
-
-func (cacheNoAssignments) assignment(int64) (cacheAssignment, error) {
-	return cacheAssignment{}, errCacheJobNotFound
-}
-func (cacheNoAssignments) job(string) (cacheJobRecord, error) {
-	return cacheJobRecord{}, errCacheJobNotFound
-}
-func (cacheNoAssignments) jobs(int64) ([]cacheJobRecord, error) { return nil, errCacheJobNotFound }

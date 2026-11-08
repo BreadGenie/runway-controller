@@ -21,8 +21,7 @@ const servicePeer = "[fdaa:1:0:2::7]:1234"
 func serviceFixture(t *testing.T, edit func(*cacheServiceLease), status int, stall bool) (*cacheService, *authorityCase) {
 	t.Helper()
 	test := newAuthorityCase(t)
-	gh, _ := test.authority(t)
-	lease := cacheServiceLease{Lease: "lease-1", Team: "team", TenantID: 2, Region: "blr-1", Repository: fixtureRepository, VMID: "vm-7", MeshAddress: "fdaa:1:0:2::7", RunnerID: 219, RunnerName: test.binding.RunnerName, Deadline: time.Now().Add(time.Hour), Job: &cacheServiceJob{JobID: test.release.JobID, RunID: 41867135947, RunAttempt: 1, DisplayName: "Integration (mariadb, 1)", WorkflowRef: fixtureWorkflow, EventName: "workflow_dispatch"}}
+	lease := cacheServiceLease{Lease: "lease-1", Team: "team", TenantID: 2, Region: "blr-1", Repository: fixtureRepository, RepositoryID: 580439734, DefaultBranch: "develop", VMID: "vm-7", MeshAddress: "fdaa:1:0:2::7", RunnerID: 219, RunnerName: test.binding.RunnerName, Deadline: time.Now().Add(time.Hour), Job: &cacheServiceJob{Verified: true, Ref: fixtureRef, SHA: fixtureSHA, JobID: test.release.JobID, RunID: 41867135947, RunAttempt: 1, DisplayName: "Integration (mariadb, 1)", WorkflowRef: fixtureWorkflow, EventName: "workflow_dispatch"}}
 	if edit != nil {
 		edit(&lease)
 	}
@@ -50,7 +49,7 @@ func serviceFixture(t *testing.T, edit func(*cacheServiceLease), status int, sta
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	s := &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: cacheCentralHTTPS{origin: central.URL, token: "region-secret", client: central.Client()}, github: gh.client, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: data.URL, archiveBytes: 1 << 20, log: func(map[string]any) {}, clock: func(context.Context) (grant.Clock, error) {
+	s := &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: cacheCentralHTTPS{origin: central.URL, token: "region-secret", client: central.Client()}, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: data.URL, archiveBytes: 1 << 20, log: func(map[string]any) {}, clock: func(context.Context) (grant.Clock, error) {
 		now := time.Now()
 		return grant.Clock{Earliest: now, Latest: now}, nil
 	}}}
@@ -108,11 +107,11 @@ func TestCacheServiceAttributionAndFallback(t *testing.T) {
 	}
 }
 
-// The controller's scale-set messages carry no run attempt: REST supplies it.
+// Only the controller can fill an unknown run attempt.
 func TestCacheServiceUnknownRunAttempt(t *testing.T) {
 	s, test := serviceFixture(t, func(l *cacheServiceLease) { l.Job.RunAttempt = 0 }, 200, false)
-	if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
-		t.Fatal("unknown attempt not resolved by REST", got)
+	if got := serviceSetup(t, s, test.setup, servicePeer); got != "disabled" {
+		t.Fatal("unknown attempt enabled", got)
 	}
 	s, test = serviceFixture(t, func(l *cacheServiceLease) { l.Job.RunAttempt = 2 }, 200, false)
 	if got := serviceSetup(t, s, test.setup, servicePeer); got != "disabled" {
@@ -200,7 +199,7 @@ func TestCacheCentralRejectsContractMutations(t *testing.T) {
 }
 
 func TestCacheServiceConfig(t *testing.T) {
-	c := cacheServiceConfig{OperatorListen: "[fdaa:1::10]:8445", CentralIssuer: "central", CentralJWKSURL: "https://central.example/api/method/central.api.jwks.get_jwks", CentralRegionID: 1, Version: 1, RegionID: "blr-1", MeshRegionID: 1, Listen: "[fdaa:1::10]:8443", Audience: "https://cache.example", CertificateFile: "/etc/cache.crt", PrivateKeyFile: "/etc/cache.key", SigningKeyFile: "/var/lib/cache/signing.key", CacheDataCAFile: "/etc/cache-ca.crt", GitHubTokenFile: "/etc/github", CentralURL: "https://central.example", CentralTokenFile: "/etc/central", ArchiveBytes: 1 << 30}
+	c := cacheServiceConfig{OperatorListen: "[fdaa:1::10]:8445", CentralIssuer: "central", CentralJWKSURL: "https://central.example/api/method/central.api.jwks.get_jwks", CentralRegionID: 1, Version: 1, RegionID: "blr-1", MeshRegionID: 1, Listen: "[fdaa:1::10]:8443", Audience: "https://cache.example", CertificateFile: "/etc/cache.crt", PrivateKeyFile: "/etc/cache.key", SigningKeyFile: "/var/lib/cache/signing.key", CacheDataCAFile: "/etc/cache-ca.crt", CentralURL: "https://central.example", CentralTokenFile: "/etc/central", ArchiveBytes: 1 << 30}
 	data, _ := json.Marshal(c)
 	if _, err := decodeCacheServiceConfig(data); err != nil {
 		t.Fatal(err)
@@ -230,7 +229,7 @@ func TestCacheServiceConfig(t *testing.T) {
 		}
 	}
 }
-func TestCacheServiceRenewalRechecksGitHub(t *testing.T) {
+func TestCacheServiceRenewalRequiresVerifiedLease(t *testing.T) {
 	s, test := serviceFixture(t, nil, 200, false)
 	if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
 		t.Fatal(got)
@@ -238,21 +237,69 @@ func TestCacheServiceRenewalRechecksGitHub(t *testing.T) {
 	host := s.sessions["fdaa:1:0:2::7"]
 	host.mu.Lock()
 	release := *host.release
-	confirmation := *release.Confirmed
 	host.mu.Unlock()
-	confirmation.ConfirmedAt = time.Now().Add(-cacheConfirmationFresh - time.Second)
-	release.Confirmed = &confirmation
 	a := host.authority.(*cacheServiceAuthority)
-	github := s.github.Transport.(*githubFixture)
-	github.mu.Lock()
-	for path, bodies := range github.responses {
-		if strings.Contains(path, "/actions/jobs/") {
-			github.responses[path] = [][]byte{bytes.ReplaceAll(bodies[0], []byte(`"status":"in_progress"`), []byte(`"status":"completed"`))}
-		}
-	}
-	github.mu.Unlock()
+	a.lease.Job.Verified = false
 	binding, _ := host.authenticateService()
 	if _, err := a.authorize(t.Context(), binding, release, test.setup); err == nil {
 		t.Fatal("completed job renewed")
+	}
+}
+
+func TestCacheServiceVerifiedContext(t *testing.T) {
+	for _, field := range []string{"unverified", "repository", "run_id", "run_attempt", "ref", "sha", "event_name", "ref_type", "base_ref", "head_ref"} {
+		t.Run(field, func(t *testing.T) {
+			s, a := serviceFixture(t, func(l *cacheServiceLease) {
+				if field == "unverified" {
+					l.Job.Verified = false
+				}
+			}, 200, false)
+			c := &a.setup.Context
+			for name, p := range map[string]**string{"repository": &c.Repository, "run_id": &c.RunID, "run_attempt": &c.RunAttempt, "ref": &c.Ref, "sha": &c.SHA, "event_name": &c.EventName, "ref_type": &c.RefType, "base_ref": &c.BaseRef, "head_ref": &c.HeadRef} {
+				if name == field {
+					bad := "mismatch"
+					*p = &bad
+				}
+			}
+			if got := serviceSetup(t, s, a.setup, servicePeer); got != "disabled" {
+				t.Fatal("context mismatch enabled", got)
+			}
+		})
+	}
+}
+
+type changedCacheCentral struct{ leaseValue cacheServiceLease }
+
+func (c changedCacheCentral) lease(context.Context, netip.Addr) (cacheServiceLease, error) {
+	return c.leaseValue, nil
+}
+func TestCacheServiceRenewalChecksCentral(t *testing.T) {
+	for _, field := range []string{"lease", "job", "ended", "unverified"} {
+		t.Run(field, func(t *testing.T) {
+			s, test := serviceFixture(t, nil, 200, false)
+			if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
+				t.Fatal(got)
+			}
+			host := s.sessions["fdaa:1:0:2::7"]
+			a := host.authority.(*cacheServiceAuthority)
+			current := a.lease
+			j := *current.Job
+			current.Job = &j
+			switch field {
+			case "lease":
+				current.Lease = "other"
+			case "job":
+				current.Job.RunID++
+			case "ended":
+				current.Deadline = time.Now().Add(-time.Second)
+			case "unverified":
+				current.Job.Verified = false
+			}
+			a.central = changedCacheCentral{current}
+			binding, _ := host.authenticateService()
+			if _, err := a.authorize(t.Context(), binding, *host.release, test.setup); err == nil {
+				t.Fatal("changed Central lease renewed")
+			}
+		})
 	}
 }

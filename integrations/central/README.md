@@ -85,3 +85,5 @@ carry the tenant identity rather than the Central Team name. The regional read
 credential may use either `team` or `tenant_id`, never both. The latter must map
 to exactly one Team; missing, invalid or ambiguous mappings fail closed with
 `{"error":"not_found"}`. Response keys are identical to the team lookup.
+
+Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Central, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.
