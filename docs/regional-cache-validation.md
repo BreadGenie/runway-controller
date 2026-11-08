@@ -21,4 +21,5 @@ Wrapper changes require Go wrapper and wire-v2 tests. The guest runner is stock.
 Live qualification must preserve the journal, demonstrate warm hits
 with two confirmed scale-set-39 jobs, and refuse forged runs, sibling UUIDs,
 unbound guests and tag-as-branch claims. Tear down test guests and runners.
-Repeated matched performance qualification and a standalone jailer remain open.
+Standalone guests run under the Firecracker jailer (qualified on blr-1, 2026-11-08). Repeated matched performance
+qualification remains open.
