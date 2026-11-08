@@ -4,15 +4,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -232,12 +237,138 @@ func exchange(conn connection, deadline time.Time, getenv func(string) string) b
 	return len(fields) == 4 && fields["version"] == float64(2) && fields["nonce"] == nonce && fields["outcome"] == "enabled" && fields["route"] == route
 }
 
+const configPath = "/etc/runway/cache.json"
+
+type serviceConfig struct {
+	Version int    `json:"version"`
+	Mode    string `json:"mode"`
+	Service string `json:"service"`
+	CAFile  string `json:"ca_file"`
+}
+
+func readServiceConfig(path string) (*serviceConfig, error) {
+	data, err := trustedFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodeServiceConfig(data)
+}
+
+func decodeServiceConfig(data []byte) (*serviceConfig, error) {
+	var c serviceConfig
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if d.Decode(&c) != nil || d.Decode(new(any)) != io.EOF || c.Version != 1 {
+		return nil, fmt.Errorf("invalid cache config")
+	}
+	if c.Mode == "vsock" && c.Service == "" && c.CAFile == "" {
+		return nil, nil
+	}
+	if c.Mode != "service" || !regexp.MustCompile(`^internal-[a-z0-9][a-z0-9.-]*:[0-9]+$`).MatchString(c.Service) || c.CAFile != "/etc/runway/cache-ca.pem" {
+		return nil, fmt.Errorf("invalid cache service")
+	}
+	_, port, err := net.SplitHostPort(c.Service)
+	if err != nil {
+		return nil, err
+	}
+	if p, err := net.LookupPort("tcp", port); err != nil || p < 1 {
+		return nil, fmt.Errorf("invalid port")
+	}
+	return &c, nil
+}
+
+func trustedFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0022 != 0 || info.Size() > 1<<20 {
+		return nil, fmt.Errorf("unsafe cache file")
+	}
+	return io.ReadAll(io.LimitReader(f, 1<<20))
+}
+
+// HTTP adapts the unchanged newline-delimited setup wire to POST /setup.
+type serviceExchange struct {
+	client   *http.Client
+	ctx      context.Context
+	url      string
+	payload  bytes.Buffer
+	response io.ReadCloser
+}
+
+func (c *serviceExchange) SetDeadline(time.Time) error { return nil }
+func (c *serviceExchange) Write(p []byte) (int, error) { return c.payload.Write(p) }
+func (c *serviceExchange) Read(p []byte) (int, error) {
+	if c.response == nil {
+		req, err := http.NewRequestWithContext(c.ctx, "POST", c.url, &c.payload)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		res, err := c.client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		c.response = res.Body
+		if res.StatusCode != http.StatusOK {
+			return 0, fmt.Errorf("setup refused")
+		}
+	}
+	return c.response.Read(p)
+}
+func setupService(c *serviceConfig, deadline time.Time, getenv func(string) string) bool {
+	ca, err := trustedFile(c.CAFile)
+	if err != nil {
+		return false
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return false
+	}
+	return setupServiceWithRoots(c, roots, deadline, getenv)
+}
+
+func setupServiceWithRoots(c *serviceConfig, roots *x509.CertPool, deadline time.Time, getenv func(string) string) bool {
+	host, _, err := net.SplitHostPort(c.Service)
+	if err != nil {
+		return false
+	}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: host, MinVersion: tls.VersionTLS12}, DialContext: (&net.Dialer{Timeout: time.Second}).DialContext, TLSHandshakeTimeout: time.Second}
+	defer transport.CloseIdleConnections()
+	ctx, cancel := context.WithDeadline(context.Background(), minDeadline(deadline, time.Now().Add(3*time.Second)))
+	defer cancel()
+	cex := &serviceExchange{client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, ctx: ctx, url: "https://" + c.Service + "/setup"}
+	defer func() {
+		if cex.response != nil {
+			cex.response.Close()
+		}
+	}()
+	return exchange(cex, deadline, getenv)
+}
+
 func setup(deadline time.Time) bool {
 	probe, err := net.DialTimeout("tcp", "127.0.0.1:18080", min(200*time.Millisecond, time.Until(deadline)))
 	if err != nil {
 		return false
 	}
 	probe.Close()
+	c, err := readServiceConfig(configPath)
+	if err != nil {
+		return false
+	}
+	if c != nil {
+		return setupService(c, deadline, os.Getenv)
+	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return false

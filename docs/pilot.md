@@ -89,6 +89,35 @@ Leave `owner_id` unset so each process gets a fresh identity. Only one process o
 
 After `controller_listening`, dispatch a trusted workflow using the dedicated `runs-on` label. Start with the [Docker smoke workflow](../examples/smoke-workflow.yml). Inspect Central's Runner Lease, the GitHub run, controller health output, and collected diagnostics. GitHub remains the authority for job success; a stopped guest service does not prove success.
 
+### Regional cache during prepare
+
+Build the current controller release's wrapper with
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /srv/runway/cache-node ./cmd/cache-node`.
+Append these arguments to the controller's `transport_command`:
+
+```json
+"--regional-cache", "internal-cache:443",
+"--regional-cache-ca", "/srv/runway/private/cache-ca.pem",
+"--regional-cache-node", "/srv/runway/cache-node"
+```
+
+The CA PEM and wrapper paths are on the controller. The transport sends these
+files and its matching relay/systemd unit through the existing JSON-over-SSH
+stdin channel via Metal, only on `prepare`. Deploy the repository files together
+with the wrapper. No service credential or storage key reaches the guest.
+The service must resolve by its mesh `internal-` name, present a certificate for
+that name signed by the pinned CA, and expose setup and translator routes on
+that one TLS port.
+
+This is off by default and applies only to an unregistered fresh clone reporting
+`installed`. Preparation replaces externals node20/node24 while preserving
+`node.real`, installs the relay unit, writes root-owned `/etc/runway/cache.json`
+and `/etc/runway/cache-ca.pem`, and starts the relay. Failed installation restores
+prior cache files/service state and returns `unknown`; the controller requests no
+JIT. Repeated preparation is safe. Later setup/network failures use GitHub's
+cache and persist that decision for the job. See the [integration guide](../integrations/actions-runner/regional-cache.md)
+for the config schema, budgets and standalone mode.
+
 ### Sudo compatibility for trusted workflows
 
 Some trusted GitHub Actions workflows expect a passwordless `sudo`. Preparation can grant it to the guest's `runner` account, but only when an operator asks for it. Append `--allow-guest-sudo` to `transport_command`:
