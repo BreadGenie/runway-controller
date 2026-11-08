@@ -264,7 +264,9 @@ json.dump({"runner_id": d["runner_id"], "runner_name": d["runner_name"], "reposi
 	# Binding: only root writes it, in a root-only directory, atomically.
 	local pid
 	pid=$(systemctl show -p MainPID --value "runway-guest-$vm.service")
-	[ "$(readlink "/proc/$pid/exe")" = "$jail/firecracker" ] || die "Firecracker PID not found"
+	# After pivot_root, readlink of /proc/PID/exe names the path inside the jail,
+	# so identify the process by its root directory and executable digest instead.
+	[ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$(stat -Lc %d:%i "/proc/$pid/root")" = "$(stat -Lc %d:%i "$jail")" ] || die "Firecracker PID not found in its jail"
 	[ "$(sha256sum "/proc/$pid/exe" | cut -c1-64)" = "$(sha256sum /usr/bin/firecracker | cut -c1-64)" ] || die "Firecracker binary digest mismatch"
 	python3 -I - "$work" "$vm" "$socket_dir/v.sock" "$pid" "$RUNWAY_REPOSITORY" "$hours" "$run_root/bindings" "$jail_uid" "$jail_gid" <<'PY'
 import datetime, json, os, sys
@@ -314,11 +316,15 @@ teardown() {
 	rm -f "$run_root/bindings/$vm.json" "$run_root/bindings/$vm.json.tmp"
 	systemctl stop "runway-guest-$vm.service" 2>/dev/null || true
 	systemctl reset-failed "runway-guest-$vm.service" 2>/dev/null || true
-	local jail=$jail_base/firecracker/$vm/root
-	if mountpoint -q "$jail/vsock"; then
-		umount "$jail/vsock" || return 1
+	local jail=$jail_base/firecracker/$vm/root failed=0
+	# Never remove the jail through a live bind mount: it would delete cache-host's
+	# sockets. Keep cleaning up everything else, and report the failure at the end.
+	if mountpoint -q "$jail/vsock" && ! umount "$jail/vsock"; then
+		echo "warning: $jail/vsock still mounted; leaving the jail for reap" >&2
+		failed=1
+	else
+		rm -rf --one-file-system "$jail_base/firecracker/$vm" || failed=1
 	fi
-	rm -rf --one-file-system "$jail_base/firecracker/$vm" || return 1
 	if [ -f "$work/runner.json" ] && [ -s "$token_file" ]; then
 		local id repository status
 		read -r id repository < <(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["runner_id"], d["repository"])' "$work/runner.json")
@@ -328,13 +334,15 @@ teardown() {
 	fi
 	systemctl stop "runway-cache-host@$vm.service" 2>/dev/null || true
 	systemctl reset-failed "runway-cache-host@$vm.service" 2>/dev/null || true
-	if mountpoint -q "$work/root" 2>/dev/null; then umount "$work/root" || return 1; fi
+	if mountpoint -q "$work/root" 2>/dev/null; then umount "$work/root" || failed=1; fi
 	ip netns del "$ns" 2>/dev/null || true
 	[ -n "$index" ] && ip link del "rsg${index}h" 2>/dev/null || true
 	sleep 1
 	if zfs list -H "$zv" >/dev/null 2>&1; then zfs destroy "$zv" || { sleep 3; zfs destroy "$zv"; }; fi
-	rm -rf "$work" "$run_root/vms/$vm"
-	echo "{\"vm_id\":\"$vm\",\"torn_down\":true}"
+	# A still-mounted work root or jail keeps its directories for reap to retry.
+	if [ "$failed" = 0 ]; then rm -rf --one-file-system "$work" "$run_root/vms/$vm"; fi
+	echo "{\"vm_id\":\"$vm\",\"torn_down\":$([ "$failed" = 0 ] && echo true || echo false)}"
+	return "$failed"
 }
 
 # reap tears down every guest whose VM unit is no longer running, for example
@@ -346,7 +354,7 @@ reap() {
 		vm=$(basename "$work")
 		[[ $vm =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -e "$work/started" ] || continue
 		systemctl is-active --quiet "runway-guest-$vm.service" && continue
-		teardown "$vm"
+		teardown "$vm" || echo "warning: teardown of $vm incomplete; reap will retry" >&2
 	done
 }
 
