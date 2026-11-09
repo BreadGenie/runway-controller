@@ -16,13 +16,18 @@ Four things, all outside this repo:
 | Central services up | `python3 ../scripts/fc-services.py status` | `central-web`, `atlas-web`, `worker`, `scheduler`, `mariadb`, `redis-*`, both metal tunnels |
 | A Runner Pool, Active | `tabRunner Pool` where `status='Active'` | `lnc22b893b`, scale set `runway-2vcpu-6gb` (id 27) |
 | A scale set with that label | GitHub → repo → Settings → Actions → Runner scale sets | `runway-2vcpu-6gb`, group 1 |
-| Host RAM for the shape | `free -m` on the Metal host | blr-1 has ~7.1 GiB free; a 6 GiB guest fits, an 8 GiB guest does not |
+| Host RAM and disk for the shape | `free -m` and `zfs list metal` on the Metal host | blr-1 had ~30 GiB RAM available on 2026-11-09, so two 12 GiB guests fit. Its free Metal disk, not RAM, ran out first when service VMs shared the host |
 
 **Check host RAM first.** It is the single most common false start. Atlas refuses VM
 creation with "No Metal Server has capacity" when the guest will not fit, and that surfaces
 as a wall of failed leases rather than one clear message. `free -m` on the Metal host, and
 `sudo ip netns list` to see whether a stranded VM is holding memory. A lease goes stale, its
 VM stays up, and the next hundred VMs all fail.
+
+**Then check disk.** Metal keeps a terminated runner's source image in its idle cache for
+about an hour, so a host can have plenty of free RAM and still not fit another runner. If a
+guest hits ENOSPC, ext4 remounts its root read-only, and freeing space afterwards doesn't
+undo that. Check `findmnt -no OPTIONS /` inside the guest, and reboot it through Atlas.
 
 ## The loop
 
