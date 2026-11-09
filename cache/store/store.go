@@ -693,9 +693,11 @@ func repositoryTenant(repository string) (int64, bool) {
 // download checks the bearer grant and the ticket before fetching, stages the
 // object while hashing it, and serves bytes only after the size and digest
 // match the journal. The ticket must carry the redeeming grant's signed
-// tenant, and the entry's routed tenant must match the ticket: cross-tenant
-// replays fail closed with the same opaque refusal as any other invalid
-// ticket, even if the translator's session binding regresses.
+// tenant, the entry's routed tenant must match the ticket, and the entry must
+// belong to the redeeming grant's repository, as lookups already require:
+// cross-tenant and cross-repository replays fail closed with the same opaque
+// refusal as any other invalid ticket, even if the translator's session
+// binding regresses.
 func (s *Server) download(w http.ResponseWriter, r *http.Request, clock grant.Clock) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		fail(w, http.StatusMethodNotAllowed)
@@ -714,7 +716,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, clock grant.Cl
 	if e != nil {
 		entryTenant, tenantOK = repositoryTenant(e.repository)
 	}
-	if err != nil || !ok || ticket.entryID != id || e == nil || !e.published || e.hidden || !s.now().Before(ticket.expires) || !tenantOK || ticket.tenant != scope.Tenant || entryTenant != ticket.tenant {
+	if err != nil || !ok || ticket.entryID != id || e == nil || !e.published || e.hidden || !s.now().Before(ticket.expires) || !tenantOK || ticket.tenant != scope.Tenant || entryTenant != ticket.tenant || e.repository != scope.Repository {
 		s.mu.Unlock()
 		fail(w, http.StatusNotFound)
 		return

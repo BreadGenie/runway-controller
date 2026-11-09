@@ -149,6 +149,11 @@ func TestManagedReadTicketsBindTenant(t *testing.T) {
 	if status, _ := service.Do(t, "GET", swapped, teamB, "", nil); status != 404 {
 		t.Fatal("cross-tenant object redeem under its own session", status)
 	}
+	// Another repository of the same tenant cannot redeem the ticket either.
+	sibling := service.Signer.Grant(t, storetest.Job{TenantID: 1, RepositoryID: 2, Write: "refs/heads/main"})
+	if status, _ := service.Do(t, "GET", locationA, sibling, "", nil); status != 404 {
+		t.Fatal("same-tenant other-repository redeem", status)
+	}
 	// No bearer, a forged bearer, or a standalone grant redeems nothing.
 	for name, token := range map[string]string{"none": "", "forged": teamA + "x", "standalone": service.Signer.Reader(t)} {
 		if status, _ := service.Do(t, "GET", locationA, token, "", nil); status != 404 {

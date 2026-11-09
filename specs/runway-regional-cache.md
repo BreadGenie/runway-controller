@@ -45,7 +45,8 @@ size and SHA256 before serving bytes. Read tickets last at most one minute and
 never outlive their grants. Each ticket is bound at mint to the lookup grant's
 signed tenant (zero for standalone); redemption authenticates the download with
 a bearer grant and refuses it unless the ticket's tenant equals the redeeming
-grant's tenant and the entry's routed tenant equals the ticket's tenant. Any
+grant's tenant, the entry's routed tenant equals the ticket's tenant, and the
+entry belongs to the redeeming grant's repository. Any
 mismatch fails closed with the same opaque refusal as any other invalid
 ticket. Tickets journaled before tenant binding carry no tenant and never
 redeem again after upgrade. Quotas, physical staging and size-scaled operation
@@ -328,7 +329,8 @@ authority. Data API authorization checks bucket availability (using the bounded
 credential cache); errors refuse requests. Downloads still require their
 short-lived journaled ticket, the redeeming grant's bearer, and a successful
 tenant-routed storage read; the ticket's tenant must equal both the redeeming
-grant's tenant and the entry's routed tenant. Central provisioning, Atlas
+grant's tenant and the entry's routed tenant, and the entry must belong to the
+redeeming grant's repository. Central provisioning, Atlas
 deployment and the guest TLS relay remain separate issues; no live regional
 deployment is qualified here.
 
