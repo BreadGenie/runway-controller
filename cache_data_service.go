@@ -42,7 +42,7 @@ type cacheDataServiceConfig struct {
 	Disk            store.DiskConfig     `json:"disk"`
 	StorageBudget   *store.StorageBudget `json:"storage_budget,omitempty"`
 	Managed         *cacheManagedConfig  `json:"managed,omitempty"`
-	Garage          store.GarageConfig   `json:"garage"`
+	Garage          store.GarageConfig   `json:"garage,omitzero"`
 }
 
 var cacheDataNestedFields = map[string][]string{

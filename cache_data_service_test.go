@@ -592,3 +592,17 @@ func TestCacheDataServiceAdmissionRefusesExcessAndStoppedRequests(t *testing.T) 
 		t.Fatal("stopped service admitted request")
 	}
 }
+
+func TestManagedCacheDataConfigRoundTrip(t *testing.T) {
+	config, _ := cacheDataConfigFixture(t)
+	config.Garage = store.GarageConfig{}
+	config.Managed = &cacheManagedConfig{CentralURL: "https://central.example.test", CentralTokenFile: "/etc/runway/central-token", StorageCAFile: "/etc/runway/storage-ca.pem"}
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, _, err := decodeCacheDataServiceConfig(encoded)
+	if err != nil || decoded.Managed == nil {
+		t.Fatalf("generated managed configuration refused: %v", err)
+	}
+}

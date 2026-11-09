@@ -809,6 +809,21 @@ class TransportTests(unittest.TestCase):
                     self.assertEqual(json.loads(output), {'state': 'unknown'})
                     self.assertFalse((Path(directory) / 'docker/daemon.json').exists())
 
+    def test_vm_identifiers_preserve_legacy_and_tenant_qualified_names(self):
+        for name in ('vm-123', 'vm-0-0012', 'vm-617-0001'):
+            with self.subTest(name=name):
+                args = self.arguments('status')
+                args[args.index('--vm-id') + 1] = name
+                with (patch.object(transport.sys, 'argv', args),
+                      patch.object(transport.sys, 'stdout', io.StringIO()),
+                      patch.object(transport.subprocess, 'run') as run):
+                    run.return_value.returncode = 0
+                    run.return_value.stdout = '{"state":"installed"}'
+                    self.assertEqual(transport.main(), 0)
+                    payload = json.loads(run.call_args.kwargs['input'])
+                    self.assertEqual(payload['vm_id'], name)
+                    self.assertTrue(payload['known_hosts'].endswith('-' + name))
+
     def test_vm_shell_injection_is_rejected_before_ssh(self):
         args = self.arguments('status')
         args[args.index('--vm-id') + 1] = 'vm-123; echo unsafe'

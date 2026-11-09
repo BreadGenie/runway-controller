@@ -617,7 +617,7 @@ new file mode 100644
 index 0000000..491f47f
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_pool/runner_pool.json
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,206 @@
 +{
 + "doctype": "DocType",
 + "name": "Runner Pool",
@@ -640,6 +640,7 @@ index 0000000..491f47f
 +  "disk_mib",
 +  "max_job_seconds",
 +  "ssh_public_key",
++  "placement_rules",
 +  "ownership_section",
 +  "controller_owner",
 +  "fence",
@@ -788,6 +789,13 @@ index 0000000..491f47f
 +   "fieldtype": "Check",
 +   "label": "Regional Cache",
 +   "default": "0"
++  },
++  {
++   "fieldname": "placement_rules",
++   "label": "Placement Rules",
++   "fieldtype": "Code",
++   "options": "JSON",
++   "description": "Optional Atlas placement rules. Empty uses the region placement policy."
 +  }
 + ],
 + "permissions": [
@@ -821,7 +829,7 @@ new file mode 100644
 index 0000000..9db1ec6
 --- /dev/null
 +++ b/central/infrastructure/doctype/runner_pool/runner_pool.py
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,60 @@
 +from urllib.parse import urlsplit
 +
 +import frappe
@@ -829,7 +837,7 @@ index 0000000..9db1ec6
 +from frappe.model.document import Document
 +
 +from central.infrastructure.doctype.team_ssh_key.team_ssh_key import fingerprint
-+from central.infrastructure.runway import active_leases
++from central.infrastructure.runway import active_leases, pool_placement_rules
 +
 +
 +class RunnerPool(Document):
@@ -854,6 +862,7 @@ index 0000000..9db1ec6
 +				frappe.throw(_("Runner pool capacity or deadline is outside pilot limits."))
 +		if int(self.scale_set_id or 0) < 1:
 +			frappe.throw(_("Set a positive GitHub scale set ID."))
++		pool_placement_rules(self)
 +		fingerprint(self.ssh_public_key)
 +		if not self.is_new():
 +			immutable = (
@@ -867,6 +876,7 @@ index 0000000..9db1ec6
 +				"cpu_millicores",
 +				"memory_mib",
 +				"disk_mib",
++				"placement_rules",
 +			)
 +			if any(self.has_value_changed(field) for field in immutable) and active_leases(
 +				pool=self.name, team=self.team
@@ -894,7 +904,7 @@ new file mode 100644
 index 0000000..3273173
 --- /dev/null
 +++ b/central/infrastructure/runway.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,339 @@
 +from datetime import UTC
 +from uuid import UUID
 +from zoneinfo import ZoneInfo
@@ -1226,17 +1236,25 @@ index 0000000..3273173
 +		lease.last_error = str(error)[:1000]
 +	save_internal(lease)
 +	return lease_snapshot(lease)
++
++
++def pool_placement_rules(pool):
++	"""Read optional Atlas placement constraints before dispatching a VM."""
++	rules = frappe.parse_json(pool.get("placement_rules") or "[]")
++	if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
++		frappe.throw(_("Placement rules must be a JSON array of objects."))
++	return rules
 diff --git a/central/integrations/runway.py b/central/integrations/runway.py
 new file mode 100644
 index 0000000..41d813a
 --- /dev/null
 +++ b/central/integrations/runway.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,198 @@
 +import frappe
 +from frappe.utils import get_datetime, now_datetime
 +
 +from central.errors import AtlasConnectionError, AtlasRejected, AtlasRequestUncertain, AtlasResourceGone
-+from central.infrastructure.runway import active_leases, fenced_lease, lease_snapshot, save_internal
++from central.infrastructure.runway import active_leases, fenced_lease, lease_snapshot, pool_placement_rules, save_internal
 +from central.integrations.atlas import AtlasClient
 +
 +
@@ -1274,6 +1292,9 @@ index 0000000..41d813a
 +		"sleep_after_idle_seconds": 0,
 +		"tags": {"runway_pool": pool.name, "runway_lease": lease.name, "role": "ci", "team": pool.team},
 +	}
++	rules = pool_placement_rules(pool)
++	if rules:
++		payload["placement_rules"] = rules
 +	try:
 +		response = client_for_pool(pool).create_vm(payload)
 +	except AtlasRejected:

@@ -238,8 +238,8 @@ def main() -> int:
             parser.error('Regional cache requires --regional-cache and --regional-cache-ca')
         if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
             parser.error('Regional cache requires internal-name:port')
-    if not re.fullmatch(r'vm-[0-9]+', args.vm_id):
-        parser.error('Expected an Atlas vm-<digits> identifier')
+    if not re.fullmatch(r'vm-[0-9]+(?:-[0-9]+)?', args.vm_id):
+        parser.error('Expected an Atlas vm-<digits> or vm-<tenant>-<digits> identifier')
     if not re.fullmatch(r'runway-[a-z0-9-]{1,56}', args.runner_name):
         parser.error('Expected a runway-prefixed runner name')
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', args.host):
