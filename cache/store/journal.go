@@ -32,6 +32,10 @@ type diskEntry struct {
 
 type diskTicket struct {
 	EntryID int64
+	// Tenant is the signed tenant bound at mint. It is a pointer so that
+	// journals written before tenant binding (no tenant key) are
+	// distinguishable from standalone tickets (explicit zero) and refused.
+	Tenant  *int64
 	Expires time.Time
 }
 
@@ -141,8 +145,14 @@ func (s *Server) recover() error {
 		if _, err := hex.DecodeString(k); err != nil || len(k) != 64 || s.entries[v.EntryID] == nil || v.Expires.After(now.Add(ticketLifetime)) {
 			return errors.New("invalid read ticket")
 		}
+		if v.Tenant == nil {
+			// Tickets are short-lived, so journals written before tenant
+			// binding are simply dropped after upgrade: an old-format ticket
+			// without a tenant never redeems again.
+			continue
+		}
 		if now.Before(v.Expires) {
-			s.tickets[k] = readTicket{v.EntryID, v.Expires}
+			s.tickets[k] = readTicket{v.EntryID, *v.Tenant, v.Expires}
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.budget.recovery(objects, bytes))
@@ -178,7 +188,8 @@ func (s *Server) persist() error {
 		d.Entries = append(d.Entries, diskEntry{ID: e.id, Size: e.size, Repository: e.repository, Ref: e.ref, Key: e.key, Version: e.version, Subject: e.subject, Object: e.objectKey, Created: e.created, Accessed: e.accessed, Published: e.published, Hidden: e.hidden, Digest: e.digest})
 	}
 	for k, v := range s.tickets {
-		d.Tickets[k] = diskTicket{v.entryID, v.expires}
+		tenant := v.tenant
+		d.Tickets[k] = diskTicket{EntryID: v.entryID, Tenant: &tenant, Expires: v.expires}
 	}
 	s.stateErr = s.writeState(d)
 	return s.stateErr

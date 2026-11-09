@@ -72,7 +72,10 @@ func TestDownloadAdmissionAndCredentials(t *testing.T) {
 	var calls atomic.Int32
 	h, front := fixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		for _, key := range []string{"Authorization", "Cookie", "Forwarded", "X-Forwarded-Host", "Proxy-Authorization", "Content-Range", "Range", "If-Range"} {
+		if r.Header.Get("Authorization") != "Bearer cache-only" {
+			t.Errorf("download lost host grant")
+		}
+		for _, key := range []string{"Cookie", "Forwarded", "X-Forwarded-Host", "Proxy-Authorization", "Content-Range", "Range", "If-Range"} {
 			if r.Header.Get(key) != "" {
 				t.Errorf("forwarded download header %s", key)
 			}

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +116,45 @@ func TestManagedBucketsNamespaceAndRecreation(t *testing.T) {
 		t.Fatal("recreation reused namespace")
 	}
 
+}
+
+// Read tickets are bound to the grant's signed tenant at mint. Redemption
+// checks the ticket against the redeeming grant's tenant and against the
+// entry's routed tenant, so a cross-tenant replay fails closed even if the
+// translator's session binding regresses.
+func TestManagedReadTicketsBindTenant(t *testing.T) {
+	_, ac := teamGarage(t)
+	_, bc := teamGarage(t)
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: ac, 2: bc} })
+	teamA := service.Signer.Grant(t, storetest.Job{TenantID: 1, Write: "refs/heads/main"})
+	teamB := service.Signer.Grant(t, storetest.Job{TenantID: 2, Write: "refs/heads/main"})
+	aID := service.Save(t, teamA, "deps-a", "team-a-bytes")
+	bID := service.Save(t, teamB, "deps-b", "team-b-bytes")
+	if status, data := service.Restore(t, teamA, "deps-a"); status != 200 || data != "team-a-bytes" {
+		t.Fatal("same-tenant redeem", status, data)
+	}
+	_, locationA := service.Lookup(t, teamA, "deps-a")
+	// A ticket replayed under another tenant's session is refused.
+	if status, _ := service.Do(t, "GET", locationA, teamB, "", nil); status != 404 {
+		t.Fatal("cross-tenant session redeem", status)
+	}
+	// A ticket used for another tenant's object key is refused.
+	swapped := strings.Replace(locationA, "/download/"+strconv.FormatInt(aID, 10)+"?", "/download/"+strconv.FormatInt(bID, 10)+"?", 1)
+	if swapped == locationA {
+		t.Fatal("entry swap fixture")
+	}
+	if status, _ := service.Do(t, "GET", swapped, teamA, "", nil); status != 404 {
+		t.Fatal("cross-tenant object redeem", status)
+	}
+	if status, _ := service.Do(t, "GET", swapped, teamB, "", nil); status != 404 {
+		t.Fatal("cross-tenant object redeem under its own session", status)
+	}
+	// No bearer, a forged bearer, or a standalone grant redeems nothing.
+	for name, token := range map[string]string{"none": "", "forged": teamA + "x", "standalone": service.Signer.Reader(t)} {
+		if status, _ := service.Do(t, "GET", locationA, token, "", nil); status != 404 {
+			t.Errorf("%s redeem: %d", name, status)
+		}
+	}
 }
 
 func TestGarageTLSConfigurationRefusals(t *testing.T) {
