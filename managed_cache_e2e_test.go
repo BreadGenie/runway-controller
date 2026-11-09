@@ -436,6 +436,22 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 		if status, _ := f.request("GET", strings.TrimPrefix(locationA, "http://127.0.0.1:18080"), nil, nil); status == 200 {
 			t.Fatal("team B read team A ticket")
 		}
+		// Tenant binding also holds at cache-data without the translator's
+		// session check: team B's own bearer and no bearer fail on A's URL.
+		dataLocation := strings.Replace(locationA, "http://127.0.0.1:18080", f.data.Config.PublicOrigin, 1)
+		now := time.Now()
+		teamBBearer, err := grant.Issue(f.data.Signer.Key, f.data.Config.PublicOrigin, grant.Authorization{
+			TenantID: 3, RegionID: "blr-1", JobID: uuid.NewString(), RepositoryID: 580439734,
+			RunID: 41867135947, RunAttempt: 1, ReadRefs: []string{"refs/heads/develop"}, Deadline: now.Add(10 * time.Minute),
+		}, grant.Clock{Earliest: now, Latest: now})
+		if err != nil {
+			t.Fatal("team B bearer", err)
+		}
+		for name, token := range map[string]string{"team-b session": teamBBearer, "no session": ""} {
+			if status, _ := f.data.Do(t, "GET", dataLocation, token, "", nil); status != 404 {
+				t.Fatalf("cache-data admitted %s on team A ticket: %d", name, status)
+			}
+		}
 		f.guest = original
 		f.mu.Lock()
 		f.lease.TenantID = 3

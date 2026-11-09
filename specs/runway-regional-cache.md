@@ -42,7 +42,13 @@ Signing keys and Garage credentials never enter the guest.
 cache-data stages uploads privately, journals intent before PUT and publication
 before success, and exposes only complete immutable archives. Downloads verify
 size and SHA256 before serving bytes. Read tickets last at most one minute and
-never outlive their grants. Quotas, physical staging and size-scaled operation
+never outlive their grants. Each ticket is bound at mint to the lookup grant's
+signed tenant (zero for standalone); redemption authenticates the download with
+a bearer grant and refuses it unless the ticket's tenant equals the redeeming
+grant's tenant and the entry's routed tenant equals the ticket's tenant. Any
+mismatch fails closed with the same opaque refusal as any other invalid
+ticket. Tickets journaled before tenant binding carry no tenant and never
+redeem again after upgrade. Quotas, physical staging and size-scaled operation
 and recovery budgets remain finite. Active operations pin entries without
 holding the index lock over storage I/O; hidden entries retry deletion with backoff.
 
@@ -320,9 +326,11 @@ in process memory and are absent from journals, grants and logs.
 Setup and renewal freshly check Central bucket availability as well as lease
 authority. Data API authorization checks bucket availability (using the bounded
 credential cache); errors refuse requests. Downloads still require their
-short-lived journaled ticket and a successful tenant-routed storage read.
-Central provisioning, Atlas deployment and the guest TLS relay remain separate
-issues; no live regional deployment is qualified here.
+short-lived journaled ticket, the redeeming grant's bearer, and a successful
+tenant-routed storage read; the ticket's tenant must equal both the redeeming
+grant's tenant and the entry's routed tenant. Central provisioning, Atlas
+deployment and the guest TLS relay remain separate issues; no live regional
+deployment is qualified here.
 
 Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Central, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.
 
