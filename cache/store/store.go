@@ -79,12 +79,14 @@ func (config Config) validate() error {
 	return nil
 }
 
-// Scope is the verified grant: never guest request fields.
+// Scope is the verified grant: never guest request fields. Tenant is the
+// signed Central team from the grant; zero is standalone.
 type Scope struct {
 	Subject, Repository string
 	WriteRef            string
 	ReadRefs            []string
 	ExpiresAt           time.Time
+	Tenant              int64
 }
 
 type entry struct {
@@ -106,6 +108,7 @@ func (s *Server) uploadDeadline(e *entry) time.Time {
 
 type readTicket struct {
 	entryID int64
+	tenant  int64 // signed tenant bound at mint; checked at redeem
 	expires time.Time
 }
 
@@ -240,7 +243,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/download/") {
-		s.download(w, r)
+		s.download(w, r, clock)
 		return
 	}
 	scope, ok := s.authorize(r, clock)
@@ -293,7 +296,7 @@ func (s *Server) authorize(r *http.Request, clock grant.Clock) (Scope, bool) {
 		return Scope{}, false
 	}
 	subject, _ := json.Marshal([]string{claims.JobID, strconv.FormatInt(claims.RequestID, 10), strconv.FormatInt(claims.RunID, 10), strconv.FormatInt(claims.RunAttempt, 10)})
-	return Scope{Subject: string(subject), Repository: string(repository), ReadRefs: claims.ReadRefs, WriteRef: claims.WriteRef, ExpiresAt: time.Unix(claims.ExpiresAt, 0)}, true
+	return Scope{Subject: string(subject), Repository: string(repository), ReadRefs: claims.ReadRefs, WriteRef: claims.WriteRef, ExpiresAt: time.Unix(claims.ExpiresAt, 0), Tenant: claims.TenantID}, true
 }
 
 // collect expires tickets and hides abandoned or idle entries; the sweeper
@@ -631,7 +634,8 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// issueTicket persists a one-minute read ticket (capped at the grant) for e. Caller holds mu.
+// issueTicket persists a one-minute read ticket (capped at the grant) for e,
+// bound to the grant's signed tenant. Caller holds mu.
 func (s *Server) issueTicket(w http.ResponseWriter, scope Scope, ref string, e *entry) {
 	if len(s.tickets) >= maxTickets {
 		fail(w, http.StatusTooManyRequests)
@@ -649,7 +653,7 @@ func (s *Server) issueTicket(w http.ResponseWriter, scope Scope, ref string, e *
 	if scope.ExpiresAt.Before(expires) {
 		expires = scope.ExpiresAt
 	}
-	s.tickets[ticketKey(token)] = readTicket{e.id, expires}
+	s.tickets[ticketKey(token)] = readTicket{e.id, scope.Tenant, expires}
 	if s.persist() != nil {
 		fail(w, http.StatusServiceUnavailable)
 		return
@@ -658,18 +662,61 @@ func (s *Server) issueTicket(w http.ResponseWriter, scope Scope, ref string, e *
 	_ = json.NewEncoder(w).Encode(map[string]any{"cacheKey": e.key, "scope": ref, "archiveLocation": fmt.Sprintf("%s/download/%d?ticket=%s", s.config.PublicOrigin, e.id, token)})
 }
 
-// download checks the ticket before fetching, stages the object while hashing
-// it, and serves bytes only after the size and digest match the journal.
-func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+// repositoryTenant returns the tenant routed by a repository scope key:
+// the managed tuple's tenant, or zero for standalone. It mirrors objectKey's
+// strict canonical-tuple check so a ticket can never cover another tenant's
+// object, whatever entry ID the download URL names.
+func repositoryTenant(repository string) (int64, bool) {
+	var parts []string
+	if json.Unmarshal([]byte(repository), &parts) != nil || len(parts) != 3 {
+		return 0, false
+	}
+	canonical, _ := json.Marshal(parts)
+	if string(canonical) != repository {
+		return 0, false
+	}
+	switch parts[0] {
+	case "managed":
+		tenant, err := strconv.ParseInt(parts[1], 10, 64)
+		repo, repoErr := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || repoErr != nil || tenant <= 0 || tenant > 4294967295 || repo <= 0 || parts[1] != strconv.FormatInt(tenant, 10) || parts[2] != strconv.FormatInt(repo, 10) {
+			return 0, false
+		}
+		return tenant, true
+	case "standalone":
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+// download checks the bearer grant and the ticket before fetching, stages the
+// object while hashing it, and serves bytes only after the size and digest
+// match the journal. The ticket must carry the redeeming grant's signed
+// tenant, the entry's routed tenant must match the ticket, and the entry must
+// belong to the redeeming grant's repository, as lookups already require:
+// cross-tenant and cross-repository replays fail closed with the same opaque
+// refusal as any other invalid ticket, even if the translator's session
+// binding regresses.
+func (s *Server) download(w http.ResponseWriter, r *http.Request, clock grant.Clock) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		fail(w, http.StatusMethodNotAllowed)
+		return
+	}
+	scope, ok := s.authorize(r, clock)
+	if !ok {
+		fail(w, http.StatusNotFound)
 		return
 	}
 	id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/download/"), 10, 64)
 	s.mu.Lock()
 	ticket, ok := s.tickets[ticketKey(r.URL.Query().Get("ticket"))]
 	e := s.entries[id]
-	if err != nil || !ok || ticket.entryID != id || e == nil || !e.published || e.hidden || !s.now().Before(ticket.expires) {
+	entryTenant, tenantOK := int64(0), true
+	if e != nil {
+		entryTenant, tenantOK = repositoryTenant(e.repository)
+	}
+	if err != nil || !ok || ticket.entryID != id || e == nil || !e.published || e.hidden || !s.now().Before(ticket.expires) || !tenantOK || ticket.tenant != scope.Tenant || entryTenant != ticket.tenant || e.repository != scope.Repository {
 		s.mu.Unlock()
 		fail(w, http.StatusNotFound)
 		return

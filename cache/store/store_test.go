@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -191,7 +192,7 @@ func TestSlowDownloadDoesNotBlockOtherRequests(t *testing.T) {
 	service.Garage.Mu.Unlock()
 	done := make(chan string)
 	go func() {
-		status, data := service.Do(t, "GET", slow, "", "", nil)
+		status, data := service.Do(t, "GET", slow, reader, "", nil)
 		done <- fmt.Sprint(status, " ", string(data))
 	}()
 	waitFor(t, func() bool {
@@ -343,31 +344,78 @@ func TestReadTicketsAndClock(t *testing.T) {
 	firstID := service.Save(t, writer, "first", "one")
 	secondID := service.Save(t, writer, "second", "two")
 	_, location := service.Lookup(t, reader, "second")
-	if status, _ := service.Do(t, "GET", strings.Replace(location, fmt.Sprintf("/download/%d?", secondID), fmt.Sprintf("/download/%d?", firstID), 1), "", "", nil); status != 404 {
+	if status, _ := service.Do(t, "GET", strings.Replace(location, fmt.Sprintf("/download/%d?", secondID), fmt.Sprintf("/download/%d?", firstID), 1), reader, "", nil); status != 404 {
 		t.Fatal("ticket read another entry", status)
 	}
-	if status, _ := service.Do(t, "GET", location+"0", "", "", nil); status != 404 {
+	if status, _ := service.Do(t, "GET", location+"0", reader, "", nil); status != 404 {
 		t.Fatal("altered ticket accepted", status)
+	}
+	if status, _ := service.Do(t, "GET", location, "", "", nil); status != 404 {
+		t.Fatal("bearerless ticket redeem accepted", status)
 	}
 	service.Clock.Mu.Lock()
 	service.Clock.Err = fmt.Errorf("unsynchronized")
 	service.Clock.Mu.Unlock()
-	if status, _ := service.Do(t, "GET", location, "", "", nil); status != 503 {
+	if status, _ := service.Do(t, "GET", location, reader, "", nil); status != 503 {
 		t.Fatal("download bypassed clock refusal", status)
 	}
 	service.Clock.Mu.Lock()
 	service.Clock.Err = nil
 	service.Clock.Mu.Unlock()
 	service.Clock.Advance(61 * time.Second)
-	if status, _ := service.Do(t, "GET", location, "", "", nil); status != 404 {
+	if status, _ := service.Do(t, "GET", location, reader, "", nil); status != 404 {
 		t.Fatal("ticket outlived a minute", status)
 	}
 	// A ticket never outlives its grant.
 	short := service.Signer.Grant(t, storetest.Job{Lifetime: 10 * time.Second, Now: time.Now().Add(61 * time.Second)})
 	_, location = service.Lookup(t, short, "second")
 	service.Clock.Advance(11 * time.Second)
-	if status, _ := service.Do(t, "GET", location, "", "", nil); status != 404 {
+	if status, _ := service.Do(t, "GET", location, short, "", nil); status != 404 {
 		t.Fatal("ticket outlived its grant", status)
+	}
+}
+
+// Tickets are short-lived, so journals written before tenant binding carry no
+// tenant and are dropped on recovery: an old-format ticket never redeems
+// again, while entries keep serving under fresh tickets.
+func TestOldFormatTicketRefusedAfterUpgrade(t *testing.T) {
+	service := storetest.Start(t)
+	writer, reader := service.Signer.Writer(t), service.Signer.Reader(t)
+	service.Save(t, writer, "legacy", "legacy-bytes")
+	_, location := service.Lookup(t, reader, "legacy")
+	if err := service.Server.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service.Server = nil
+	path := filepath.Join(service.Config.StateDir, "state.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	tickets, _ := state["Tickets"].(map[string]any)
+	if len(tickets) == 0 {
+		t.Fatal("journal ticket fixture")
+	}
+	for _, ticket := range tickets {
+		delete(ticket.(map[string]any), "Tenant")
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	service.Restart(t)
+	if status, _ := service.Do(t, "GET", location, reader, "", nil); status != 404 {
+		t.Fatal("old-format ticket redeemed", status)
+	}
+	if status, data := service.Restore(t, reader, "legacy"); status != 200 || data != "legacy-bytes" {
+		t.Fatal("fresh ticket after upgrade", status, data)
 	}
 }
 
@@ -441,7 +489,7 @@ func TestRestartRecoversVerifiesAndHidesLostObjects(t *testing.T) {
 	}
 	service.Garage.Mu.Unlock()
 	service.Restart(t)
-	if status, data := service.Do(t, "GET", location, "", "", nil); status != 200 || string(data) != "kept-bytes" {
+	if status, data := service.Do(t, "GET", location, reader, "", nil); status != 200 || string(data) != "kept-bytes" {
 		t.Fatal("persisted ticket or entry lost", status, string(data))
 	}
 	for _, key := range []string{"lost", "corrupt"} {
@@ -565,7 +613,7 @@ func TestStagingAdmissionAndUnlinkFailure(t *testing.T) {
 	service.Garage.Mu.Unlock()
 	_, location := service.Lookup(t, reader, "a")
 	done := make(chan int)
-	go func() { status, _ := service.Do(t, "GET", location, "", "", nil); done <- status }()
+	go func() { status, _ := service.Do(t, "GET", location, reader, "", nil); done <- status }()
 	waitFor(t, func() bool { return service.Charged() == 4096 })
 	if err := os.Chmod(service.Config.Disk.Directory, 0500); err != nil {
 		t.Fatal(err)

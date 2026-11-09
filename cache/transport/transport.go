@@ -226,9 +226,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400)
 		return
 	}
-	// Construct from scratch: no guest credentials, routing or forwarding headers.
+	// Construct from scratch: the host grant always authenticates, including
+	// archive reads so cache-data can bind the ticket to the redeeming
+	// session's tenant. No guest credentials, routing or forwarding headers.
+	req.Header.Set("Authorization", "Bearer "+h.grant.Bearer)
 	if !download {
-		req.Header.Set("Authorization", "Bearer "+h.grant.Bearer)
 		for _, k := range []string{"Accept", "Content-Type", "Content-Range"} {
 			for _, v := range r.Header.Values(k) {
 				req.Header.Add(k, v)

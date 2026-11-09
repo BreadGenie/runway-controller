@@ -389,13 +389,14 @@ func (service *Service) Lookup(t testing.TB, token, keys string) (int, string) {
 	return status, reply.Location
 }
 
-// Restore looks key up and downloads it.
+// Restore looks key up and downloads it with the same grant, so the redeeming
+// session's tenant is checked against the ticket.
 func (service *Service) Restore(t testing.TB, token, key string) (int, string) {
 	t.Helper()
 	status, location := service.Lookup(t, token, key)
 	if status != http.StatusOK {
 		return status, ""
 	}
-	status, data := service.Do(t, "GET", location, "", "", nil)
+	status, data := service.Do(t, "GET", location, token, "", nil)
 	return status, string(data)
 }

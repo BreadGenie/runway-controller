@@ -47,8 +47,8 @@ func testPinnedClientThroughRelay(t *testing.T, client string) {
 		}
 		if strings.HasPrefix(r.URL.Path, "/download/") {
 			downloads.Add(1)
-			if r.Header.Get("Authorization") != "" {
-				t.Error("ticket read carried bearer")
+			if r.Header.Get("Authorization") != "Bearer "+bearer {
+				t.Error("ticket read lost host grant")
 			}
 		} else if r.Header.Get("Authorization") != "Bearer "+bearer {
 			t.Error("control request lost host grant")
