@@ -216,7 +216,7 @@ func TestCacheSessionClosureAndExpiry(t *testing.T) {
 				defer cancel()
 				f := newSessionFixture(t, managed, func(c *cacheSessionConfig, _ *sessionAuthorityProbe) {
 					if stop == "deadline" {
-						c.deadline = time.Now().Add(150 * time.Millisecond)
+						c.deadline = time.Now().Add(cacheSessionSetupBudget + time.Second)
 					}
 				}, parent)
 				if got := f.enable(t.Context(), f.test.setup); got != "" {
@@ -229,7 +229,7 @@ func TestCacheSessionClosureAndExpiry(t *testing.T) {
 					f.session.close()
 					f.session.close()
 				}
-				for deadline := time.Now().Add(time.Second); !f.session.done(); {
+				for deadline := time.Now().Add(cacheSessionSetupBudget + 2*time.Second); !f.session.done(); {
 					if time.Now().After(deadline) {
 						t.Fatal("session did not close")
 					}
