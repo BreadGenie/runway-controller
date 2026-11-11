@@ -63,7 +63,7 @@ func (central cacheCentralHTTPS) read(ctx context.Context, method string, query 
 	if !cacheHTTPSOrigin(central.origin) || central.client == nil || central.token == "" || strings.ContainsAny(central.token, " \t\r\n") {
 		return nil, grant.ErrInvalid
 	}
-	ctx, cancel := context.WithTimeout(ctx, cacheHostSetupBudget)
+	ctx, cancel := context.WithTimeout(ctx, cacheSessionSetupBudget)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(central.origin, "/")+"/api/method/central.runway."+method+"?"+query.Encode(), nil)
 	if err != nil {

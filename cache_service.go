@@ -156,11 +156,18 @@ func ensureCacheServiceKey(path string) (ed25519.PrivateKey, error) {
 type cacheService struct {
 	config   cacheServiceConfig
 	central  cacheCentral
-	template cacheHost
+	template cacheSessionConfig
 	ctx      context.Context
 	mu       sync.Mutex
-	sessions map[string]*cacheHost
+	sessions map[string]*cacheServiceSession
 	slots    chan struct{}
+}
+
+// cacheServiceSession retains the mesh address's lease identity until expiry.
+type cacheServiceSession struct {
+	leaseID      string
+	session      *cacheSession
+	authenticate func() (cacheGuestBinding, string)
 }
 
 func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -188,16 +195,16 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "cache unavailable", 503)
 			return
 		}
-		host.translate(w, r.WithContext(context.WithValue(r.Context(), cacheHostPeerKey{}, cacheHostPeer{binding: cacheGuestBinding{VMID: host.vmID}})))
+		host.session.translate(w, r, "")
 		return
 	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method refused", 405)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), cacheHostSetupBudget)
+	ctx, cancel := context.WithTimeout(r.Context(), cacheSessionSetupBudget)
 	defer cancel()
-	deadline := time.Now().Add(cacheHostSetupBudget)
+	deadline := time.Now().Add(cacheSessionSetupBudget)
 	controller := http.NewResponseController(w)
 	_ = controller.SetReadDeadline(deadline)
 	_ = controller.SetWriteDeadline(deadline)
@@ -213,8 +220,8 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	host := s.sessions[address.String()]
-	if host != nil && host.vmID != lease.Lease { // Retain the old lease until its deadline to fence address reuse.
-		if host.ctx.Err() == nil {
+	if host != nil && host.leaseID != lease.Lease { // Retain the old lease until its deadline to fence address reuse.
+		if !host.session.done() {
 			s.mu.Unlock()
 			_ = grant.WriteSetupResponse(w, request, false)
 			return
@@ -224,12 +231,8 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if host == nil {
 		// Expired lease state is bounded; never evict a live replay/setup fence.
 		for key, h := range s.sessions {
-			if h.ctx.Err() != nil {
-				h.mu.Lock()
-				if h.current != nil {
-					h.current.Close()
-				}
-				h.mu.Unlock()
+			if h.session.done() {
+				h.session.close()
 				delete(s.sessions, key)
 			}
 		}
@@ -239,22 +242,21 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		binding := cacheGuestBinding{service: true, TenantID: tenant, VMID: lease.VMID, RunnerID: lease.RunnerID, RunnerName: lease.RunnerName, Repository: lease.Repository, ExpiresAt: lease.Deadline}
-		host = &cacheHost{vmID: lease.Lease, ctx: s.ctx, key: s.template.key, roots: s.template.roots, clock: s.template.clock, audience: s.template.audience, archiveBytes: s.template.archiveBytes, log: s.template.log, nonces: map[string]bool{}}
-		var sessionCancel context.CancelFunc
-		host.ctx, sessionCancel = context.WithDeadline(s.ctx, lease.Deadline)
-		context.AfterFunc(host.ctx, sessionCancel)
-		host.authenticateService = func() (cacheGuestBinding, string) {
+		config := s.template
+		config.id, config.deadline = lease.Lease, lease.Deadline
+		config.nonceLimit, config.bindTickets = 4096, true
+		config.authority = &cacheServiceAuthority{regionID: s.config.RegionID, central: s.central, address: address, lease: lease}
+		host = &cacheServiceSession{leaseID: lease.Lease, session: newCacheSession(s.ctx, config), authenticate: func() (cacheGuestBinding, string) {
 			if !time.Now().Before(binding.ExpiresAt) {
 				return binding, "binding_expired"
 			}
 			return binding, ""
-		}
-		host.authority = &cacheServiceAuthority{regionID: s.config.RegionID, central: s.central, address: address, lease: lease}
+		}}
 		s.sessions[address.String()] = host
 	}
 	s.mu.Unlock()
 	// The Central lookup and the existing setup share one budget.
-	reason := host.enableWithin(ctx, nil, request)
+	reason := host.session.enable(ctx, request, host.authenticate)
 	_ = grant.WriteSetupResponse(w, request, reason == "")
 	s.template.log(map[string]any{"event": "setup", "lease": lease.Lease, "tenant_id": tenant, "enabled": reason == "", "reason": reason})
 }
@@ -312,13 +314,13 @@ func runCacheService(path string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := &cacheService{config: c, ctx: ctx, central: rotating, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	service := &cacheService{config: c, ctx: ctx, central: rotating, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
 	listener, err := net.Listen("tcp6", c.Listen)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	server := &http.Server{Handler: service, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: cacheHostRequestLimit, WriteTimeout: cacheHostRequestLimit, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
+	server := &http.Server{Handler: service, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: cacheSessionRequestLimit, WriteTimeout: cacheSessionRequestLimit, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
 	operatorListener, err := net.Listen("tcp", c.OperatorListen)
 	if err != nil {
 		return err
@@ -335,11 +337,7 @@ func runCacheService(path string) error {
 		service.mu.Lock()
 		defer service.mu.Unlock()
 		for _, h := range service.sessions {
-			h.mu.Lock()
-			if h.current != nil {
-				h.current.Close()
-			}
-			h.mu.Unlock()
+			h.session.close()
 		}
 	}()
 	err = server.ServeTLS(listener, "", "")

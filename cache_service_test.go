@@ -49,7 +49,7 @@ func serviceFixture(t *testing.T, edit func(*cacheServiceLease), status int, sta
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	s := &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: cacheCentralHTTPS{origin: central.URL, token: "region-secret", client: central.Client()}, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: key, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: data.URL, archiveBytes: 1 << 20, log: func(map[string]any) {}, clock: func(context.Context) (grant.Clock, error) {
+	s := &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: cacheCentralHTTPS{origin: central.URL, token: "region-secret", client: central.Client()}, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: key, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: data.URL, archiveBytes: 1 << 20, log: func(map[string]any) {}, clock: func(context.Context) (grant.Clock, error) {
 		now := time.Now()
 		return grant.Clock{Earliest: now, Latest: now}, nil
 	}}}
@@ -57,11 +57,7 @@ func serviceFixture(t *testing.T, edit func(*cacheServiceLease), status int, sta
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, h := range s.sessions {
-			h.mu.Lock()
-			if h.current != nil {
-				h.current.Close()
-			}
-			h.mu.Unlock()
+			h.session.close()
 		}
 	})
 	return s, test
@@ -152,7 +148,7 @@ func TestCacheServiceCentralBudget(t *testing.T) {
 	if got := serviceSetup(t, s, test.setup, servicePeer); got != "disabled" {
 		t.Fatal(got)
 	}
-	if elapsed := time.Since(start); elapsed > cacheHostSetupBudget+time.Second {
+	if elapsed := time.Since(start); elapsed > cacheSessionSetupBudget+time.Second {
 		t.Fatal(elapsed)
 	}
 }
@@ -234,13 +230,12 @@ func TestCacheServiceRenewalRequiresVerifiedLease(t *testing.T) {
 	if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
 		t.Fatal(got)
 	}
-	host := s.sessions["fdaa:1:0:2::7"]
-	host.mu.Lock()
-	release := *host.release
-	host.mu.Unlock()
-	a := host.authority.(*cacheServiceAuthority)
+	a, binding := serviceAuthorityFixture(t, s)
+	release, err := a.resolve(t.Context(), binding, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	a.lease.Job.Verified = false
-	binding, _ := host.authenticateService()
 	if _, err := a.authorize(t.Context(), binding, release, test.setup); err == nil {
 		t.Fatal("completed job renewed")
 	}
@@ -280,8 +275,7 @@ func TestCacheServiceRenewalChecksCentral(t *testing.T) {
 			if got := serviceSetup(t, s, test.setup, servicePeer); got != "enabled" {
 				t.Fatal(got)
 			}
-			host := s.sessions["fdaa:1:0:2::7"]
-			a := host.authority.(*cacheServiceAuthority)
+			a, binding := serviceAuthorityFixture(t, s)
 			current := a.lease
 			j := *current.Job
 			current.Job = &j
@@ -296,10 +290,25 @@ func TestCacheServiceRenewalChecksCentral(t *testing.T) {
 				current.Job.Verified = false
 			}
 			a.central = changedCacheCentral{current}
-			binding, _ := host.authenticateService()
-			if _, err := a.authorize(t.Context(), binding, *host.release, test.setup); err == nil {
+			release, err := a.resolve(t.Context(), binding, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.authorize(t.Context(), binding, release, test.setup); err == nil {
 				t.Fatal("changed Central lease renewed")
 			}
 		})
 	}
+}
+
+// Authority checks use the managed attribution adapter, never session internals.
+func serviceAuthorityFixture(t *testing.T, s *cacheService) (*cacheServiceAuthority, cacheGuestBinding) {
+	t.Helper()
+	address := netip.MustParseAddr("fdaa:1:0:2::7")
+	lease, err := s.central.lease(t.Context(), address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := cacheGuestBinding{service: true, TenantID: lease.TenantID, VMID: lease.VMID, RunnerID: lease.RunnerID, RunnerName: lease.RunnerName, Repository: lease.Repository, ExpiresAt: lease.Deadline}
+	return &cacheServiceAuthority{regionID: s.config.RegionID, central: s.central, address: address, lease: lease}, binding
 }

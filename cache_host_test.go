@@ -80,20 +80,22 @@ func startCacheHostFixture(t *testing.T, test *authorityCase, configure ...func(
 	logs, logMu := &strings.Builder{}, &sync.Mutex{}
 	bindings := &fakeBindings{}
 	host := &cacheHost{
-		vmID: test.binding.VMID, uds: uds, bindings: bindings, authority: &authority,
-		clock: func(context.Context) (grant.Clock, error) {
-			now := time.Now()
-			return grant.Clock{Earliest: now.Add(-300 * time.Millisecond), Latest: now.Add(300 * time.Millisecond)}, nil
-		},
-		key: private, audience: data.URL, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, archiveBytes: 1 << 20,
-		peer: cacheUnixPeerCredentials, directoryGroup: cacheTestSocketGroup,
-		log: func(fields map[string]any) {
-			encoded, _ := json.Marshal(fields)
-			logMu.Lock()
-			logs.Write(append(encoded, '\n'))
-			logMu.Unlock()
-		},
+		vmID: test.binding.VMID, uds: uds, bindings: bindings,
+		sessionConfig: cacheSessionConfig{authority: &authority, id: test.binding.VMID,
+			clock: func(context.Context) (grant.Clock, error) {
+				now := time.Now()
+				return grant.Clock{Earliest: now.Add(-300 * time.Millisecond), Latest: now.Add(300 * time.Millisecond)}, nil
+			},
+			key: private, audience: data.URL, roots: data.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, archiveBytes: 1 << 20,
+			log: func(fields map[string]any) {
+				encoded, _ := json.Marshal(fields)
+				logMu.Lock()
+				logs.Write(append(encoded, '\n'))
+				logMu.Unlock()
+			},
+		}, peer: cacheUnixPeerCredentials, directoryGroup: cacheTestSocketGroup,
 	}
+	host.log = host.sessionConfig.log
 	for _, change := range configure {
 		change(host)
 	}
@@ -276,7 +278,7 @@ func TestCacheHostSetupFallsBackWhenTheJobIsUnconfirmed(t *testing.T) {
 	if outcome := host.setup(t, test.setup); outcome != "disabled" || !host.logged("unconfirmed") || !host.eventually(`"event":"confirm_refused"`) {
 		t.Fatal("unconfirmed job enabled", outcome)
 	}
-	if elapsed := time.Since(started); elapsed > cacheHostSetupBudget+time.Second {
+	if elapsed := time.Since(started); elapsed > cacheSessionSetupBudget+time.Second {
 		t.Fatal("resolution not bounded by the setup budget", elapsed)
 	}
 	if status := host.lookup(t); status != http.StatusServiceUnavailable {
@@ -359,7 +361,7 @@ func TestCacheHostAnswersSetupWhenItIsUnavailable(t *testing.T) {
 func TestCacheHostRenewsInTheBackgroundWithoutBlockingRequests(t *testing.T) {
 	test := newAuthorityCase(t)
 	host := startCacheHostFixture(t, test, func(host *cacheHost) {
-		host.renewWindow = 30*time.Minute - 5*time.Second - 3*time.Second // renew ~3 s after setup
+		host.sessionConfig.renewWindow = 30*time.Minute - 5*time.Second - 3*time.Second // renew ~3 s after setup
 	})
 	binding := test.binding
 	host.bindings.set(&binding)
