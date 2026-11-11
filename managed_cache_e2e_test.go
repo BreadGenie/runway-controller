@@ -182,7 +182,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 	f.data.Restart(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, sessions: map[string]*cacheHost{}, slots: make(chan struct{}, 64), template: cacheHost{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
+	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
 	f.guest = httptest.NewUnstartedServer(managedPeer(f.service, servicePeer))
 	f.guest.Config.IdleTimeout = 5 * time.Second
 	identity := t.TempDir()
@@ -204,11 +204,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 		f.service.mu.Lock()
 		defer f.service.mu.Unlock()
 		for _, h := range f.service.sessions {
-			h.mu.Lock()
-			if h.current != nil {
-				h.current.Close()
-			}
-			h.mu.Unlock()
+			h.session.close()
 		}
 	})
 	// Resolve JobAssigned through the controller's REST worker, before any
