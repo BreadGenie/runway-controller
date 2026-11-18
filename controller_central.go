@@ -16,6 +16,7 @@ import (
 )
 
 type controllerConfig struct {
+	MetricsListen           string   `json:"metrics_listen,omitempty"`
 	CentralURL              string   `json:"central_url"`
 	CentralHost             string   `json:"central_host,omitempty"`
 	CredentialFile          string   `json:"central_credential_file"`

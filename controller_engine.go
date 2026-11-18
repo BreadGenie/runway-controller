@@ -32,6 +32,7 @@ type pilotGitHub interface {
 }
 
 type pilotEngine struct {
+	metrics             *controllerMetrics
 	verificationResults chan controllerVerificationResult
 	verificationRetries map[string]*controllerVerificationRetry
 	verificationBusy    bool
@@ -53,6 +54,7 @@ type pilotEngine struct {
 }
 
 func (e *pilotEngine) remember(lease pilotLease) {
+	defer func() { e.metrics.observe(e.snapshot) }()
 	for i := range e.snapshot.Leases {
 		if e.snapshot.Leases[i].ID == lease.ID {
 			e.snapshot.Leases[i] = lease
@@ -92,6 +94,9 @@ func (e *pilotEngine) reserve(ctx context.Context) (pilotLease, error) {
 func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
 	if message == nil {
 		return nil
+	}
+	if e.snapshot.Pool.Enabled {
+		e.metrics.demand(message.Statistics, len(message.JobAvailableMessages))
 	}
 	if message.Statistics != nil {
 		e.demand = min(1, max(0, message.Statistics.TotalAssignedJobs))

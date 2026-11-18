@@ -93,6 +93,10 @@ func routed(env []string) []string {
 }
 
 func environment(args, env []string, selectRoute func() bool, notify func(string)) []string {
+	return cacheEnvironment(args, env, selectRoute, notify, func(string) {})
+}
+
+func cacheEnvironment(args, env []string, selectRoute func() bool, notify, outcome func(string)) []string {
 	if len(args) < 2 {
 		return env
 	}
@@ -102,11 +106,14 @@ func environment(args, env []string, selectRoute func() bool, notify func(string
 	}
 	if digest, ok := supported(args[1], name); !ok {
 		notify(unpinned(name, args[1], digest))
+		outcome("fallback")
 		return env
 	}
 	if selectRoute() {
+		outcome("routed")
 		return routed(env)
 	}
+	outcome("fallback")
 	return env
 }
 
@@ -432,11 +439,27 @@ func main() {
 		return
 	}
 
-	env := environment(os.Args, os.Environ(), func() bool { return selectRoute("/run/runway", os.Getenv, setup) }, func(line string) { fmt.Fprintln(os.Stderr, line) })
+	env := cacheEnvironment(os.Args, os.Environ(), func() bool { return selectRoute("/run/runway", os.Getenv, setup) }, func(line string) { fmt.Fprintln(os.Stderr, line) }, recordCacheOutcome)
 	// The non-candidate path performs no filesystem reads before exec.
 	real := filepath.Join(filepath.Dir(os.Args[0]), "node.real")
 	if err := syscall.Exec(real, os.Args, env); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(127)
+	}
+}
+
+// Each candidate invocation appends one byte. The guest agent only reads the
+// size of these fixed, bounded files. Recording is best effort.
+func recordCacheOutcome(outcome string) {
+	if config, err := readServiceConfig(configPath); err != nil || config == nil {
+		return
+	}
+	f, err := os.OpenFile("/run/runway/metric-"+outcome, os.O_WRONLY|os.O_APPEND|os.O_CREATE|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err == nil && info.Mode().IsRegular() && info.Size() < 1<<20 {
+		_, _ = f.WriteString("1")
 	}
 }

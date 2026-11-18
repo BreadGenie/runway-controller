@@ -334,6 +334,16 @@ def main() -> int:
         # reports beyond the state is dropped here unless it is asked for. That is what a
         # silent measurement looks like: the guest measured, and this line threw it away.
         document = {'state': status['state']}
+        metrics = status.get('cache_metrics')
+        if isinstance(metrics, dict):
+            observed = {
+                name: metrics[name] for name, limit in (
+                    ('routed', 1 << 20), ('fallback', 1 << 20), ('relay_errors', 1 << 20),
+                    ('extraction_bytes', (1 << 63) - 1),
+                ) if type(metrics.get(name)) is int and 0 <= metrics[name] <= limit
+            }
+            if observed:
+                document['cache_metrics'] = observed
         if args.timings and status.get('timings_ms'):
             document['timings_ms'] = status['timings_ms']
         print(json.dumps(document))

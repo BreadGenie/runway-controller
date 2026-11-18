@@ -288,9 +288,34 @@ def execute(payload, *, _paths=None):
             timings[name] = round((time.monotonic() - started) * 1000)
 
 
+    def cache_metrics():
+        metrics = {}
+        for outcome in ('routed', 'fallback', 'relay_errors'):
+            try:
+                entry = (paths.system_root / 'run/runway' / ('metric-' + outcome)).lstat()
+                if stat.S_ISREG(entry.st_mode):
+                    metrics[outcome] = min(entry.st_size, 1 << 20)
+            except OSError:
+                pass
+        # Actions cache extracts into the workspace and stages archives in _temp.
+        free = []
+        for directory in (workspace, workspace / '_temp'):
+            try:
+                space = os.statvfs(directory)
+                free.append(space.f_bavail * space.f_frsize)
+            except OSError:
+                pass
+        if free:
+            metrics['extraction_bytes'] = min(free)
+        return metrics
+
     def report(state):
         """Build the status, adding step timings only when requested."""
         document = {'state': state}
+        if action == 'status' and state != 'unknown':
+            metrics = cache_metrics()
+            if metrics:
+                document['cache_metrics'] = metrics
         if timings:
             document['timings_ms'] = timings
         response.clear()
@@ -885,11 +910,11 @@ def execute(payload, *, _paths=None):
         return (0 if action == 'status' or current == 'installed' else 1), response or None
     if action == 'collect':
         report = call(['journalctl', '-u', 'runway-runner.service', '--no-pager', '-n', '200'])
-        response.update(state=state(), diagnostics=report.stdout[-131072:])
+        response.update(state=state(), cache_metrics=cache_metrics(), diagnostics=report.stdout[-131072:])
         return report.returncode, response or None
     if action == 'stop':
         call(['systemctl', 'stop', 'runway-runner.service'])
-        response.update(state=state())
+        response.update(state=state(), cache_metrics=cache_metrics())
         return 0, response or None
     if marker.exists() or (runner / '.runner').exists():
         response.update(state=state())

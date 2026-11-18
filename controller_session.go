@@ -72,7 +72,11 @@ func (l controllerLifecycle) Run(parent context.Context) (runErr error) {
 	heartbeatDone := make(chan error, 1)
 	go func() {
 		err := holdOwnership(ctx, func(ctx context.Context) error {
+			started := l.engine.metrics.renewalStart()
 			_, err := l.engine.store.Renew(ctx, lastError.Load().(string))
+			if err == nil {
+				l.engine.metrics.renew(started)
+			}
 			return err
 		}, l.heartbeatEvery)
 		if err != nil {
@@ -131,6 +135,7 @@ func (l controllerLifecycle) Run(parent context.Context) (runErr error) {
 			}
 			if errors.Is(err, errPoolResumed) {
 				l.engine.demand, l.engine.haveDemand = 0, false
+				l.engine.metrics.clearDemand()
 				l.log("controller_pool_resumed", nil)
 			} else if ctx.Err() == nil {
 				if err == nil {
@@ -210,14 +215,17 @@ func (l controllerLifecycle) refresh(ctx context.Context, session controllerSess
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	started := l.engine.metrics.renewalStart()
 	fresh, err := l.engine.store.Renew(ctx, health)
 	if err != nil {
 		return err
 	}
+	l.engine.metrics.renew(started)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	l.engine.snapshot = fresh
+	l.engine.metrics.observe(fresh)
 	if session != nil {
 		session.SetMaxRunners(poolCapacity(fresh.Pool))
 	}

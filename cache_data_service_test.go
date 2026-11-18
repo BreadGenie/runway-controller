@@ -215,7 +215,9 @@ func startCacheDataFixture(t *testing.T, config cacheDataServiceConfig, pair tls
 	ctx, cancel := context.WithCancel(t.Context())
 	running := &runningCacheDataService{cancel: cancel, done: make(chan error, 1)}
 	core := coreFixture(t, config)
-	go func() { running.done <- startCacheDataService(ctx, config.Listen, core, pair, observe) }()
+	go func() {
+		running.done <- startCacheDataService(ctx, config.Listen, core, pair, observe, config.MetricsListen)
+	}()
 	t.Cleanup(func() { cancel(); running.join(t) })
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -293,6 +295,12 @@ func assertCacheDataListenerClosed(t *testing.T, address string) {
 
 func TestCacheDataServiceTLSAndClock(t *testing.T) {
 	config, private := cacheDataConfigFixture(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MetricsListen = listener.Addr().String()
+	listener.Close()
 	garage := storetest.NewGarage(t)
 	config.Garage.Endpoint = garage.URL
 	pair, client := cacheDataTLSFixture(t)
@@ -336,6 +344,27 @@ func TestCacheDataServiceTLSAndClock(t *testing.T) {
 	clockRefused.Store(true)
 	if status, data := callCacheData(t, client, "GET", lookup, token, "", "", ""); status != 503 || strings.Contains(string(data), "private clock") {
 		t.Fatal("clock refusal failed or disclosed diagnostic", status)
+	}
+	response, err = plain.Get("http://" + config.MetricsListen + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || readErr != nil ||
+		!strings.Contains(string(body), "runway_cache_misses_total 1\n") ||
+		!strings.Contains(string(body), "runway_cache_hits_total 0\n") {
+		t.Fatalf("invalid metrics scrape: %s (%v)", body, readErr)
+	}
+	for _, area := range []string{"journal", "spool"} {
+		for _, name := range []string{"available", "size"} {
+			var bytes uint64
+			pattern := fmt.Sprintf("runway_cache_filesystem_%s_bytes{area=%q} ", name, area)
+			_, value, found := strings.Cut(string(body), pattern)
+			if _, err := fmt.Sscan(value, &bytes); !found || err != nil || bytes == 0 {
+				t.Errorf("missing positive filesystem sample %s in %s", pattern, body)
+			}
+		}
 	}
 	running.cancel()
 	if err := running.join(t); err != nil {
@@ -460,7 +489,7 @@ func TestCacheDataServiceStartupFailuresReleaseListenerAndJournal(t *testing.T) 
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 			defer cancel()
-			if err := startCacheDataService(ctx, config.Listen, coreFixture(t, config), pair, observe); err == nil || strings.Contains(err.Error(), "fixture-secret") || strings.Contains(err.Error(), config.Garage.Endpoint) {
+			if err := startCacheDataService(ctx, config.Listen, coreFixture(t, config), pair, observe, config.MetricsListen); err == nil || strings.Contains(err.Error(), "fixture-secret") || strings.Contains(err.Error(), config.Garage.Endpoint) {
 				t.Fatal("startup failure was not sanitized", err)
 			}
 			if failure != "listener already owned" {

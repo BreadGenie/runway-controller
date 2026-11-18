@@ -30,6 +30,7 @@ func runController(path string) error {
 	if err != nil {
 		return err
 	}
+	claimStarted := time.Now()
 	snapshot, err := central.Claim(ctx)
 	if err != nil {
 		return err
@@ -37,6 +38,13 @@ func runController(path string) error {
 	if snapshot.Fence <= 0 || snapshot.Pool.MaxConcurrency != 1 || !repositoryURL.MatchString(snapshot.Pool.RepositoryURL) || snapshot.Pool.ScaleSetID <= 0 {
 		return errors.New("pilot requires a fenced pool, repository URL, existing scale set, and max_concurrency=1")
 	}
+	metrics := newControllerMetrics(snapshot, time.Now)
+	metrics.renewed = claimStarted
+	closeMetrics, err := startMetrics(cfg.MetricsListen, metrics.write)
+	if err != nil {
+		return err
+	}
+	defer closeMetrics()
 	// Mutating GitHub calls must not be blindly retried by the SDK's HTTP
 	// retry policy. Uncertain JIT outcomes are represented by Central phases.
 	adminHTTP := retryablehttp.NewClient()
@@ -46,7 +54,7 @@ func runController(path string) error {
 	if err != nil {
 		return err
 	}
-	engine := &pilotEngine{store: central, github: github, assignmentREST: rest, guest: commandTransport{command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
+	engine := &pilotEngine{metrics: metrics, store: central, github: github, assignmentREST: rest, guest: commandTransport{observeCache: metrics.observeGuest, command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
 	json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_claimed", "pool": cfg.Pool, "owner_id": cfg.OwnerID, "fence": snapshot.Fence})
 	lifecycle := controllerLifecycle{
 		engine: engine,

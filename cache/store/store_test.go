@@ -59,6 +59,9 @@ func TestSaveRestoreRefsAndIsolation(t *testing.T) {
 	if status, _ := service.Reserve(t, reader, "read-only", 4); status != 403 {
 		t.Fatal("read-only grant reserved", status)
 	}
+	if hits, misses := service.LookupCounts(); hits != 6 || misses != 3 {
+		t.Fatalf("lookup counters: got %d hits, %d misses", hits, misses)
+	}
 }
 
 func TestReservationUploadAndFinalizeContracts(t *testing.T) {

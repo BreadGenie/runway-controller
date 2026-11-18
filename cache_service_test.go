@@ -141,6 +141,15 @@ func TestCacheServiceGrantTranslatorReplay(t *testing.T) {
 	if w.Code != 204 {
 		t.Fatal(w.Code, w.Body.String())
 	}
+	assertMetric(t, s.writeMetrics, "cache_translator_errors_total 0")
+	invalid := httptest.NewRequest("GET", "/unsupported", nil)
+	invalid.RemoteAddr = servicePeer
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, invalid)
+	if w.Code != http.StatusBadRequest {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	assertMetric(t, s.writeMetrics, "cache_translator_errors_total 1")
 }
 func TestCacheServiceCentralBudget(t *testing.T) {
 	s, test := serviceFixture(t, nil, 200, true)

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,24 +27,26 @@ import (
 )
 
 type cacheServiceConfig struct {
-	OperatorListen   string   `json:"operator_listen"`
-	OperatorPeers    []string `json:"operator_peers,omitempty"`
-	CentralIssuer    string   `json:"central_issuer"`
-	CentralJWKSURL   string   `json:"central_jwks_url"`
-	CentralRegionID  int      `json:"central_region_id"`
-	CentralCAFile    string   `json:"central_ca_file"`
-	Version          int      `json:"version"`
-	RegionID         string   `json:"region_id"`
-	MeshRegionID     uint16   `json:"mesh_region_id"`
-	Listen           string   `json:"listen"`
-	Audience         string   `json:"audience"`
-	CertificateFile  string   `json:"certificate_file"`
-	PrivateKeyFile   string   `json:"private_key_file"`
-	SigningKeyFile   string   `json:"signing_key_file"`
-	CacheDataCAFile  string   `json:"cache_data_ca_file"`
-	CentralURL       string   `json:"central_url"`
-	CentralTokenFile string   `json:"central_token_file"`
-	ArchiveBytes     int64    `json:"archive_bytes"`
+	MetricsListen     string   `json:"metrics_listen,omitempty"`
+	DataMetricsListen string   `json:"data_metrics_listen,omitempty"`
+	OperatorListen    string   `json:"operator_listen"`
+	OperatorPeers     []string `json:"operator_peers,omitempty"`
+	CentralIssuer     string   `json:"central_issuer"`
+	CentralJWKSURL    string   `json:"central_jwks_url"`
+	CentralRegionID   int      `json:"central_region_id"`
+	CentralCAFile     string   `json:"central_ca_file"`
+	Version           int      `json:"version"`
+	RegionID          string   `json:"region_id"`
+	MeshRegionID      uint16   `json:"mesh_region_id"`
+	Listen            string   `json:"listen"`
+	Audience          string   `json:"audience"`
+	CertificateFile   string   `json:"certificate_file"`
+	PrivateKeyFile    string   `json:"private_key_file"`
+	SigningKeyFile    string   `json:"signing_key_file"`
+	CacheDataCAFile   string   `json:"cache_data_ca_file"`
+	CentralURL        string   `json:"central_url"`
+	CentralTokenFile  string   `json:"central_token_file"`
+	ArchiveBytes      int64    `json:"archive_bytes"`
 }
 
 func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
@@ -54,6 +58,11 @@ func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	}
 	if _, ok := object["operator_peers"]; ok {
 		fields = append(fields, "operator_peers")
+	}
+	for _, name := range []string{"metrics_listen", "data_metrics_listen"} {
+		if _, ok := object[name]; ok {
+			fields = append(fields, name)
+		}
 	}
 	if readCacheObject(data, fields) != nil || json.Unmarshal(data, &c) != nil {
 		return c, grant.ErrInvalid
@@ -154,13 +163,14 @@ func ensureCacheServiceKey(path string) (ed25519.PrivateKey, error) {
 }
 
 type cacheService struct {
-	config   cacheServiceConfig
-	central  cacheCentral
-	template cacheSessionConfig
-	ctx      context.Context
-	mu       sync.Mutex
-	sessions map[string]*cacheServiceSession
-	slots    chan struct{}
+	translatorErrors atomic.Uint64
+	config           cacheServiceConfig
+	central          cacheCentral
+	template         cacheSessionConfig
+	ctx              context.Context
+	mu               sync.Mutex
+	sessions         map[string]*cacheServiceSession
+	slots            chan struct{}
 }
 
 // cacheServiceSession retains the mesh address's lease identity until expiry.
@@ -192,6 +202,7 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		host := s.sessions[address.String()]
 		s.mu.Unlock()
 		if host == nil {
+			s.translatorErrors.Add(1)
 			http.Error(w, "cache unavailable", 503)
 			return
 		}
@@ -245,6 +256,7 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		config := s.template
 		config.id, config.deadline = lease.Lease, lease.Deadline
 		config.nonceLimit, config.bindTickets = 4096, true
+		config.translationError = func() { s.translatorErrors.Add(1) }
 		config.authority = &cacheServiceAuthority{regionID: s.config.RegionID, central: s.central, address: address, lease: lease}
 		host = &cacheServiceSession{leaseID: lease.Lease, session: newCacheSession(s.ctx, config), authenticate: func() (cacheGuestBinding, string) {
 			if !time.Now().Before(binding.ExpiresAt) {
@@ -315,6 +327,11 @@ func runCacheService(path string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	service := &cacheService{config: c, ctx: ctx, central: rotating, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	closeMetrics, err := startMetrics(c.MetricsListen, service.writeMetrics)
+	if err != nil {
+		return err
+	}
+	defer closeMetrics()
 	listener, err := net.Listen("tcp6", c.Listen)
 	if err != nil {
 		return err
@@ -352,4 +369,8 @@ func runCacheService(path string) error {
 		return nil
 	}
 	return err
+}
+
+func (s *cacheService) writeMetrics(w io.Writer) {
+	metric(w, "cache_translator_errors_total", "counter", "", s.translatorErrors.Load())
 }

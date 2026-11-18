@@ -61,7 +61,7 @@ func prepareCacheService(path string, check bool) error {
 	if storage == "" {
 		storage = "/etc/runway/storage-ca.pem"
 	}
-	config := cacheDataServiceConfig{Version: 1, Listen: origin.Host, PublicOrigin: c.Audience, CertificateFile: c.CertificateFile, PrivateKeyFile: c.PrivateKeyFile, PublicKeys: map[string]string{grant.KeyID(public): hex.EncodeToString(public)}, RegionID: c.RegionID, StateDir: "/var/lib/runway-cache", QuotaBytes: 1 << 30, TotalBytes: 4 << 30, MaxArchiveBytes: c.ArchiveBytes, Disk: store.DiskConfig{Directory: "/var/lib/runway-cache/spools", PhysicalBytes: 8 << 30}, Managed: &cacheManagedConfig{CentralCAFile: c.CentralCAFile, CentralURL: c.CentralURL, CentralTokenFile: c.CentralTokenFile, StorageCAFile: storage}}
+	config := cacheDataServiceConfig{MetricsListen: c.DataMetricsListen, Version: 1, Listen: origin.Host, PublicOrigin: c.Audience, CertificateFile: c.CertificateFile, PrivateKeyFile: c.PrivateKeyFile, PublicKeys: map[string]string{grant.KeyID(public): hex.EncodeToString(public)}, RegionID: c.RegionID, StateDir: "/var/lib/runway-cache", QuotaBytes: 1 << 30, TotalBytes: 4 << 30, MaxArchiveBytes: c.ArchiveBytes, Disk: store.DiskConfig{Directory: "/var/lib/runway-cache/spools", PhysicalBytes: 8 << 30}, Managed: &cacheManagedConfig{CentralCAFile: c.CentralCAFile, CentralURL: c.CentralURL, CentralTokenFile: c.CentralTokenFile, StorageCAFile: storage}}
 	data, err := json.Marshal(config)
 	if err != nil {
 		return err
