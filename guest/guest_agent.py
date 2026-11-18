@@ -38,12 +38,15 @@ class _Paths(NamedTuple):
     wrapper: Path = Path('/usr/local/bin/runway-guest-runner')
 
 
+CACHE_RELAY_UNIT = 'runway-cache-relay.service'
+
+
 def install_regional_cache(bundle, paths, call):
     """Transactional fresh-clone install; payload contains bytes, never guest paths."""
     root = paths.system_root
     changed = []
     created = []
-    unit = 'runway-cache-relay.service'
+    unit = CACHE_RELAY_UNIT
     active = enabled = False
     started = False
     service_touched = False
@@ -868,10 +871,16 @@ def execute(payload, *, _paths=None):
                         int(payload['workspace_tmpfs_mib'])):
                     report('unknown')
                     return 1, response or None
-            if payload.get('regional_cache') and not timed(
-                    'regional_cache', install_regional_cache, payload['regional_cache'], paths, call):
-                report('unknown')
-                return 1, response or None
+            if payload.get('regional_cache'):
+                if not timed('regional_cache', install_regional_cache, payload['regional_cache'], paths, call):
+                    report('unknown')
+                    return 1, response or None
+            elif (paths.system_root / 'etc/systemd/system' / CACHE_RELAY_UNIT).exists():
+                # First-boot presets can enable the relay baked into older images.
+                if call(['systemctl', 'disable', '--now', CACHE_RELAY_UNIT]).returncode:
+                    print('Could not stop and disable the unconfigured cache relay.', file=sys.stderr)
+                    report('unknown')
+                    return 1, response or None
         report(current)
         return (0 if action == 'status' or current == 'installed' else 1), response or None
     if action == 'collect':

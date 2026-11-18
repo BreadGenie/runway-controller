@@ -1,5 +1,6 @@
 [Unit]
 Description=Credential-free regional cache relay
+ConditionPathExists=/etc/runway/cache.json
 After=systemd-sysusers.service systemd-modules-load.service
 Requires=systemd-sysusers.service
 
