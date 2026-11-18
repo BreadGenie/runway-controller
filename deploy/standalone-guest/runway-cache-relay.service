@@ -21,6 +21,7 @@ TimeoutStopSec=5
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 ProtectSystem=strict
+ReadWritePaths=-/run/runway
 ProtectHome=yes
 PrivateTmp=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_VSOCK

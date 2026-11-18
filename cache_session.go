@@ -28,19 +28,20 @@ const (
 // cacheSessionConfig supplies immutable dependencies and adapter-specific policy.
 // Authentication stays with the adapter; the session rechecks it before accepting setup.
 type cacheSessionConfig struct {
-	deadline     time.Time // managed Runner Lease stop; zero uses the parent lifetime
-	id           string
-	authority    cacheJobAuthority
-	unavailable  string
-	clock        func(context.Context) (grant.Clock, error)
-	key          ed25519.PrivateKey
-	audience     string
-	roots        *x509.CertPool
-	archiveBytes int64
-	log          func(map[string]any)
-	renewWindow  time.Duration
-	nonceLimit   int // zero preserves the standalone lifetime-bounded behavior
-	bindTickets  bool
+	translationError func()
+	deadline         time.Time // managed Runner Lease stop; zero uses the parent lifetime
+	id               string
+	authority        cacheJobAuthority
+	unavailable      string
+	clock            func(context.Context) (grant.Clock, error)
+	key              ed25519.PrivateKey
+	audience         string
+	roots            *x509.CertPool
+	archiveBytes     int64
+	log              func(map[string]any)
+	renewWindow      time.Duration
+	nonceLimit       int // zero preserves the standalone lifetime-bounded behavior
+	bindTickets      bool
 }
 
 // cacheSession owns one job's cache access independently of its ingress transport.
@@ -344,6 +345,9 @@ func (session *cacheSession) translate(w http.ResponseWriter, r *http.Request, r
 	reason := ""
 	defer func() {
 		recovered := recover()
+		if session.config.translationError != nil && (recovered != nil || recorder.status >= 400) {
+			session.config.translationError()
+		}
 		session.config.log(map[string]any{"event": "http", "vm_id": session.config.id, "method": r.Method, "path": path, "status": recorder.status, "request_bytes": r.ContentLength, "response_bytes": recorder.bytes, "ms": time.Since(start).Milliseconds(), "reason": reason, "aborted": recovered != nil})
 		if recovered != nil {
 			panic(recovered)

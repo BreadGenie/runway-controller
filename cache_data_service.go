@@ -28,6 +28,7 @@ import (
 // cacheDataServiceConfig is the strict cache-data configuration. It names
 // Garage storage explicitly; there are no ambient credentials or discovery.
 type cacheDataServiceConfig struct {
+	MetricsListen   string               `json:"metrics_listen,omitempty"`
 	Version         int                  `json:"version"`
 	Listen          string               `json:"listen"`
 	PublicOrigin    string               `json:"public_origin"`
@@ -66,6 +67,9 @@ func decodeCacheDataServiceConfig(data []byte) (cacheDataServiceConfig, store.Co
 		required = append(required, "managed")
 	} else {
 		required = append(required, "garage")
+	}
+	if _, ok := fields["metrics_listen"]; ok {
+		required = append(required, "metrics_listen")
 	}
 	if _, ok := fields["storage_budget"]; ok {
 		required = append(required, "storage_budget")
@@ -182,12 +186,12 @@ func runCacheDataService(configPath string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return startCacheDataService(ctx, config.Listen, core, pair, newCacheHostClock().observe)
+	return startCacheDataService(ctx, config.Listen, core, pair, newCacheHostClock().observe, config.MetricsListen)
 }
 
 // startCacheDataService serves until ctx ends. The injected clock keeps local
 // tests independent of the host kernel clock; the command always uses adjtimex.
-func startCacheDataService(ctx context.Context, listen string, core store.Config, pair tls.Certificate, observe func(context.Context) (grant.Clock, error)) (result error) {
+func startCacheDataService(ctx context.Context, listen string, core store.Config, pair tls.Certificate, observe func(context.Context) (grant.Clock, error), metricsListen string) (result error) {
 	if observe == nil || len(pair.Certificate) == 0 || pair.PrivateKey == nil {
 		return grant.ErrInvalid
 	}
@@ -208,6 +212,18 @@ func startCacheDataService(ctx context.Context, listen string, core store.Config
 			result = errors.Join(result, errors.New("cache data state close failed"))
 		}
 	}()
+	if metricsListen != "" {
+		closeMetrics, err := startMetrics(metricsListen, func(w io.Writer) {
+			hits, misses := service.LookupCounts()
+			metric(w, "cache_hits_total", "counter", "", hits)
+			metric(w, "cache_misses_total", "counter", "", misses)
+			cacheDiskMetrics(w, core.StateDir, core.Disk.Directory)
+		})
+		if err != nil {
+			return err
+		}
+		defer closeMetrics()
+	}
 	budget := store.DefaultStorageBudget
 	if core.StorageBudget != nil {
 		budget = *core.StorageBudget

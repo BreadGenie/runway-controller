@@ -17,8 +17,9 @@ type guestTransport interface {
 }
 
 type commandTransport struct {
-	command []string
-	timeout time.Duration
+	observeCache func(pilotLease, guestCacheMetrics)
+	command      []string
+	timeout      time.Duration
 }
 
 func (t commandTransport) Call(ctx context.Context, action string, lease pilotLease, jit string) (string, error) {
@@ -62,8 +63,9 @@ func (t commandTransport) Call(ctx context.Context, action string, lease pilotLe
 		return "unknown", errors.New("guest " + action + " failed or timed out")
 	}
 	var status struct {
-		State     string         `json:"state"`
-		TimingsMs map[string]int `json:"timings_ms"`
+		Cache     *guestCacheMetrics `json:"cache_metrics"`
+		State     string             `json:"state"`
+		TimingsMs map[string]int     `json:"timings_ms"`
 	}
 	if output.Len() > 4096 || json.Unmarshal(output.Bytes(), &status) != nil {
 		return "unknown", errors.New("guest transport returned invalid status")
@@ -79,6 +81,9 @@ func (t commandTransport) Call(ctx context.Context, action string, lease pilotLe
 	}
 	switch status.State {
 	case "installed", "running", "completed", "unknown":
+		if t.observeCache != nil && status.Cache != nil {
+			t.observeCache(lease, *status.Cache)
+		}
 		return status.State, nil
 	default:
 		return "unknown", errors.New("guest transport returned unsupported state")

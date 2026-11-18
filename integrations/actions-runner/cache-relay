@@ -87,6 +87,18 @@ def relay(left, right, stop, idle_seconds=IDLE_SECONDS):
                     deadline = time.monotonic() + idle_seconds
 
 
+def record_error():
+    try:
+        fd = os.open("/run/runway/metric-relay_errors",
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            entry = os.fstat(stream.fileno())
+            if stat.S_ISREG(entry.st_mode) and entry.st_size < 1 << 20:
+                stream.write(b"1")
+    except OSError:
+        pass
+
+
 def serve(listener, stop, connect, first_byte_seconds=FIRST_BYTE_SECONDS):
     """Own every connection and worker; the host enforces attempt authorization."""
     slots = threading.BoundedSemaphore(CONNECTIONS)
@@ -113,7 +125,7 @@ def serve(listener, stop, connect, first_byte_seconds=FIRST_BYTE_SECONDS):
                 with connect() as upstream:
                     relay(connection, upstream, stop)
         except OSError:
-            pass  # Close this byte stream; never log credentials or retry writes.
+            record_error()  # Close this byte stream without logging data or retrying writes.
         finally:
             slots.release()
 
@@ -129,6 +141,7 @@ def serve(listener, stop, connect, first_byte_seconds=FIRST_BYTE_SECONDS):
                 continue
             if not slots.acquire(blocking=False):
                 connection.close()
+                record_error()
                 continue
             thread = threading.Thread(target=worker, args=(connection,))
             try:

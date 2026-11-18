@@ -19,11 +19,20 @@ func TestControllerTransportKeepsCredentialsOffArgvAndEnvironment(t *testing.T) 
 	}
 	t.Setenv("GH_TOKEN", "control-plane-secret")
 	t.Setenv("RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE", "/private/app.pem")
-	transport := commandTransport{command: []string{executable, "-test.run=TestControllerTransportHelper", "--", "runway-test-helper"}, timeout: time.Second * 5}
-	state, err := transport.Call(context.Background(), "bootstrap", pilotLease{VMID: "vm-0000001", RunnerName: "runway-test", Deadline: time.Now().Add(time.Minute)}, "stdin-jit-secret")
-	if err != nil || state != "running" {
-		t.Fatalf("invalid transport result %q %v", state, err)
+	snapshot := pilotSnapshot{Pool: pilotPool{ID: "test", Enabled: true}, Leases: []pilotLease{{ID: "test", Phase: "running"}}}
+	metrics := newControllerMetrics(snapshot, time.Now)
+	transport := commandTransport{observeCache: metrics.observeGuest, command: []string{executable, "-test.run=TestControllerTransportHelper", "--", "runway-test-helper"}, timeout: time.Second * 5}
+	for range 2 {
+		state, err := transport.Call(context.Background(), "bootstrap", pilotLease{ID: "test", Phase: "running", VMID: "vm-0000001", RunnerName: "runway-test", Deadline: time.Now().Add(time.Minute)}, "stdin-jit-secret")
+		if err != nil || state != "running" {
+			t.Fatalf("invalid transport result %q %v", state, err)
+		}
 	}
+	assertMetric(t, metrics.write,
+		`cache_routed_total{pool="test",region=""} 4`,
+		`cache_fallback_total{pool="test",region=""} 2`,
+		`cache_relay_errors_total{pool="test",region=""} 1`,
+		`cache_extraction_available_bytes{pool="test",region=""} 4096`)
 }
 
 func TestControllerTransportHelper(t *testing.T) {
@@ -53,7 +62,7 @@ func TestControllerTransportHelper(t *testing.T) {
 	if err != nil || string(data) != "stdin-jit-secret\n" {
 		os.Exit(4)
 	}
-	fmt.Println(`{"state":"running"}`)
+	fmt.Println(`{"state":"running","cache_metrics":{"routed":4,"fallback":2,"relay_errors":1,"extraction_bytes":4096}}`)
 	os.Exit(0)
 }
 

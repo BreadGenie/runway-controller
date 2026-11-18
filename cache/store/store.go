@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -115,11 +116,12 @@ type readTicket struct {
 // Server holds the index under mu. Garage I/O, hashing and streaming happen
 // outside mu on pinned entries, so a slow reader never blocks other requests.
 type Server struct {
-	config Config
-	origin *url.URL
-	budget StorageBudget
-	store  *garageStore
-	pool   *spoolPool
+	hits, misses atomic.Uint64
+	config       Config
+	origin       *url.URL
+	budget       StorageBudget
+	store        *garageStore
+	pool         *spoolPool
 
 	mu        sync.Mutex
 	clock     grant.Clock // latest observation, and when it was taken
@@ -631,8 +633,12 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
 			}
 		}
 	}
+	s.misses.Add(1)
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// LookupCounts reports authorized lookups that returned a ticket or a miss.
+func (s *Server) LookupCounts() (hits, misses uint64) { return s.hits.Load(), s.misses.Load() }
 
 // issueTicket persists a one-minute read ticket (capped at the grant) for e,
 // bound to the grant's signed tenant. Caller holds mu.
@@ -658,6 +664,7 @@ func (s *Server) issueTicket(w http.ResponseWriter, scope Scope, ref string, e *
 		fail(w, http.StatusServiceUnavailable)
 		return
 	}
+	s.hits.Add(1)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"cacheKey": e.key, "scope": ref, "archiveLocation": fmt.Sprintf("%s/download/%d?ticket=%s", s.config.PublicOrigin, e.id, token)})
 }
