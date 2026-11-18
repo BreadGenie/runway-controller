@@ -179,7 +179,7 @@ func TestCentralRPCSendsFencingAndKeepsSecretsOutOfErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = client.Update(context.Background(), "lease", "jit_requested", leaseEvent{})
-	if err == nil || strings.Contains(err.Error(), "test-secret") || !strings.Contains(err.Error(), "403") {
+	if !errors.Is(err, errCentralFenceRejected) || strings.Contains(err.Error(), "test-secret") || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("bad sanitized error: %v", err)
 	}
 	if requests != 2 {
