@@ -384,6 +384,29 @@ func TestControllerObservesUncertainBootstrapWithoutResendingSecret(t *testing.T
 	}
 }
 
+func TestControllerRetiresUnstartedGuestAfterBootstrapReplyLoss(t *testing.T) {
+	s := newPilotStore()
+	lease := prepareVM(t, s)
+	g := &fakePilotGitHub{store: s}
+	guest := &fakeGuestTransport{loseBootstrapResponse: true}
+	e := newPilotEngine(s, g, guest)
+	if err := e.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected uncertain bootstrap")
+	}
+	// Also model a transport loss before the guest started the service.
+	guest.state = "installed"
+	for range 2 {
+		if err := e.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retired := s.find(lease.ID)
+	if retired.Phase != "deleted" || retired.JITState != "removed" || g.runner != nil ||
+		g.jitCalls != 1 || guest.bootstrapCalls != 1 || g.removeCalls != 1 || s.deleteCalls != 1 {
+		t.Fatalf("uncertain bootstrap did not converge without replay: phase=%s registration=%s", retired.Phase, retired.JITState)
+	}
+}
+
 func TestControllerUncertainVMCreateReusesDurableLease(t *testing.T) {
 	s := newPilotStore()
 	s.loseCreateResponse = true
@@ -426,13 +449,25 @@ func TestControllerDeadlineDeletesVMEvenWhenGitHubIsUnavailable(t *testing.T) {
 	l.Phase = "running"
 	l.JITState = "ready"
 	l.Deadline = time.Now().Add(-time.Second)
-	g := &fakePilotGitHub{store: s, lookupFailure: true}
+	g := &fakePilotGitHub{store: s, lookupFailure: true, runner: &scaleset.RunnerReference{ID: 42, Name: l.RunnerName, RunnerScaleSetID: 7}}
 	e := newPilotEngine(s, g, &fakeGuestTransport{state: "running"})
 	if e.Reconcile(context.Background()) == nil {
 		t.Fatal("unconfirmed GitHub cleanup must report unhealthy")
 	}
 	if s.deleteCalls != 1 || s.find(l.ID).Phase != "deleted" || !e.occupied() {
 		t.Fatal("deadline left VM alive or admitted work before GitHub cleanup")
+	}
+	if g.removeCalls != 0 || g.runner == nil {
+		t.Fatal("outage should leave registration pending")
+	}
+	g.lookupFailure = false
+	e = newPilotEngine(s, g, &fakeGuestTransport{})
+	e.demand = 0
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.deleteCalls != 1 || e.occupied() || s.find(l.ID).JITState != "removed" || g.runner != nil || g.removeCalls != 1 {
+		t.Fatal("recovery did not confirm registration and VM absence")
 	}
 }
 

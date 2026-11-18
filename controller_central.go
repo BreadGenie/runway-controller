@@ -195,6 +195,8 @@ func newCentralRPC(cfg controllerConfig) (*centralRPC, error) {
 // to retry later, so callers treat it as a delay rather than a failure.
 var errCentralContended = errors.New("Central returned HTTP 508; a concurrent transaction is blocking this one, retry later")
 
+var errCentralFenceRejected = errors.New("Central denied fenced request (HTTP 403)")
+
 func (c *centralRPC) call(ctx context.Context, method string, fields map[string]any, out any) error {
 	payload := map[string]any{"pool": c.pool, "owner_id": c.owner}
 	if method != "claim_pool" {
@@ -229,6 +231,9 @@ func (c *centralRPC) call(ctx context.Context, method string, fields map[string]
 		// mutation tears down the GitHub message session and unregisters the scale set.
 		if response.StatusCode == http.StatusLoopDetected {
 			return errCentralContended
+		}
+		if response.StatusCode == http.StatusForbidden && method != "claim_pool" {
+			return fmt.Errorf("Central %s: %w", method, errCentralFenceRejected)
 		}
 		return fmt.Errorf("Central %s rejected (HTTP %d)", method, response.StatusCode)
 	}

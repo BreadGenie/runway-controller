@@ -21,6 +21,8 @@ type controllerSession interface {
 	Close(context.Context) error
 }
 
+var errPoolResumed = errors.New("runner pool resumed")
+
 type githubControllerSession struct {
 	*scaleset.MessageSessionClient
 	*listener.Listener
@@ -114,6 +116,9 @@ func (l controllerLifecycle) Run(parent context.Context) (runErr error) {
 				break
 			}
 			if err := l.engine.Reconcile(ctx); err != nil {
+				if errors.Is(err, errCentralFenceRejected) {
+					return err
+				}
 				report(err)
 			}
 		} else {
@@ -121,7 +126,13 @@ func (l controllerLifecycle) Run(parent context.Context) (runErr error) {
 			l.log("controller_listening", nil)
 			err := l.listen(ctx, session, &lastError, report)
 			l.engine.acquirer = nil
-			if ctx.Err() == nil {
+			if errors.Is(err, errCentralFenceRejected) {
+				return err
+			}
+			if errors.Is(err, errPoolResumed) {
+				l.engine.demand, l.engine.haveDemand = 0, false
+				l.log("controller_pool_resumed", nil)
+			} else if ctx.Err() == nil {
 				if err == nil {
 					err = errors.New("listener ended without an error")
 				}
@@ -147,22 +158,46 @@ func (l controllerLifecycle) listen(ctx context.Context, session controllerSessi
 	go func() { done <- session.Run(sessionCtx, pilotScaler{deliveries}) }()
 	ticker := time.NewTicker(l.reconcileEvery)
 	defer ticker.Stop()
+	refresh := func() error {
+		wasEnabled := l.engine.snapshot.Pool.Enabled
+		if err := l.refresh(ctx, session, lastError.Load().(string)); err != nil {
+			return err
+		}
+		// Changing capacity only affects the next GET. Idle polls can
+		// keep returning no statistics, and token refresh stays on the
+		// same session. Reopen to read the new session's initial demand.
+		if !wasEnabled && l.engine.snapshot.Pool.Enabled {
+			return errPoolResumed
+		}
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			stop()
 			return <-done
 		case delivery := <-deliveries:
-			err := l.refresh(ctx, session, lastError.Load().(string))
+			err := refresh()
 			if err == nil {
 				err = l.engine.Handle(ctx, delivery.message)
+			}
+			if errors.Is(err, errPoolResumed) || errors.Is(err, errCentralFenceRejected) {
+				// Leave this delivery unacknowledged for the next session.
+				delivery.result <- err
+				<-done
+				return err
 			}
 			report(err)
 			delivery.result <- err
 		case <-ticker.C:
-			err := l.refresh(ctx, session, lastError.Load().(string))
+			err := refresh()
 			if err == nil {
 				err = l.engine.Reconcile(ctx)
+			}
+			if errors.Is(err, errPoolResumed) || errors.Is(err, errCentralFenceRejected) {
+				stop()
+				<-done
+				return err
 			}
 			report(err)
 		case err := <-done:
