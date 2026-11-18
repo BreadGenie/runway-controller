@@ -77,6 +77,24 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'etc/runway/cache.json').read_text()),
                              {'version': 1, 'mode': 'service', 'service': 'internal-cache:443', 'ca_file': '/etc/runway/cache-ca.pem'})
 
+    def test_unconfigured_prepare_disables_and_stops_baked_relay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, _ = self.fixture(root)
+            disable = ['systemctl', 'disable', '--now', 'runway-cache-relay.service']
+            result, commands = self.run_guest(paths, None, existing_service=True)
+            self.assertEqual(result, (0, {'state': 'installed'}))
+            self.assertIn(disable, commands)
+            self.assertFalse((root / 'etc/runway/cache.json').exists())
+            self.assertFalse((root / 'run/runway').exists())
+            result, _ = self.run_guest(paths, None, fail=disable, existing_service=True)
+            self.assertEqual(result, (1, {'state': 'unknown'}))
+
+            (root / 'etc/systemd/system/runway-cache-relay.service').unlink()
+            result, commands = self.run_guest(paths, None)
+            self.assertEqual(result, (0, {'state': 'installed'}))
+            self.assertNotIn(disable, commands)
+
     def test_baked_default_and_missing_or_old_wrapper_restore(self):
         for broken in (None, 'missing', 'missing-real', 'old', 'schema'):
             with self.subTest(broken=broken), tempfile.TemporaryDirectory() as directory:

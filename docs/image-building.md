@@ -12,6 +12,9 @@ The tested builder uses one vCPU, 2 GiB RAM, and a 4 GiB disk. On a small Metal 
 
 ## Install and seal a builder
 
+Build with `umask 022`. With `umask 077`, the Atlas builder writes root-only
+guest network files (mode 0600), and the guest stalls waiting for networking.
+
 Create a new VM through `scripts/atlas-vm.py`, using an explicit source image and a new creation journal. The builder must never receive JIT material or run a GitHub job. A used runner cannot become a shared image, even if its registration files are later removed.
 
 Build the static cache wrapper from the reviewed Runway checkout on the controller/build machine:
