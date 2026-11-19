@@ -42,7 +42,7 @@ bucket.
 
 ## Rotate, revoke or replace
 
-Run `sudo runway --action cache-service-rotate --config /etc/runway/cache-service.json`
+Run `sudo runway-controller --action cache-service-rotate --config /etc/runway/cache-service.json`
 on the cache VM. If the reply is interrupted, repeat the same command. Both
 services read the credential from disk. Runway rejects the old credential as
 soon as rotation succeeds.

@@ -1,4 +1,4 @@
-// runway prepares an explicitly selected GitHub runner scale set.
+// runway-controller prepares an explicitly selected GitHub runner scale set.
 // It is operator tooling for a Frappe Cloud runner proof of concept.
 package main
 

@@ -6,7 +6,7 @@ Requires=runway-cache-data.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/runway --action cache-service --config /etc/runway/cache-service.json
+ExecStart=/usr/local/bin/runway-controller --action cache-service --config /etc/runway/cache-service.json
 Restart=on-failure
 RestartSec=5
 UMask=0077

@@ -5,7 +5,7 @@ Wants=runway-cache-data.service
 
 [Service]
 Type=simple
-ExecStart=/opt/runway-cache/bin/runway --action cache-host --config /etc/runway-cache/host.json --vm-id %i
+ExecStart=/opt/runway-cache/bin/runway-controller --action cache-host --config /etc/runway-cache/host.json --vm-id %i
 # Started and stopped by the standalone guest launcher; never restarted, so a
 # restarted host cannot release a second job for the same guest. The launcher
 # caps guest lifetime at RuntimeMaxSec.

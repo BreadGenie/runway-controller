@@ -144,7 +144,7 @@ The current controller provisions a VM and registers its runner from demand befo
   mismatch as a bench restored into the wrong workspace.
 - **A pool refuses a name that contradicts it.** A scale set named `runway-4vcpu-8gb` against a pool
   building 1 vCPU and 2 GiB is refused when the pool saves, where it is one line to fix, rather than
-  at acquisition. The name must also be routable: `runway`-prefixed, lowercase. The runway CLI
+  at acquisition. The name must also be routable: `runway`-prefixed, lowercase. The `runway-controller` CLI
   enforces the same pattern, so an operator cannot create a name the pool will refuse.
 - **A name that states no shape still works.** `runway-dogfood` states nothing to check and keeps its
   meaning, so a pool that predates shapes does not have to be renamed.

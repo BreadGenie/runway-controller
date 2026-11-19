@@ -1,13 +1,13 @@
 #!/bin/bash
 # Install or upgrade the persistent regional-cache services on blr-1.
-#   install.sh /path/to/runway /path/to/cache-node (static linux/amd64 builds)
+#   install.sh /path/to/runway-controller /path/to/cache-node (static linux/amd64 builds)
 # Idempotent. Keeps the previous binaries as *.previous for rollback. Never
 # touches metal.service, metald state or its ZFS pool.
 set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
-runway=${1:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
-cache_node=${2:?usage: install.sh /path/to/runway-binary /path/to/cache-node-binary}
+controller=${1:?usage: install.sh /path/to/runway-controller /path/to/cache-node-binary}
+cache_node=${2:?usage: install.sh /path/to/runway-controller /path/to/cache-node-binary}
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 if [ -d /run/runway-cache/bindings ] && [ -n "$(find /run/runway-cache/bindings -mindepth 1 -maxdepth 1 -print -quit)" ]; then
 	echo "refusing install: guest binding files exist in /run/runway-cache/bindings; tear down all guests first" >&2
@@ -45,11 +45,11 @@ fi
 # No pipe into grep -q: under pipefail its early exit fails the check.
 version=$(/opt/runway-garage/bin/garage --version)
 case $version in "garage $GARAGE_VERSION"|"garage $GARAGE_VERSION ["*) ;; *) echo "unexpected Garage version: $version" >&2; exit 1 ;; esac
-# The new runway must run here and know the cache actions before it replaces the old one.
-check=$("$runway" --action cache-data 2>&1 || true)
-case $check in *"cache-data requires --config"*) ;; *) echo "runway binary refused: $check" >&2; exit 1 ;; esac
+# The new runway-controller must run here and know the cache actions before it replaces the old one.
+check=$("$controller" --action cache-data 2>&1 || true)
+case $check in *"cache-data requires --config"*) ;; *) echo "runway-controller binary refused: $check" >&2; exit 1 ;; esac
 
-replace "$runway" /opt/runway-cache/bin/runway 0755
+replace "$controller" /opt/runway-cache/bin/runway-controller 0755
 replace "$here/health.sh" /opt/runway-cache/bin/runway-cache-health 0755
 replace "$here/../standalone-guest/runway-standalone-guest" /opt/runway-cache/bin/runway-standalone-guest 0755
 replace "$here/../standalone-guest/setup-probe.py" /opt/runway-cache/bin/runway-setup-probe 0755
@@ -60,7 +60,9 @@ for helper in cache-relay; do
 done
 replace "$here/../standalone-guest/runway-cache-relay.service" /opt/runway-cache/guest/runway-cache-relay.service 0644
 install -m 0600 -o runway-garage -g runway-garage "$here/garage.toml" /etc/runway-garage/garage.toml
-for unit in "$here"/systemd/*; do install -m 0644 "$unit" /etc/systemd/system/; done
+for unit in "$here"/systemd/*; do
+	replace "$unit" "/etc/systemd/system/${unit##*/}" 0644
+done
 install -m 0644 "$here/tmpfiles.conf" /etc/tmpfiles.d/runway-cache.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/runway-cache.conf
 
@@ -116,4 +118,4 @@ while read -r unit _; do
     [ -n "$unit" ] && systemctl restart "$unit"
 done < <(systemctl list-units --no-legend --state=active 'runway-cache-host@*')
 systemctl enable --now runway-cache-health.timer
-echo "installed: garage $version runway $(sha256sum /opt/runway-cache/bin/runway | cut -c1-16)…"
+echo "installed: garage $version runway-controller $(sha256sum /opt/runway-cache/bin/runway-controller | cut -c1-16)…"

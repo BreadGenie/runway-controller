@@ -149,7 +149,7 @@ refuses grants from the other mode.
 
 ## Service mode
 
-`runway --action cache-service --config /etc/runway/cache-service.json` serves
+`runway-controller --action cache-service --config /etc/runway/cache-service.json` serves
 a direct guest mesh TLS listener.
 `POST /setup` carries the existing newline-framed
 setup wire v2 request and response; cache v1 `/_apis/artifactcache/...` and
@@ -215,10 +215,10 @@ The service signs grants with the positive tenant from the verified Runway
 lease; managed cache-data rejects standalone grants. No changes to main's two
 actions are needed.
 
-- `runway-cache-data.service`: `ExecStart=/usr/local/bin/runway --action cache-data --config /etc/runway/cache-data.json`
+- `runway-cache-data.service`: `ExecStart=/usr/local/bin/runway-controller --action cache-data --config /etc/runway/cache-data.json`
 - `runway-cache-service.service`: `After=runway-cache-data.service`,
   `Requires=runway-cache-data.service`,
-  `ExecStart=/usr/local/bin/runway --action cache-service --config /etc/runway/cache-service.json`
+  `ExecStart=/usr/local/bin/runway-controller --action cache-service --config /etc/runway/cache-service.json`
 
 Install the unit templates from `deploy/regional-cache/systemd/`.
 Use `Restart=on-failure` for both units. Provision protected configuration and
