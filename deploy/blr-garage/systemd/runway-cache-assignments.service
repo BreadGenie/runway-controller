@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/runway-cache/bin/runway --action cache-assignments --config /etc/runway-cache/assignments.json
+ExecStart=/opt/runway-cache/bin/runway-controller --action cache-assignments --config /etc/runway-cache/assignments.json
 # One session per scale set; on failure systemd reopens it. It also acquires
 # the scale set's jobs, so guests receive no job while it is down.
 Restart=always

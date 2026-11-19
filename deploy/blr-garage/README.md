@@ -34,13 +34,13 @@ total and 1 GiB per archive; the Garage layout declares 40 GiB.
 
 ```sh
 # On a workstation: build and copy.
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o runway .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o runway-controller .
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o cache-node ./cmd/cache-node
 tar -cf - deploy/blr-garage deploy/standalone-guest integrations/actions-runner | ssh root@blr-1 'mkdir -p /root/runway-deploy && tar -C /root/runway-deploy -xf -'
-ssh root@blr-1 'cat > /root/runway-deploy/runway' < runway
+ssh root@blr-1 'cat > /root/runway-deploy/runway-controller' < runway-controller
 ssh root@blr-1 'cat > /root/runway-deploy/cache-node' < cache-node
 # On blr-1:
-bash /root/runway-deploy/deploy/blr-garage/install.sh /root/runway-deploy/runway /root/runway-deploy/cache-node
+bash /root/runway-deploy/deploy/blr-garage/install.sh /root/runway-deploy/runway-controller /root/runway-deploy/cache-node
  # Keep the existing /etc/runway-cache/github-token during upgrades.
 RUNWAY_SCALE_SET_ID=39 bash /root/runway-deploy/deploy/blr-garage/bootstrap.sh   # layout, bucket, key, TLS, configs; prints health
 ```
@@ -50,9 +50,15 @@ when they are already present.
 
 ## Upgrade
 
-- **runway**: rebuild, copy it, then rerun `install.sh`. It replaces the binary and restarts
-  every binary consumer, including assignments and active cache-host instances. Restart recovery
-  re-verifies every indexed object. Previous binaries remain as `*.previous`.
+- **runway-controller**: rebuild both binaries and rerun `install.sh` with the
+  matching launcher and units. It restarts every binary consumer, including
+  assignments and active cache-host instances. Restart recovery re-verifies
+  every indexed object. The installer keeps replaced binaries, helpers, and
+  units as `*.previous`. The first upgrade to `runway-controller` leaves
+  `/opt/runway-cache/bin/runway` in place. To roll back that upgrade, restore
+  the previous units, launcher, and guest helpers, then run
+  `systemctl daemon-reload` and restart the cache units. The restored units
+  and launcher use the retained binary.
 - **Garage**: change `garage.pin` (URL and SHA256, both from the official release), then rerun
   `install.sh` and `systemctl restart runway-garage`. Read the Garage release notes for metadata
   migrations first.
@@ -68,7 +74,7 @@ A wipe loses only cached data. Jobs miss and save again.
 systemctl stop runway-cache-data runway-garage
 rm -rf /var/lib/runway-garage/meta /var/lib/runway-garage/data /var/lib/runway-cache/state /var/lib/runway-cache/spools
 rm -f /etc/runway-cache/garage-key.json
-bash /root/runway-deploy/deploy/blr-garage/install.sh /opt/runway-cache/bin/runway /opt/runway-cache/guest/cache-node   # recreates the directories
+bash /root/runway-deploy/deploy/blr-garage/install.sh /opt/runway-cache/bin/runway-controller /opt/runway-cache/guest/cache-node   # recreates the directories
 bash /root/runway-deploy/deploy/blr-garage/bootstrap.sh
 ```
 

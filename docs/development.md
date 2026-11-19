@@ -7,7 +7,7 @@ Runway's CLI can be built and tested independently. A live execution needs an ex
 Use Go 1.26.3 or the version required by `go.mod`, Python 3 for script tests, and Bash for guest scripts.
 
 ```sh
-go build -o runway .
+go build -o runway-controller .
 go test ./...
 go vet ./...
 python3 -m unittest discover -s guest -p '*_test.py'
@@ -16,7 +16,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 bash -n guest/guest-runner.sh
 bash -n guest/install-guest-runner.sh
 bash -n scripts/build-ci-kernel.sh
-./runway --help
+./runway-controller --help
 ```
 
 The CLI uses a pinned GitHub scale-set SDK dependency. Guest tools and VM helpers are separate from the CLI; running unit tests does not start a VM or modify GitHub.
@@ -75,8 +75,8 @@ The App key stays on the operator/controller host. Only a fresh JIT configuratio
 
 ```sh
 mkdir -m 700 private
-./runway --action create --url https://github.com/OWNER/REPO --name runway-dogfood
-./runway --action jit --url https://github.com/OWNER/REPO \
+./runway-controller --action create --url https://github.com/OWNER/REPO --name runway-dogfood
+./runway-controller --action jit --url https://github.com/OWNER/REPO \
   --id SCALE_SET_ID --name runway-guest-001 --out private/guest-001.jit
 ```
 
@@ -95,7 +95,7 @@ The script consumes the transport file and supplies the JIT configuration throug
 Install [the smoke workflow](../examples/smoke-workflow.yml) in the selected repository and confirm its `runs-on` label matches the dedicated scale set. Start the listener, wait for `listening with capacity one; journal:` in its output, and only then manually dispatch that workflow. A job that finishes before the listener starts can be missed:
 
 ```sh
-./runway --action listen --url https://github.com/OWNER/REPO \
+./runway-controller --action listen --url https://github.com/OWNER/REPO \
   --id SCALE_SET_ID --name runway-guest-001 \
   --journal private/guest-001.json --timeout 20m
 ```
@@ -114,7 +114,7 @@ The helper creates through Central's Team-authorized Atlas client and reserves a
 After completion or failure, remove the GitHub scale set and terminate the guest as separate operations. Confirm the GitHub runner is gone and the tenant-scoped Atlas GET returns `404`. An accepted delete alone is insufficient.
 
 ```sh
-./runway --action delete --url https://github.com/OWNER/REPO --id SCALE_SET_ID
+./runway-controller --action delete --url https://github.com/OWNER/REPO --id SCALE_SET_ID
 ```
 
 ```sh

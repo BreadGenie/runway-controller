@@ -1,4 +1,5 @@
 /runway
+/runway-controller
 /private/
 /.local/
 *.jit

@@ -259,7 +259,7 @@ PY
 	# Register exactly one ephemeral JIT runner in the runner scale set whose
 	# message session runway-cache-assignments holds (host credential).
 	local name="$RUNWAY_RUNNER_LABEL-$vm" registered
-	registered=$(RUNWAY_GITHUB_TOKEN_FILE=$token_file /opt/runway-cache/bin/runway --action jit \
+	registered=$(RUNWAY_GITHUB_TOKEN_FILE=$token_file /opt/runway-cache/bin/runway-controller --action jit \
 		--url "https://github.com/$RUNWAY_REPOSITORY" --id "$RUNWAY_SCALE_SET_ID" --name "$name" --out "$work/jit") || die "JIT registration failed"
 	# runner.json lets the cleanup trap (and teardown) delete the registered runner.
 	printf '%s' "$registered" | python3 -I -c '

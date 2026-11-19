@@ -22,9 +22,9 @@ The pilot supports one concurrent runner per pool and a single-host administrati
 With Go 1.26.3 or newer:
 
 ```sh
-go build -o runway .
+go build -o runway-controller .
 go test ./...
-./runway -h
+./runway-controller -h
 ```
 
 See [development](docs/development.md) for the separate infrastructure and GitHub prerequisites needed for a live run.

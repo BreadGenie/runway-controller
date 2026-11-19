@@ -33,8 +33,8 @@ Publish an Available System image using the [baked runner image recipe](image-bu
 Create a dedicated scale set with an existing administrator credential or GitHub App configuration described in [development](development.md):
 
 ```sh
-go build -o runway .
-./runway --action create --url https://github.com/OWNER/REPO --name runway-dogfood
+go build -o runway-controller .
+./runway-controller --action create --url https://github.com/OWNER/REPO --name runway-dogfood
 ```
 
 Record the returned ID. An uncertain create response requires remote inspection before another create. In Runway Desk, an operator creates a Runner Pool with the following values:
@@ -87,7 +87,7 @@ Set `"central_url": "http://127.0.0.1:8003"` and, when the backend routes by vir
 The controller uses the same GitHub authentication as the other CLI commands: the current `gh` credential, or `RUNWAY_GITHUB_APP_CLIENT_ID`, `RUNWAY_GITHUB_APP_INSTALLATION_ID`, and `RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE`. GitHub App and Runway credentials remain outside guests. JIT material travels through stdin to the guest and is consumed by its runner wrapper.
 
 ```sh
-./runway --action controller --config /srv/runway/private/controller.json
+./runway-controller --action controller --config /srv/runway/private/controller.json
 ```
 
 Leave `owner_id` unset so each process gets a fresh identity. Only one process owns the pool at a time. Claims are fenced in Central; ownership renews while the process runs. Configure service supervision to restart on failures, allowing the existing owner lease to expire before takeover when necessary.
@@ -159,7 +159,7 @@ Central's scheduled reaper expires VMs even while Runway is unavailable. Runway 
 Pause the pool to stop admission and retire existing leases; pausing does not gracefully finish running jobs. Keep the controller, Central workers and Atlas reconciliation running until leases show VM phase `deleted` and JIT state `removed`. Then stop the controller. Remove a dedicated scale set only after cleanup:
 
 ```sh
-./runway --action delete --url https://github.com/OWNER/REPO --id SCALE_SET_ID
+./runway-controller --action delete --url https://github.com/OWNER/REPO --id SCALE_SET_ID
 ```
 
 Pool identity changes require a drained pool and a controller restart. Preserve lease history and sanitized evidence. Do not clear an uncertain record merely to recover its admission slot.
