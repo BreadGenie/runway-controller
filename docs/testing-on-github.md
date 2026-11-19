@@ -1,6 +1,6 @@
 # Testing a change on real GitHub Actions
 
-This is the end-to-end loop: make a change in `runway`, run it against a real repository
+This is the end-to-end loop: make a change in `runway-controller`, run it against a real repository
 pushing real commits, and see a job land on a guest you built. It is the only test that
 proves the product promise, which is that a repository changes its `runs-on` line and nothing
 else.
