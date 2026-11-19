@@ -55,6 +55,9 @@ func runController(path string) error {
 		return err
 	}
 	engine := &pilotEngine{metrics: metrics, store: central, github: github, assignmentREST: rest, guest: commandTransport{observeCache: metrics.observeGuest, command: cfg.TransportCommand, timeout: time.Duration(cfg.TransportTimeoutSeconds) * time.Second}, snapshot: snapshot, now: time.Now}
+	engine.logTrace = func(event controllerTrace) {
+		writeControllerTrace(os.Stderr, cfg.Pool, event)
+	}
 	json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "controller_claimed", "pool": cfg.Pool, "owner_id": cfg.OwnerID, "fence": snapshot.Fence})
 	lifecycle := controllerLifecycle{
 		engine: engine,

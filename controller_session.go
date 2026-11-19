@@ -160,7 +160,7 @@ func (l controllerLifecycle) listen(ctx context.Context, session controllerSessi
 	defer stop()
 	deliveries := make(chan pilotDelivery)
 	done := make(chan error, 1)
-	go func() { done <- session.Run(sessionCtx, pilotScaler{deliveries}) }()
+	go func() { done <- session.Run(sessionCtx, pilotScaler{deliveries: deliveries, trace: l.engine.trace}) }()
 	ticker := time.NewTicker(l.reconcileEvery)
 	defer ticker.Stop()
 	refresh := func() error {
@@ -182,10 +182,26 @@ func (l controllerLifecycle) listen(ctx context.Context, session controllerSessi
 			stop()
 			return <-done
 		case delivery := <-deliveries:
+			l.engine.trace(traceMessage("controller_scale_set_handling", delivery.message))
 			err := refresh()
+			reason := "handled"
 			if err == nil {
 				err = l.engine.Handle(ctx, delivery.message)
+				if err != nil {
+					reason = "handling_failed"
+				}
+			} else {
+				reason = "refresh_failed"
 			}
+			switch {
+			case errors.Is(err, errPoolResumed):
+				reason = "pool_resumed"
+			case errors.Is(err, errCentralFenceRejected):
+				reason = "fence_rejected"
+			}
+			finished := traceMessage("controller_scale_set_finished", delivery.message)
+			finished.Reason = reason
+			l.engine.trace(finished)
 			if errors.Is(err, errPoolResumed) || errors.Is(err, errCentralFenceRejected) {
 				// Leave this delivery unacknowledged for the next session.
 				delivery.result <- err
@@ -251,9 +267,15 @@ type pilotDelivery struct {
 	message *scaleset.RunnerScaleSetMessage
 	result  chan error
 }
-type pilotScaler struct{ deliveries chan pilotDelivery }
+type pilotScaler struct {
+	deliveries chan pilotDelivery
+	trace      func(controllerTrace)
+}
 
 func (s pilotScaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
+	if s.trace != nil {
+		s.trace(traceMessage("controller_scale_set_received", message))
+	}
 	delivery := pilotDelivery{message: message, result: make(chan error, 1)}
 	select {
 	case s.deliveries <- delivery:

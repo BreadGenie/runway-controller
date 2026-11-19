@@ -124,7 +124,7 @@ func TestControllerAssignmentBounds(t *testing.T) {
 	}
 	for i := 0; i <= controllerAssignmentCap; i++ {
 		job.JobID = uuid.NewString()
-		e.rememberAssignment(job)
+		e.rememberAssignment(job, 0)
 	}
 	if len(e.pendingAssignments) != 0 || !e.now().Before(e.assignmentSaturated) {
 		t.Fatal("cap did not fail closed")
@@ -143,7 +143,7 @@ func TestControllerAssignmentRetryBudget(t *testing.T) {
 		}
 		drainAssignment(t, e)
 	}
-	e.rememberAssignment(job)
+	e.rememberAssignment(job, 0)
 	e.pendingAssignments[4242].next = time.Time{}
 	e.resolveAssignments(context.Background())
 	if e.assignmentBusy || calls.Load() != 2*controllerAssignmentTries {

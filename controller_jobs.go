@@ -53,7 +53,7 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 			}
 		}
 		if matched == nil {
-			e.rememberAssignment(job.JobMessageBase)
+			e.rememberAssignment(job.JobMessageBase, message.MessageID)
 			continue
 		}
 		if _, err := uuid.Parse(job.JobID); err != nil {
@@ -63,7 +63,7 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 		if err != nil {
 			return err
 		}
-		if err := e.persistJobEvidence(ctx, *matched, "assigned", fields); err != nil {
+		if err := e.persistJobEvidence(ctx, *matched, "assigned", fields, message.MessageID); err != nil {
 			return err
 		}
 	}
@@ -92,7 +92,7 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 				}
 				lease = updated
 			}
-			if err := e.persistJobEvidence(ctx, lease, "started", fields); err != nil {
+			if err := e.persistJobEvidence(ctx, lease, "started", fields, message.MessageID); err != nil {
 				return err
 			}
 		}
@@ -122,8 +122,18 @@ func (e *pilotEngine) recordJobEvidence(ctx context.Context, message *scaleset.R
 				}
 			}
 			fields.Error = diagnosticsError
-			if _, err := e.update(ctx, lease, "completed", fields); err != nil {
+			updated, err := e.update(ctx, lease, "completed", fields)
+			if err != nil {
 				return err
+			}
+			e.traceJobEvidence(updated, "completed", message.MessageID)
+			if e.logTrace != nil && !updated.Verified && (updated.Phase == "deleting" || updated.Phase == "deleted") {
+				for _, start := range message.JobStartedMessages {
+					if start.JobID == job.JobID && start.RunnerName == lease.RunnerName && start.RunnerID == updated.RunnerID {
+						e.trace(controllerTrace{Event: "controller_verification_skipped", Reason: "started_and_completed", MessageID: message.MessageID, controllerTraceJob: traceLease(updated)})
+						break
+					}
+				}
 			}
 		}
 	}
@@ -199,7 +209,7 @@ func (e *pilotEngine) acquire(ctx context.Context, lease pilotLease) error {
 }
 
 // Skip durable replays, including after a restart; omitted evidence never erases a value.
-func (e *pilotEngine) persistJobEvidence(ctx context.Context, lease pilotLease, event string, fields leaseEvent) error {
+func (e *pilotEngine) persistJobEvidence(ctx context.Context, lease pilotLease, event string, fields leaseEvent, messageID int) error {
 	changed := event == "started" && !lease.Started
 	for _, pair := range [][2]string{{lease.JobID, fields.JobID}, {lease.WorkflowRunID, fields.WorkflowRunID}, {lease.Repository, fields.Repository}, {lease.RequestLabels, fields.RequestLabels}, {lease.JobDisplayName, fields.JobDisplayName}, {lease.JobWorkflowRef, fields.JobWorkflowRef}, {lease.EventName, fields.EventName}, {lease.RunAttempt, fields.RunAttempt}} {
 		changed = changed || (pair[1] != "" && pair[0] != pair[1])
@@ -208,6 +218,9 @@ func (e *pilotEngine) persistJobEvidence(ctx context.Context, lease pilotLease, 
 	if !changed {
 		return nil
 	}
-	_, err := e.update(ctx, lease, event, fields)
+	updated, err := e.update(ctx, lease, event, fields)
+	if err == nil {
+		e.traceJobEvidence(updated, event, messageID)
+	}
 	return err
 }

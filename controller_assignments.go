@@ -16,6 +16,7 @@ const controllerAssignmentTries = 10
 
 type controllerAssignmentRun struct {
 	jobs          map[string]scaleset.JobMessageBase
+	messageIDs    map[string]int
 	expires, next time.Time
 	tries         int
 	refused       bool
@@ -35,13 +36,23 @@ type controllerAssignmentResult struct {
 // resolved siblings) for three minutes to detect duplicate rerun display names.
 // Saturation disables fallback for a full TTL: dropping a sibling must never
 // turn an ambiguous display name into an apparently unique one.
-func (e *pilotEngine) rememberAssignment(job scaleset.JobMessageBase) {
+func (e *pilotEngine) rememberAssignment(job scaleset.JobMessageBase, messageID int) {
 	now := e.now()
-	if now.Before(e.assignmentSaturated) || !canonicalCacheUUID(job.JobID) || job.WorkflowRunID <= 0 || job.JobDisplayName == "" || len(job.JobDisplayName)+len(job.JobWorkflowRef)+len(job.EventName)+len(strings.Join(job.RequestLabels, ""))+16*len(job.RequestLabels) > 8192 {
+	trace := controllerTrace{Event: "controller_assignment_hint_rejected", MessageID: messageID, controllerTraceJob: traceScaleSetJob(job, "", 0)}
+	if now.Before(e.assignmentSaturated) {
+		trace.Reason = "capacity"
+		e.trace(trace)
+		return
+	}
+	if !canonicalCacheUUID(job.JobID) || job.WorkflowRunID <= 0 || job.JobDisplayName == "" || len(job.JobDisplayName)+len(job.JobWorkflowRef)+len(job.EventName)+len(strings.Join(job.RequestLabels, ""))+16*len(job.RequestLabels) > 8192 {
+		trace.Reason = "invalid_hint"
+		e.trace(trace)
 		return
 	}
 	repository := strings.TrimPrefix(e.snapshot.Pool.RepositoryURL, "https://github.com/")
 	if job.OwnerName+"/"+job.RepositoryName != repository {
+		trace.Reason = "repository_mismatch"
+		e.trace(trace)
 		return
 	}
 	if e.pendingAssignments == nil {
@@ -50,6 +61,7 @@ func (e *pilotEngine) rememberAssignment(job scaleset.JobMessageBase) {
 	count := 0
 	for id, run := range e.pendingAssignments {
 		if !now.Before(run.expires) {
+			e.traceAssignmentRun(run, "controller_assignment_hint_expired", "ttl_elapsed")
 			delete(e.pendingAssignments, id)
 			continue
 		}
@@ -62,21 +74,40 @@ func (e *pilotEngine) rememberAssignment(job scaleset.JobMessageBase) {
 			// redeliveries poison the run rather than replacing earlier evidence.
 			if old.JobDisplayName != job.JobDisplayName || old.JobWorkflowRef != job.JobWorkflowRef || old.EventName != job.EventName || old.RunnerRequestID != job.RunnerRequestID {
 				run.refused = true
+				trace.Reason = "conflicting_replay"
+				e.trace(trace)
 			}
 			return
 		}
 	}
 	if count >= controllerAssignmentCap {
+		for _, pending := range e.pendingAssignments {
+			e.traceAssignmentRun(pending, "controller_assignment_hint_rejected", "capacity")
+		}
 		clear(e.pendingAssignments)
+		trace.Reason = "capacity"
+		e.trace(trace)
 		e.assignmentSaturated = now.Add(controllerAssignmentTTL)
 		return
 	}
 	if run == nil {
-		run = &controllerAssignmentRun{jobs: make(map[string]scaleset.JobMessageBase), expires: now.Add(controllerAssignmentTTL)}
+		run = &controllerAssignmentRun{jobs: make(map[string]scaleset.JobMessageBase), messageIDs: make(map[string]int), expires: now.Add(controllerAssignmentTTL)}
 		e.pendingAssignments[job.WorkflowRunID] = run
 	}
 	job.RequestLabels = append([]string(nil), job.RequestLabels...)
 	run.jobs[job.JobID] = job
+	run.messageIDs[job.JobID] = messageID
+	trace.Event = "controller_assignment_hint_created"
+	e.trace(trace)
+}
+
+func (e *pilotEngine) traceAssignmentRun(run *controllerAssignmentRun, event, reason string) {
+	if e.logTrace == nil {
+		return
+	}
+	for id, job := range run.jobs {
+		e.trace(controllerTrace{Event: event, Reason: reason, MessageID: run.messageIDs[id], Attempt: run.tries, controllerTraceJob: traceScaleSetJob(job, "", 0)})
+	}
 }
 
 // Only this serialized engine method touches hints and leases. The worker owns
@@ -92,44 +123,14 @@ func (e *pilotEngine) resolveAssignments(ctx context.Context) error {
 			e.assignmentCancel()
 			e.assignmentCancel = nil
 		}
-		run := e.pendingAssignments[result.run]
-		if run != nil && run == result.hints && errors.Is(result.err, errCacheJobMismatch) {
-			run.refused = true
-		}
-		if run != nil && run == result.hints && e.now().Before(run.expires) && !run.refused && result.err == nil {
-			var matched *scaleset.JobMessageBase
-			for _, job := range run.jobs {
-				if job.JobDisplayName == result.job.Name {
-					if matched != nil {
-						run.refused = true
-						matched = nil
-						break
-					}
-					copy := job
-					matched = &copy
-				}
-			}
-			if matched != nil {
-				for _, lease := range e.snapshot.Leases {
-					if lease.ID != result.leaseID || !e.assignmentLeaseEligible(lease) || lease.RunnerName != result.runnerName || lease.RunnerID != result.runnerID {
-						continue
-					}
-					fields, err := jobEvidence(lease, *matched)
-					if err != nil {
-						run.refused = true
-						break
-					}
-					fields.RunAttempt = strconv.FormatInt(result.attempt, 10)
-					if err := e.persistJobEvidence(ctx, lease, "assigned", fields); err != nil {
-						return err
-					}
-				}
-			}
+		if err := e.applyAssignmentResult(ctx, result); err != nil {
+			return err
 		}
 	default:
 	}
 	for id, run := range e.pendingAssignments {
 		if !e.now().Before(run.expires) {
+			e.traceAssignmentRun(run, "controller_assignment_hint_expired", "ttl_elapsed")
 			delete(e.pendingAssignments, id)
 		}
 	}
@@ -179,4 +180,89 @@ func (e *pilotEngine) resolveAssignments(ctx context.Context) error {
 func (e *pilotEngine) assignmentLeaseEligible(lease pilotLease) bool {
 	repository := strings.TrimPrefix(e.snapshot.Pool.RepositoryURL, "https://github.com/")
 	return e.snapshot.Pool.Enabled && lease.RunnerID > 0 && lease.RunnerName != "" && lease.JobID == "" && !lease.Started && lease.Phase != "deleted" && lease.Phase != "deleting" && e.now().Before(lease.Deadline) && (lease.Repository == "" || lease.Repository == repository)
+}
+
+func (e *pilotEngine) applyAssignmentResult(ctx context.Context, result controllerAssignmentResult) error {
+	run := e.pendingAssignments[result.run]
+	trace := controllerTrace{Event: "controller_assignment_hint_rejected", controllerTraceJob: traceLease(pilotLease{
+		ID: result.leaseID, RunnerName: result.runnerName, RunnerID: result.runnerID, WorkflowRunID: strconv.FormatInt(result.run, 10),
+	})}
+	if run == nil || run != result.hints {
+		trace.Reason = "stale_hint"
+		e.trace(trace)
+		return nil
+	}
+	if errors.Is(result.err, errCacheJobMismatch) {
+		run.refused = true
+	}
+	trace.Attempt = run.tries
+	switch {
+	case !e.now().Before(run.expires):
+		trace.Reason = "ttl_elapsed"
+	case result.err != nil:
+		trace.Reason = controllerRESTJobReason(result.err)
+	case run.refused:
+		trace.Reason = "refused_hint"
+	default:
+		trace.Reason = "name_not_found"
+		var matched *scaleset.JobMessageBase
+		for _, job := range run.jobs {
+			if job.JobDisplayName != result.job.Name {
+				continue
+			}
+			if matched != nil {
+				run.refused = true
+				matched = nil
+				trace.Reason = "ambiguous_name"
+				break
+			}
+			copy := job
+			matched = &copy
+		}
+		if matched != nil {
+			trace.JobUUID = matched.JobID
+			trace.MessageID = run.messageIDs[matched.JobID]
+			trace.Reason = "stale_lease"
+			for _, lease := range e.snapshot.Leases {
+				if lease.ID != result.leaseID || !e.assignmentLeaseEligible(lease) || lease.RunnerName != result.runnerName || lease.RunnerID != result.runnerID {
+					continue
+				}
+				fields, err := jobEvidence(lease, *matched)
+				if err != nil {
+					run.refused = true
+					trace.Reason = "evidence_mismatch"
+					break
+				}
+				fields.RunAttempt = strconv.FormatInt(result.attempt, 10)
+				if err := e.persistJobEvidence(ctx, lease, "assigned", fields, trace.MessageID); err != nil {
+					trace.Reason = "write_failed"
+					e.trace(trace)
+					return err
+				}
+				trace.Event = "controller_assignment_hint_resolved"
+				trace.Reason = ""
+				e.trace(trace)
+			}
+		}
+	}
+	if trace.Reason != "" {
+		e.trace(trace)
+		if run.tries == controllerAssignmentTries && !run.refused && trace.Reason != "ttl_elapsed" {
+			e.traceAssignmentRun(run, "controller_assignment_hint_exhausted", "retry_limit")
+		}
+	}
+	return nil
+}
+
+func controllerRESTJobReason(err error) string {
+	switch {
+	case errors.Is(err, errCacheJobMismatch):
+		return "runner_or_job_mismatch"
+	case errors.Is(err, errCacheJobCompleted):
+		return "job_completed"
+	case err == errCacheJobNotFound:
+		return "job_not_running"
+	default:
+		return "rest_unavailable"
+	}
 }
