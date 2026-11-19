@@ -115,7 +115,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 			return
 		}
 		switch r.URL.Path {
-		case "/api/method/central.runway.cache_lease":
+		case "/api/method/runway.api.cache_lease":
 			address := r.URL.Query().Get("address")
 			l := f.lease
 			switch address {
@@ -134,7 +134,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 				return
 			}
 			json.NewEncoder(w).Encode(l)
-		case "/api/method/central.runway.cache_bucket":
+		case "/api/method/runway.api.cache_bucket":
 			query := r.URL.Query()
 			if len(query) != 1 || (query.Get("team") != "team-a" && query.Get("team") != "team-b" && query.Get("tenant_id") != "2" && query.Get("tenant_id") != "3") {
 				w.WriteHeader(404)
@@ -299,7 +299,7 @@ func (f *managedE2E) enroll(credential string) {
 		f.t.Fatalf("enrolment: %d %s", response.StatusCode, raw)
 	}
 	request, _ := json.Marshal(map[string]any{"pool": map[string]any{"name": "pool", "regional_cache": true, "fence": 1, "region": "blr-1"}, "region": map[string]string{"cache_service_name": "internal-cache.example.test:8443", "cache_service_ca": configured.CA}})
-	command := exec.Command("python3", "integrations/central/contract_harness.py")
+	command := exec.Command(centralContractPython(f.t), "integrations/central/contract_harness.py")
 	command.Stdin = bytes.NewReader(request)
 	output, err := command.CombinedOutput()
 	var snapshot struct {
@@ -375,6 +375,7 @@ func (f *managedE2E) save() {
 	}
 }
 func TestManagedCacheEndToEnd(t *testing.T) {
+	centralContractPython(t)
 	if os.Getenv("RUNWAY_MANAGED_E2E") != "1" {
 		t.Skip("set RUNWAY_MANAGED_E2E=1 (offline S3 fake)")
 	}

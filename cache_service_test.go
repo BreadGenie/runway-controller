@@ -26,7 +26,7 @@ func serviceFixture(t *testing.T, edit func(*cacheServiceLease), status int, sta
 		edit(&lease)
 	}
 	central := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "token region-secret" || r.URL.Path != "/api/method/central.runway.cache_lease" || r.URL.Query().Get("address") != "fdaa:1:0:2::7" {
+		if r.Header.Get("Authorization") != "token region-secret" || r.URL.Path != "/api/method/runway.api.cache_lease" || r.URL.Query().Get("address") != "fdaa:1:0:2::7" {
 			t.Error("Central request contract", r.URL)
 			w.WriteHeader(400)
 			return

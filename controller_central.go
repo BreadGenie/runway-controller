@@ -210,7 +210,7 @@ func (c *centralRPC) call(ctx context.Context, method string, fields map[string]
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/method/central.api.runway."+method, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/method/runway.api."+method, bytes.NewReader(body))
 	if err != nil {
 		return errors.New("invalid Central request")
 	}

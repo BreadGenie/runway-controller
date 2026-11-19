@@ -1,7 +1,8 @@
-"""Exercise the actual lease contract shipped in the Central integration patch."""
+"""Exercise the actual lease contract shipped in the standalone Runway app."""
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import unittest
 import sys
@@ -14,6 +15,7 @@ contract = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contract)
 
 
+@unittest.skipUnless(os.environ.get(contract.APP_ENV), "Set RUNWAY_FRAPPE_APP to the Runway Frappe app checkout")
 class CentralContractTests(unittest.TestCase):
     def lease(self, **changes):
         return {'id': 'lease', 'phase': 'running', 'runner_id': 42,
@@ -31,7 +33,7 @@ class CentralContractTests(unittest.TestCase):
     def test_pool_placement_rules_are_optional_and_require_an_array_of_objects(self):
         namespace = {'frappe': SimpleNamespace(parse_json=json.loads, throw=contract.reject),
                      '_': lambda value: value}
-        contract.load_functions('central/infrastructure/runway.py', ['pool_placement_rules'], namespace)
+        contract.load_functions('runway/pools.py', ['pool_placement_rules'], namespace)
         read = namespace['pool_placement_rules']
         self.assertEqual(read({}), [])
         rules = [{'resource': 'metal_server', 'operator': 'has', 'tags': {'lab': 'blr'}}]
@@ -40,7 +42,7 @@ class CentralContractTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(contract.ContractError):
                 read({'placement_rules': invalid})
 
-    @unittest.skipIf(sys.version_info < (3, 14), 'pilot integration requires Python 3.14')
+    @unittest.skipIf(sys.version_info < (3, 14), 'Runway app requires Python 3.14')
     def test_runner_create_forwards_placement_without_changing_default(self):
         sent = []
         namespace = {'frappe': SimpleNamespace(db=SimpleNamespace(commit=lambda: None)),
@@ -50,7 +52,7 @@ class CentralContractTests(unittest.TestCase):
                      'save_internal': lambda lease: None,
                      'AtlasRejected': RuntimeError, 'AtlasRequestUncertain': OSError,
                      'AtlasConnectionError': ConnectionError}
-        contract.load_functions('central/integrations/runway.py', ['create_vm'], namespace)
+        contract.load_functions('runway/vms.py', ['create_vm'], namespace)
         pool = contract.Document(image_id='image', cpu_millicores=1000, memory_mib=1024,
                                  disk_mib=4096, ssh_public_key='public', name='pool', team='team')
         lease = contract.Document(runner_name='runner', name='lease', reload=lambda: None)
@@ -63,8 +65,8 @@ class CentralContractTests(unittest.TestCase):
         self.assertEqual(lease.vm_id, 'vm')
 
     def test_runner_identity_storage_accepts_github_ids_above_signed_int32(self):
-        schema = json.loads(contract.added_file(
-            'central/infrastructure/doctype/runner_lease/runner_lease.json'))
+        schema = json.loads(contract.app_file(
+            'runway/runway/doctype/runner_lease/runner_lease.json'))
         field = next(field for field in schema['fields'] if field['fieldname'] == 'runner_id')
         self.assertTrue(field['fieldtype'] == 'Long Int' or
                         field['fieldtype'] == 'Int' and field.get('length', 0) > 11)

@@ -34,7 +34,7 @@ Before creating a runner, verify:
 - Atlas can reach Metal's authenticated API, and Metal can download Atlas's image and binary artifacts. A local control plane may need SSH tunnels; endpoints and credentials are environment-specific.
 - A compatible System image is available, schedulers and workers run, and Atlas's ten-second reconciliation jobs have an appropriate bench scheduler tick.
 
-The proof of concept needed the [Route53 initialization patch](../patches/atlas-lazy-route53-client.patch) for Generic-provider setup without AWS credentials. Review the patch against your Atlas revision before applying it. An interrupted installation also required completion of installation hooks and supported scheduler synchronization; an installed app alone did not establish a functioning region.
+Complete the Atlas installation hooks and scheduler synchronization before using the region. Install the [Runway Frappe app](../integrations/central/README.md) on the Central site.
 
 ## Prepare a compatible image
 
