@@ -1,8 +1,10 @@
-# Runway
+# runway-controller
 
 Managed GitHub Actions runners for Frappe Cloud, with a path toward PR previews and deployments on push.
 
-Runway now includes a bounded internal pilot: a durable runner controller, a Central integration patch for pools and leases, and a credential-free baked runner image recipe. Earlier execution experiments passed real GitHub workflows on fresh Atlas/Firecracker VMs, including Docker Redis services. A real workflow also passed after killing and restarting the durable controller; see the recorded evidence and limits.
+This repository is the Go side of Runway: the runner controller, the regional cache services, the guest agent and the image scripts. Runner pools, leases and Team connections live in the separate `runway` Frappe app, which runs on its own site and talks to Central over its API. The program is still built as `runway`.
+
+Runway now includes a bounded internal pilot: a durable runner controller, the `runway` Frappe app for pools and leases, and a credential-free baked runner image recipe. Earlier execution experiments passed real GitHub workflows on fresh Atlas/Firecracker VMs, including Docker Redis services. A real workflow also passed after killing and restarting the durable controller; see the recorded evidence and limits.
 
 The proposed product lets a team connect GitHub in Frappe Cloud and change `runs-on` in existing workflows. GitHub continues to own workflow execution, checks, logs, and artifacts. Frappe Cloud supplies runner compute and eventually connects those results to previews and deployments.
 

@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
-	"github.com/BreadGenie/runway/cache/store"
+	"github.com/BreadGenie/runway-controller/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/store"
 )
 
 // cacheDataServiceConfig is the strict cache-data configuration. It names

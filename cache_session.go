@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
-	"github.com/BreadGenie/runway/cache/transport"
+	"github.com/BreadGenie/runway-controller/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/transport"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 // Observe dependencies rather than session state. Both real authority adapters

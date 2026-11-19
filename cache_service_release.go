@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
-	"github.com/BreadGenie/runway/cache/store"
+	"github.com/BreadGenie/runway-controller/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/store"
 )
 
 // check mode has no side effects. Initialization runs as part of the service,

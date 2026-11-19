@@ -21,7 +21,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 // Config bounds one service. Garage selects standalone mode; Buckets selects

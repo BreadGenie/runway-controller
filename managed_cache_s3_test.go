@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"encoding/pem"
-	"github.com/BreadGenie/runway/cache/store"
+	"github.com/BreadGenie/runway-controller/cache/store"
 )
 
 // managedS3 is deliberately an in-memory S3 fake, not a signature verifier or

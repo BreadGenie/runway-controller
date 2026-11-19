@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 var errCacheRepository = errors.New("cache repository policy unavailable")
