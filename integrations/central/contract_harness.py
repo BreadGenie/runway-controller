@@ -1,4 +1,4 @@
-"""Execute the checked-in patch's actual lease code without a Frappe site.
+"""Execute the standalone Runway app’s actual lease code without a Frappe site.
 
 Only document storage, fencing and time are substituted. This exercises the
 route, transition implementation and snapshot, not database/auth correctness.
@@ -7,25 +7,23 @@ One JSON request on stdin contains a lease snapshot and the RPC fields.
 
 import ast
 import json
+import os
 import re
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-PATCH = Path(__file__).with_name('central-runway-pilot.patch')
+APP_ENV = 'RUNWAY_FRAPPE_APP'
 
 
-def added_file(path):
-    section = PATCH.read_text().split(f'diff --git a/{path} b/{path}\n', 1)[1]
-    section = section.split('\ndiff --git ', 1)[0]
-    return '\n'.join(line[1:] for line in section.splitlines()
-                     if line.startswith('+') and not line.startswith('+++')) + '\n'
+def app_file(path):
+    return (Path(os.environ[APP_ENV]) / path).read_text()
 
 
 def load_functions(path, names, namespace):
     # Parse only the tested functions. Other Central code uses Python 3.14
     # syntax; the lease contract itself can be exercised with older Python 3.
-    source = added_file(path)
+    source = app_file(path)
     starts = list(re.finditer(r'^def (\w+)\(', source, re.MULTILINE))
     definitions = []
     for start in starts:
@@ -62,7 +60,7 @@ def reject(message):
 def update(lease, fields):
     # Storage columns come from the actual DocType, so a missing migration field
     # cannot be hidden by an unrestricted dictionary adapter.
-    schema = json.loads(added_file('central/infrastructure/doctype/runner_lease/runner_lease.json'))
+    schema = json.loads(app_file('runway/runway/doctype/runner_lease/runner_lease.json'))
     columns = {field['fieldname'] for field in schema['fields']}
     document = Document({key: value for key, value in lease.items() if key != 'id'})
     document.name = lease['id']
@@ -76,19 +74,21 @@ def update(lease, fields):
                  'fenced_lease': lambda *args: (Document(name='pool'), document),
                  'save_internal': save, 'iso_utc': lambda value: value,
                  'now_datetime': lambda: '2026-10-09T12:00:00+00:00'}
-    load_functions('central/infrastructure/runway.py', ['update_lease', 'lease_snapshot'], namespace)
+    load_functions('runway/pools.py', ['update_lease', 'lease_snapshot'], namespace)
     route = {'runway': SimpleNamespace(update_lease=namespace['update_lease'])}
-    load_functions('central/api/runway.py', ['update_lease'], route)
+    load_functions('runway/api.py', ['update_lease'], route)
     return route['update_lease'](**fields)
 
 
 if __name__ == '__main__':
+    if not os.environ.get(APP_ENV):
+        sys.exit(f'{APP_ENV} must point to the Runway Frappe app checkout')
     try:
         request = json.load(sys.stdin)
         if 'pool' in request:
-            namespace = {'frappe': SimpleNamespace(get_doc=lambda *args: Document(request['region'])),
+            namespace = {'frappe': SimpleNamespace(db=SimpleNamespace(get_value=lambda *args, **kwargs: request['region'])),
                          'iso_utc': lambda value: value, 'active_leases': lambda **kwargs: []}
-            load_functions('central/infrastructure/runway.py', ['pool_snapshot'], namespace)
+            load_functions('runway/pools.py', ['pool_snapshot'], namespace)
             result = namespace['pool_snapshot'](Document(request['pool']))
         else:
             result = update(request['lease'], request['fields'])

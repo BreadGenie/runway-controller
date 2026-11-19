@@ -45,7 +45,7 @@ func TestCentralManagedBuckets(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
-		if r.Header.Get("Authorization") != "token regional" || r.URL.Path != "/api/method/central.runway.cache_bucket" {
+		if r.Header.Get("Authorization") != "token regional" || r.URL.Path != "/api/method/runway.api.cache_bucket" {
 			t.Error("Central contract")
 			w.WriteHeader(403)
 			return

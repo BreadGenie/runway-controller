@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -15,16 +16,29 @@ import (
 	"github.com/actions/scaleset"
 )
 
-// Exercise the real Go HTTP adapter against the route, transition implementation
-// and DocType extracted from the checked-in Central patch. VM/GitHub/guest I/O
-// remains local; no Frappe site or infrastructure is touched.
-func useCentralContract(t *testing.T, e *pilotEngine, s *memoryPilotStore, loseEvent string) {
+func centralContractPython(t *testing.T) string {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("Python 3 is required for the checked-in Central contract tests")
+		t.Skip("Python 3 is required for the Runway app contract tests")
 	}
+	if os.Getenv("RUNWAY_FRAPPE_APP") == "" {
+		t.Skip("Set RUNWAY_FRAPPE_APP to the Runway Frappe app checkout")
+	}
+	return python
+}
+
+// Exercise the Go HTTP adapter against the app's RPC, lease transitions and
+// DocType with local VM, GitHub and guest substitutes.
+func useCentralContract(t *testing.T, e *pilotEngine, s *memoryPilotStore, loseEvent string) {
+	t.Helper()
+	python := centralContractPython(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/method/runway.api.update_lease" {
+			t.Errorf("unexpected RPC: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		var fields map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
 			t.Error(err)
@@ -87,7 +101,7 @@ func (s contractPilotStore) Update(ctx context.Context, id, event string, fields
 	return s.rpc.Update(ctx, id, event, fields)
 }
 
-func TestJobEvidenceAgainstCheckedInCentralContract(t *testing.T) {
+func TestJobEvidenceAgainstRunwayAppContract(t *testing.T) {
 	for _, scenario := range []struct {
 		name                                                         string
 		offer, loseBootstrap, loseStart, loseAcquire, completionOnly bool

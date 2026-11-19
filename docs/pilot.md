@@ -6,18 +6,18 @@ The controller and recovery tests are implemented. The baked image has booted as
 
 ## Install the Central integration
 
-Prepare the infrastructure described in [development](development.md). The [Central integration patch](../integrations/central/README.md) targets revision `6676d3178943d332c288fc55c04e6f44a8d01732`; it is not an upstream release. Review the patch before applying it to the Central checkout installed in your bench:
+Prepare the infrastructure described in [development](development.md). Add the standalone `runway` Frappe app to the bench and install it on a site running Central. See the [integration guide](../integrations/central/README.md).
 
 ```sh
-git -C /path/to/bench/apps/central apply --check /path/to/runway/integrations/central/central-runway-pilot.patch
-git -C /path/to/bench/apps/central apply /path/to/runway/integrations/central/central-runway-pilot.patch
 cd /path/to/bench
-bench --site CENTRAL_SITE migrate
-bench --site CENTRAL_TEST_SITE run-tests --app central --module central.tests.test_runway
+bench get-app /path/to/runway-frappe-app
+bench --site CENTRAL_TEST_SITE install-app runway
+bench --site CENTRAL_TEST_SITE run-tests --app runway
+bench --site CENTRAL_SITE install-app runway
 bench --site CENTRAL_SITE enable-scheduler
 ```
 
-Use a separate test site for the test command. Restart the site's web and worker processes after installation, run its worker queues, and configure the bench scheduler tick to ten seconds. Keep Atlas reconciliation running too. Read `spec/RUNWAY.md` in the patched checkout for the API and state-machine contract.
+Keep the Central worker queues and Atlas reconciliation running. Configure the bench scheduler tick to ten seconds.
 
 Create a dedicated API-key service user with `Central User` and a team-wide Developer or suitable custom role granting `server:view`, `server:create`, and `server:terminate`. Assign it as the pool's `controller_user`; do not give it System Manager. Store its `api_key:api_secret` in a private regular file, mode `0600`, outside the checkout.
 
@@ -233,4 +233,4 @@ and delivers them over SSH; the guest agent needs only Python's standard library
 
 JobAssigned evidence attaches directly by an existing positive request ID or job UUID. For request ID zero, the controller retains unmatched assignments by repository and workflow run, then asynchronously reads the current run attempt and its jobs using the controller’s GitHub credential. Only the single in-progress job matching the registered runner name (and runner ID when present), with exactly one matching JobAssigned display name, supplies assigned evidence before JobStarted. Duplicate display names refuse resolution; JobStarted still rejects conflicting evidence. Hints live only in memory for three minutes, with a 256-entry cap; saturation disables this fallback for three minutes rather than risk hiding an ambiguous sibling. These re-derivable hints need no Central state. One REST worker makes at most ten attempts per run, at least three seconds apart on reconciliation, stopping when job evidence arrives or the lease ends. Each attempt reads run metadata once and up to ten job pages (100 jobs per page); transient REST failures consume the same bounded retry budget, with no automatic HTTP retries. GitHub App installation tokens are cached until near expiry. Restart replay uses durable evidence without rewriting it; lost hints fall back to JobStarted until replayed. No lease is selected merely because it is the only active lease.
 
-The Central patch adds immutable `run_attempt`, `job_display_name`, `job_workflow_ref`, and `event_name` fields to `update_lease` and snapshots, plus a monotonic `started` snapshot flag set only by JobStarted (bootstrap alone does not establish a job start). The pinned scale-set SDK exposes no run attempt, so it remains unset; no attempt is inferred. Missing evidence preserves prior values. Migrate Central before deploying this controller. Replayed assigned/started evidence produces no update when nothing changes.
+The app stores immutable `run_attempt`, `job_display_name`, `job_workflow_ref`, and `event_name` fields to `update_lease` and snapshots, plus a monotonic `started` snapshot flag set only by JobStarted (bootstrap alone does not establish a job start). The pinned scale-set SDK exposes no run attempt, so it remains unset; no attempt is inferred. Missing evidence preserves prior values. Replayed assigned/started evidence produces no update when nothing changes.

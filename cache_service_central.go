@@ -65,7 +65,7 @@ func (central cacheCentralHTTPS) read(ctx context.Context, method string, query 
 	}
 	ctx, cancel := context.WithTimeout(ctx, cacheSessionSetupBudget)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(central.origin, "/")+"/api/method/central.runway."+method+"?"+query.Encode(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(central.origin, "/")+"/api/method/runway.api."+method+"?"+query.Encode(), nil)
 	if err != nil {
 		return nil, grant.ErrInvalid
 	}

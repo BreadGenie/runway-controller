@@ -13,7 +13,7 @@ Runway should be a capability inside Frappe Cloud. A separate runner-controller 
 | Pilot | Optional Frappe-specific guest tooling and later preview/deployment integration |
 | GitHub Actions | Workflow scheduling and execution protocol, job results, checks, logs, artifacts, and existing cache behavior |
 
-The [Central pilot patch](../integrations/central/README.md) implements Runner Pool and Runner Lease records, pool-scoped authorization, ownership fencing, admission, regional reconciliation and expiry. Runway calls Central's authenticated API; Central creates VMs through its existing Team-authorized Atlas client. This is an operator-configured internal pilot, with no usage ledger or customer VM billing record.
+The [Runway Frappe app](../integrations/central/README.md) implements Runner Pool and Runner Lease records, pool-scoped authorization, ownership fencing, admission, regional reconciliation and expiry. Runway calls Central's authenticated API; Central creates VMs through its existing Team-authorized Atlas client. This is an operator-configured internal pilot, with no usage ledger or customer VM billing record.
 
 ## Pilot execution path
 
@@ -43,7 +43,7 @@ and Docker rollback state belong to one request.
 
 Creation timeouts are uncertain outcomes. Persist an attempt identity before calling Atlas, reconcile by identity, and avoid blind creation retries. A tag helps locate resources but is not an atomic idempotency guarantee.
 
-VM deletion is asynchronous. An accepted DELETE is not completion; confirm absence through the tenant-scoped regional API. The prototype verified automatic Atlas cleanup after fixing scheduler configuration. The Central patch adds independent orphan sweeps and deadline handling. Live failure drills are still required to validate these paths in operation.
+VM deletion is asynchronous. An accepted DELETE is not completion; confirm absence through the tenant-scoped regional API. The prototype verified automatic Atlas cleanup after fixing scheduler configuration. The Runway app runs independent orphan sweeps and deadline handling. Live failure drills are still required to validate these paths in operation.
 
 Keep GitHub App keys and control-plane credentials outside guests. A guest receives only its JIT runner configuration or a narrowly scoped bootstrap credential. Docker runs inside the VM; no host Docker socket is shared. The current host setup does not prove untrusted-job egress isolation or denial of access to other infrastructure.
 
