@@ -184,6 +184,7 @@ def main() -> int:
     parser.add_argument('--regional-cache', help='Pinned TLS cache mesh endpoint (host:port) (prepare only)')
     parser.add_argument('--regional-cache-ca', type=Path, help='CA PEM on the controller')
     parser.add_argument('--regional-cache-node', type=Path, help='Development override: cache-node binary on the controller')
+    parser.add_argument('--regional-cache-relay', type=Path, help='Development override: cache-relay script on the controller')
     parser.add_argument('--allow-guest-sudo', action='store_true',
                         help='Give a fresh guest runner account passwordless sudo inside that guest')
     # Explicit operator opt-in to select the guest kernel's tsc clocksource during
@@ -233,7 +234,7 @@ def main() -> int:
     parser.add_argument('--deadline', help='Absolute RFC3339 deadline for bootstrap')
     parser.add_argument('--diagnostics-dir', type=Path, help='Private local directory for collect')
     args = parser.parse_args()
-    if any((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
+    if args.regional_cache or args.regional_cache_ca:
         if not all((args.regional_cache, args.regional_cache_ca)):
             parser.error('Regional cache requires --regional-cache and --regional-cache-ca')
         if not re.fullmatch(r'(?:internal-[a-z0-9][a-z0-9.-]*|\[fdaa:[a-f0-9:]+\]):[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
@@ -282,6 +283,8 @@ def main() -> int:
                    'allowlist': repo / 'cmd/cache-node/allowlist.json'}
         if args.regional_cache_node:
             sources['node'] = args.regional_cache_node
+        if args.regional_cache_relay:
+            sources['relay'] = args.regional_cache_relay
         try:
             bundle = {key: base64.b64encode(path.read_bytes()).decode('ascii') for key, path in sources.items()}
         except OSError:

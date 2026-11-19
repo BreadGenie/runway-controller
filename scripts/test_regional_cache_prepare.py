@@ -67,10 +67,13 @@ class PrepareTests(unittest.TestCase):
             root = Path(directory)
             paths, bundle = self.fixture(root)
             bundle['service'] = '[fdaa:1::7]:8443'
+            relay = b'#!/usr/bin/env python3\n# replacement relay\n'
+            bundle['relay'] = base64.b64encode(relay).decode()
             self.assertEqual(self.run_guest(paths, None)[0], (0, {'state': 'installed'}))
             self.assertFalse((root / 'etc/runway/cache.json').exists())
             for _ in range(2):
                 self.assertEqual(self.run_guest(paths, bundle)[0], (0, {'state': 'installed'}))
+                self.assertEqual((root / 'opt/runway/bin/cache-relay').read_bytes(), relay)
                 for version in ('node20', 'node24'):
                     node = paths.runner / 'externals' / version / 'bin/node'
                     self.assertEqual(node.read_bytes(), b'\x7fELFnew wrapper')
@@ -127,6 +130,7 @@ class PrepareTests(unittest.TestCase):
                     if previous:
                         self.assertEqual(self.run_guest(paths, bundle)[0][0], 0)
                         bundle['node'] = base64.b64encode(b'\x7fELFreplacement').decode()
+                    bundle['relay'] = base64.b64encode(b'#!/usr/bin/env python3\n# replacement relay\n').decode()
                     before = {p.relative_to(root): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
                     self.assertEqual(self.run_guest(paths, bundle, fail=failure)[0], (1, {'state': 'unknown'}))
                     after = {p.relative_to(root): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
@@ -173,13 +177,15 @@ class TransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'node').write_bytes(b'ELF binary')
+            (root / 'relay').write_bytes(b'Python relay')
             (root / 'ca').write_bytes(b'CA PEM')
             for override, action in ((override, action) for override in (False, True) for action in ('prepare', 'status', 'bootstrap', 'stop')):
                 argv = ['transport', '--host', 'metal', '--key-file', '/key', '--known-hosts', '/hosts',
-                        '--vm-id', 'vm-1', '--runner-name', 'runway-test', '--regional-cache', 'internal-cache:443',
-                        '--regional-cache-ca', str(root / 'ca')]
+                        '--vm-id', 'vm-1', '--runner-name', 'runway-test']
+                if action == 'prepare':
+                    argv += ['--regional-cache', 'internal-cache:443', '--regional-cache-ca', str(root / 'ca')]
                 if override:
-                    argv += ['--regional-cache-node', str(root / 'node')]
+                    argv += ['--regional-cache-node', str(root / 'node'), '--regional-cache-relay', str(root / 'relay')]
                 argv += [action]
                 with patch.object(sys, 'argv', argv), patch.object(sys, 'stdin', io.StringIO('JIT')), patch.object(sys, 'stdout', io.StringIO()), patch.object(transport.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '{"state":"installed"}')) as run:
                     self.assertEqual(transport.main(), 0)
@@ -188,13 +194,15 @@ class TransportTests(unittest.TestCase):
                 if action == 'prepare':
                     if override:
                         self.assertEqual(base64.b64decode(sent['regional_cache']['node']), b'ELF binary')
+                        self.assertEqual(base64.b64decode(sent['regional_cache']['relay']), b'Python relay')
                     else:
                         self.assertNotIn('node', sent['regional_cache'])
                         size_payload = json.loads(json.dumps(sent))
                         size_payload['regional_cache'].pop('ca')
                         self.assertLess(len(json.dumps(size_payload).encode()), 64 * 1024)
                     self.assertEqual(base64.b64decode(sent['regional_cache']['ca']), b'CA PEM')
-                    self.assertNotIn('relay', sent['regional_cache'])
+                    if not override:
+                        self.assertNotIn('relay', sent['regional_cache'])
                     self.assertNotIn('unit', sent['regional_cache'])
                     self.assertEqual(json.loads(base64.b64decode(sent['regional_cache']['allowlist'])),
                                      json.loads((Path(__file__).resolve().parents[1] / 'cmd/cache-node/allowlist.json').read_text()))
