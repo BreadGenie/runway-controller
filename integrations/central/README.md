@@ -1,18 +1,16 @@
 # Runway Frappe app
 
-Install the standalone `runway` app on a site running Central. It owns the
-Runner Pool and Runner Lease DocTypes and serves the controller's POST methods
-under `runway.api.*`. See the [pilot setup](../../docs/pilot.md).
+Install `runway` on a Frappe site with only Frappe and Runway. It owns the
+Runner Pool and Runner Lease DocTypes and serves `runway.api.*`. Point the
+controller at the Runway site with a local Frappe API key. See the
+[pilot setup](../../docs/pilot.md).
 
-Use a dedicated API-key user with `Central User` and Team capabilities
-`server:view`, `server:create` and `server:terminate`. Assign it to the pool.
-Keep credential files outside this repository. Enable the site's scheduler and
-worker queues for lease expiry and orphan cleanup.
-
-Runner Pool `placement_rules` accepts an optional JSON array of Atlas placement
-rules. Use enforced Metal Server affinity for a pool pinned to one dev host.
-An uncertain create is reconciled by lease tags without another create attempt.
-A deleted VM consumes capacity until GitHub runner cleanup is confirmed.
+Set `runway_central_url` to the Central origin. Each pool links to its Team's
+Runway Team Connection, which stores the Central service user's credential.
+Choose a Central plan, image offering and regional image. Runway persists
+the Central request key and original payload before create. Its scheduler
+reconciles actions, lease expiry and server termination. A lease holds
+capacity until both the VM and GitHub registration are confirmed absent.
 
 Regional cache defaults off. The app uses Runway Region for the cache endpoint
 and CA, and Runway Cache Bucket to track buckets it owns. The region credential

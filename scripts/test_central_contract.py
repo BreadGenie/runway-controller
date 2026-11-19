@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import unittest
-import sys
 from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location(
@@ -30,39 +29,56 @@ class CentralContractTests(unittest.TestCase):
         return contract.update(lease, {'pool': 'pool', 'owner_id': 'owner', 'fence': 1,
                                       'lease_id': lease['id'], 'event': event, **fields})
 
-    def test_pool_placement_rules_are_optional_and_require_an_array_of_objects(self):
-        namespace = {'frappe': SimpleNamespace(parse_json=json.loads, throw=contract.reject),
-                     '_': lambda value: value}
-        contract.load_functions('runway/pools.py', ['pool_placement_rules'], namespace)
-        read = namespace['pool_placement_rules']
-        self.assertEqual(read({}), [])
-        rules = [{'resource': 'metal_server', 'operator': 'has', 'tags': {'lab': 'blr'}}]
-        self.assertEqual(read({'placement_rules': json.dumps(rules)}), rules)
-        for invalid in ('{}', 'null', '[1]', '["host"]'):
-            with self.subTest(invalid=invalid), self.assertRaises(contract.ContractError):
-                read({'placement_rules': invalid})
+    def test_runner_dispatch_persists_catalogue_request_before_reconciliation(self):
+        pool = contract.Document(region='blr', status='Active', plan='plan', offering='offering',
+                                 image_id='image', ssh_public_key='public')
+        lease = contract.Document(name='lease', runner_name='runner', phase='reserved', deadline=2)
+        committed = []
 
-    @unittest.skipIf(sys.version_info < (3, 14), 'Runway app requires Python 3.14')
-    def test_runner_create_forwards_placement_without_changing_default(self):
-        sent = []
-        namespace = {'frappe': SimpleNamespace(db=SimpleNamespace(commit=lambda: None)),
-                     'pool_placement_rules': lambda pool: json.loads(pool.get('placement_rules') or '[]'),
-                     'client_for_pool': lambda pool: SimpleNamespace(
-                         create_vm=lambda payload: sent.append(payload.copy()) or {'id': 'vm'}),
-                     'save_internal': lambda lease: None,
-                     'AtlasRejected': RuntimeError, 'AtlasRequestUncertain': OSError,
-                     'AtlasConnectionError': ConnectionError}
-        contract.load_functions('runway/vms.py', ['create_vm'], namespace)
-        pool = contract.Document(image_id='image', cpu_millicores=1000, memory_mib=1024,
-                                 disk_mib=4096, ssh_public_key='public', name='pool', team='team')
-        lease = contract.Document(runner_name='runner', name='lease', reload=lambda: None)
-        namespace['create_vm'](pool, lease)
-        self.assertNotIn('placement_rules', sent[-1])
-        rules = [{'resource': 'metal_server', 'operator': 'has', 'tags': {'lab': 'blr'}}]
-        pool.placement_rules = json.dumps(rules)
-        namespace['create_vm'](pool, lease)
-        self.assertEqual(sent[-1]['placement_rules'], rules)
-        self.assertEqual(lease.vm_id, 'vm')
+        def reconcile(document, name):
+            self.assertIs(document, pool)
+            self.assertEqual(name, lease.name)
+            self.assertEqual(committed, [dict(lease)])
+
+        namespace = {
+            'frappe': SimpleNamespace(db=SimpleNamespace(commit=lambda: committed.append(dict(lease))),
+                                      get_doc=lambda *_: lease),
+            'fenced_lease': lambda *_: (pool, lease),
+            'get_datetime': lambda value: value, 'now_datetime': lambda: 1,
+            'json': json, 'save_internal': lambda lease: None, 'reconcile_lease': reconcile,
+            'lease_snapshot': dict,
+        }
+        contract.load_functions('runway/vms.py', ['ensure_vm'], namespace)
+        result = namespace['ensure_vm']('pool', 'owner', 1, lease.name)
+        self.assertEqual(result['central_request_key'], lease.name)
+        self.assertEqual(json.loads(result['central_create_payload']), {
+            'request_key': lease.name, 'region': 'blr', 'title': 'runner', 'hostname': 'runner',
+            'plan': 'plan', 'offering': 'offering', 'image_id': 'image', 'ssh_keys': ['public'],
+            'is_firewall_enabled': False,
+        })
+
+    def test_uncertain_dispatch_reuses_the_saved_payload(self):
+        requests = []
+
+        def server(method, **values):
+            requests.append((method, values))
+            if len(requests) == 1:
+                raise ConnectionError('lost reply')
+            return {'action': 'create-1', 'status': 'Queued', 'resource_id': None}
+
+        namespace = {'json': json, 'for_pool': lambda pool: SimpleNamespace(server=server)}
+        contract.load_functions('runway/vms.py', ['reconcile_vm'], namespace)
+        lease = contract.Document(central_request_key='lease',
+                                  central_create_payload=json.dumps({'request_key': 'lease', 'plan': 'original'}))
+        pool = contract.Document(plan='changed')
+        reconcile = namespace['reconcile_vm']
+        with self.assertRaises(ConnectionError):
+            reconcile(pool, lease)
+        reconcile(pool, lease)
+        self.assertEqual(requests, [('create_server', {
+            'write': True, 'request_key': 'lease', 'plan': 'original',
+        })] * 2)
+        self.assertEqual(lease.central_create_action, 'create-1')
 
     def test_runner_identity_storage_accepts_github_ids_above_signed_int32(self):
         schema = json.loads(contract.app_file(

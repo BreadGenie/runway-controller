@@ -1,25 +1,27 @@
 # Durable internal pilot
 
-The pilot adds a Central-backed controller to the earlier operator execution tools. Central stores Runner Pools and Runner Leases; Runway observes GitHub demand, boots a fresh Atlas VM from a baked image, supplies a JIT runner configuration, and reconciles cleanup. Start with one trusted internal repository and concurrency one.
+The pilot adds a Central-backed controller to the earlier operator execution tools. The Runway site stores pools and leases and calls Central over HTTP. The controller observes GitHub demand, provisions a runner through Runway, supplies a JIT runner configuration and reconciles cleanup. Start with one trusted internal repository and concurrency one.
 
 The controller and recovery tests are implemented. The baked image has booted as a fresh guest and passed a Docker Redis published-port/PING check without installing packages at boot. Earlier manually coordinated workflows passed on this infrastructure. A real workflow passed after a same-owner controller crash and restart. Central also reclaimed a separate expired VM with the controller stopped. See [results](poc-results.md); broader outage and ownership-takeover drills remain.
 
 ## Install the Central integration
 
-Prepare the infrastructure described in [development](development.md). Add the standalone `runway` Frappe app to the bench and install it on a site running Central. See the [integration guide](../integrations/central/README.md).
+Prepare the infrastructure described in [development](development.md). Add the standalone `runway` Frappe app to the bench and install it on a dedicated Frappe site. See the [integration guide](../integrations/central/README.md).
 
 ```sh
 cd /path/to/bench
 bench get-app /path/to/runway-frappe-app
-bench --site CENTRAL_TEST_SITE install-app runway
-bench --site CENTRAL_TEST_SITE run-tests --app runway
-bench --site CENTRAL_SITE install-app runway
-bench --site CENTRAL_SITE enable-scheduler
+bench --site RUNWAY_TEST_SITE install-app runway
+bench --site RUNWAY_TEST_SITE run-tests --app runway
+bench --site RUNWAY_SITE install-app runway
+bench --site RUNWAY_SITE enable-scheduler
 ```
 
-Keep the Central worker queues and Atlas reconciliation running. Configure the bench scheduler tick to ten seconds.
+Keep the Runway and Central worker queues and Atlas reconciliation running. Configure Runway's bench scheduler tick to ten seconds.
 
-Create a dedicated API-key service user with `Central User` and a team-wide Developer or suitable custom role granting `server:view`, `server:create`, and `server:terminate`. Assign it as the pool's `controller_user`; do not give it System Manager. Store its `api_key:api_secret` in a private regular file, mode `0600`, outside the checkout.
+Set `runway_central_url` in the Runway site's config. Create a Central service user per Team and grant Team-wide server view, create and terminate access. Store its key and secret in the Runway Team Connection.
+
+Create a separate API-key user on Runway for the controller and assign it to the pool as `controller_user`. Save its `api_key:api_secret` in a private file outside the checkout with mode `0600`.
 
 ## Prepare the pool
 
@@ -32,31 +34,31 @@ go build -o runway .
 ./runway --action create --url https://github.com/OWNER/REPO --name runway-dogfood
 ```
 
-Record the returned ID. An uncertain create response requires remote inspection before another create. In Central Desk, an operator creates a Runner Pool with the following values:
+Record the returned ID. An uncertain create response requires remote inspection before another create. In Runway Desk, an operator creates a Runner Pool with the following values:
 
 | Field | Initial setting |
 | --- | --- |
-| Team and region | Authorized Team and healthy enrolled region |
-| Controller user | Dedicated service user |
+| Team, connection and region | Central Team ID, its Runway Team Connection and Central region |
+| Controller user | Dedicated user on the Runway site |
 | Repository URL and scale-set ID | The repository and dedicated scale set above |
 | Image ID and SSH public key | Your baked image and guest administrative public key |
-| CPU, memory, disk | Start with 1000 millicores, 2048 MiB RAM, 4096 MiB disk; size for your workflow |
+| Plan and offering | Select a Central catalogue plan and image offering sized for the workflow |
 | Max concurrency | `1`, the supported controller pilot limit |
 | Max job seconds | Total lease lifetime, including provisioning; for example `1200` |
 | Status | Paused until configuration is ready, then Active |
 
-Central additionally caps admission at four unfinished leases per Team. A lease consumes capacity until both the VM and GitHub registration are confirmed absent. The tested 4 GiB guest disk is tight for larger workloads.
+Runway caps admission at four unfinished leases per Team. A lease consumes capacity until both the VM and GitHub registration are confirmed absent. The tested 4 GiB guest disk is tight for larger workloads.
 
 ## Configure and run
 
-The supplied transport is an operator bridge for a single known Metal host. It uses SSH to enter `metal-VM_ID` network namespaces and SSH into the guest at its namespace-local address. The host must have the guest administrative private key corresponding to the pool's public key. Establish host SSH trust before launch. Placement must stay on that host; the transport does not discover a guest's host in a multi-host region.
+The supplied transport is an operator bridge for a single known Metal host. It uses SSH to enter `metal-VM_ID` network namespaces and SSH into the guest at its namespace-local address. The host must have the guest administrative private key corresponding to the pool's public key. Establish host SSH trust before launch. Use a region where Central places this pool's servers on that host. The transport uses a configured Metal host, and Central's create API exposes no placement selector.
 
 Create a private configuration file using deployment-specific absolute paths:
 
 ```json
 {
-  "central_url": "https://central.example.com",
-  "central_credential_file": "/srv/runway/private/central.token",
+  "central_url": "https://runway.example.com",
+  "central_credential_file": "/srv/runway/private/runway.token",
   "pool": "YOUR_POOL_ID",
   "transport_timeout_seconds": 90,
   "transport_command": [
@@ -71,15 +73,15 @@ Create a private configuration file using deployment-specific absolute paths:
 
 `key-file` and `known-hosts` are paths on Metal; `diagnostics-dir` is local to the controller. Known-host files are separated by VM ID. The transport requires Python 3 on the controller, Metal and guest, plus working SSH and `ip netns` on Metal. Keep configuration and diagnostic directories private. Diagnostics can contain workflow output and must be handled as sensitive logs.
 
-`central_url` must use `https`: every call sends the service user's `api_key:api_secret` in an `Authorization` header, so plaintext HTTP is refused except for a literal `localhost`, `127.0.0.1` or `[::1]` endpoint. Hosts are matched after parsing, so lookalikes such as `localhost.example.com` and `127.0.0.1.example.com` are refused, as are userinfo, query strings, fragments and unspecified addresses like `0.0.0.0` and `[::]`. Central must not redirect to another host; a redirect is reported as a rejected call. To test against a remote Central, forward a port to a loopback backend on the Central host and point `central_url` at it:
+`central_url` must use `https`: every call sends the service user's `api_key:api_secret` in an `Authorization` header, so plaintext HTTP is refused except for a literal `localhost`, `127.0.0.1` or `[::1]` endpoint. Hosts are matched after parsing, so lookalikes such as `localhost.example.com` and `127.0.0.1.example.com` are refused, as are userinfo, query strings, fragments and unspecified addresses like `0.0.0.0` and `[::]`. Runway must not redirect to another host; a redirect is reported as a rejected call. To test against a remote Runway site, forward a port to a loopback backend on the Runway host and point `central_url` at it:
 
 ```sh
-ssh -N -L 127.0.0.1:8003:127.0.0.1:8000 operator@central.example.com
+ssh -N -L 127.0.0.1:8003:127.0.0.1:8000 operator@runway.example.com
 ```
 
-Set `"central_url": "http://127.0.0.1:8003"` and, when the backend routes by virtual host, `"central_host": "central.example.com"` to match the configured site. Never forward to a non-loopback backend port.
+Set `"central_url": "http://127.0.0.1:8003"` and, when the backend routes by virtual host, `"central_host": "runway.example.com"` to match the configured site. Never forward to a non-loopback backend port.
 
-The controller uses the same GitHub authentication as the other CLI commands: the current `gh` credential, or `RUNWAY_GITHUB_APP_CLIENT_ID`, `RUNWAY_GITHUB_APP_INSTALLATION_ID`, and `RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE`. GitHub App and Central credentials remain outside guests. JIT material travels through stdin to the guest and is consumed by its runner wrapper.
+The controller uses the same GitHub authentication as the other CLI commands: the current `gh` credential, or `RUNWAY_GITHUB_APP_CLIENT_ID`, `RUNWAY_GITHUB_APP_INSTALLATION_ID`, and `RUNWAY_GITHUB_APP_PRIVATE_KEY_FILE`. GitHub App and Runway credentials remain outside guests. JIT material travels through stdin to the guest and is consumed by its runner wrapper.
 
 ```sh
 ./runway --action controller --config /srv/runway/private/controller.json
