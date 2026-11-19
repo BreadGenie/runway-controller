@@ -238,7 +238,7 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 	drainAssignment(t, engine)
 	deadline := time.Now().Add(5 * time.Second)
 	for !pilot.snapshot.Leases[0].Verified && time.Now().Before(deadline) {
-		if err := engine.verifyJobs(t.Context()); err != nil {
+		if err := engine.verifyJobs(t.Context(), nil); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Millisecond)

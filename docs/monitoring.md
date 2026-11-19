@@ -25,6 +25,25 @@ best effort, gathered during status and cleanup, and the job can influence
 them. Counters reset on exporter restart. A guest destroyed before its next
 observation can lose its latest events.
 
+## Trace controller assignment and verification
+
+The controller writes these JSON events to stderr with a UTC `timestamp` and
+the Runner Pool. Join delivery events on `message_id` within the same session.
+Join later activity on `lease_id`, runner name and ID, `run_id`, and `job_uuid`
+where present. Verification uses `attempt` for the controller's retry number.
+
+| Event | What to compare |
+| --- | --- |
+| `controller_scale_set_received` | Logged by the listener before handing off the message. Compare the matching job's GitHub start or finish timestamp to this timestamp for time to controller receipt. |
+| `controller_scale_set_handling` | Receipt to handling is time waiting for the serialized engine. |
+| `controller_job_evidence_written` | Handling to `assigned`, `started`, or `completed` includes ownership refresh and work before the durable write. Replays that skip a write have no evidence event. |
+| `controller_scale_set_finished` | Handling to finish covers ownership refresh and synchronous processing. The outcome precedes SDK acknowledgment. |
+| `controller_assignment_hint_created`, `controller_assignment_hint_resolved` | Creation to resolution covers waiting for an eligible runner, REST attempts and retries, and the durable assignment write. |
+| `controller_assignment_hint_rejected`, `controller_assignment_hint_expired`, `controller_assignment_hint_exhausted` | Fixed reasons distinguish cases such as `ambiguous_name`, `runner_or_job_mismatch`, `job_not_running`, TTL expiry, and retry exhaustion. REST can report no eligible running job without distinguishing an invisible job from one on a different runner. |
+| `controller_verification_scheduled`, `controller_verification_rest_result` | Evidence to scheduling is the wait for the verifier to become eligible and available. Scheduling to REST result covers worker dispatch and GitHub REST calls. |
+| `controller_verification_applied`, `controller_verification_discarded` | REST result to disposition covers the wait for the engine to consume the result and, if applied, persist it. An applied result can record a failed verification attempt. Discard reasons include `lease_retiring`, `stale_identity`, and `write_failed`. |
+| `controller_verification_skipped` | `started_and_completed` marks a message that retired the same job's lease before verification could be scheduled from its start evidence. |
+
 ## Send metrics to Atlas
 
 Use the local Vector instance on the controller host, including when that

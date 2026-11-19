@@ -124,7 +124,7 @@ func TestControllerAssignmentBounds(t *testing.T) {
 	}
 	for i := 0; i <= controllerAssignmentCap; i++ {
 		job.JobID = uuid.NewString()
-		e.rememberAssignment(job)
+		e.rememberAssignment(job, 0)
 	}
 	if len(e.pendingAssignments) != 0 || !e.now().Before(e.assignmentSaturated) {
 		t.Fatal("cap did not fail closed")
@@ -143,7 +143,7 @@ func TestControllerAssignmentRetryBudget(t *testing.T) {
 		}
 		drainAssignment(t, e)
 	}
-	e.rememberAssignment(job)
+	e.rememberAssignment(job, 0)
 	e.pendingAssignments[4242].next = time.Time{}
 	e.resolveAssignments(context.Background())
 	if e.assignmentBusy || calls.Load() != 2*controllerAssignmentTries {
@@ -207,7 +207,11 @@ func TestControllerAssignmentStopsOnStarted(t *testing.T) {
 	if err := e.Handle(t.Context(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: lease.RunnerName, RunnerID: 42}}}); err != nil {
 		t.Fatal(err)
 	}
-	drainAssignment(t, e)
+	// Handle can consume the result if the canceled worker returns before
+	// its assignment reconciliation pass.
+	if e.assignmentBusy {
+		drainAssignment(t, e)
+	}
 	if e.assignmentBusy || !s.snapshot.Leases[0].Started {
 		t.Fatal("worker survived JobStarted")
 	}

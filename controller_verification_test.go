@@ -52,7 +52,7 @@ func TestControllerVerification(t *testing.T) {
 			if scenario == "attempt" {
 				l.RunAttempt = "2"
 			}
-			f := verifyControllerJob(t.Context(), client, l)
+			f, _ := verifyControllerJob(t.Context(), client, l)
 			if scenario == "success" {
 				if !f.Verified || f.Ref != fixtureRef || f.SHA != fixtureSHA || f.RepositoryID != 580439734 || f.DefaultBranch != "develop" || f.RunAttempt != "1" {
 					t.Fatalf("missing evidence: %+v", f)
@@ -71,7 +71,7 @@ func drainVerification(t *testing.T, e *pilotEngine) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("verification worker stalled")
 	}
-	if err := e.verifyJobs(t.Context()); err != nil {
+	if err := e.verifyJobs(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -90,7 +90,7 @@ func TestControllerVerificationRetryAndCentralImmutability(t *testing.T) {
 			fixture.responses[path] = append([][]byte{[]byte(`{"total_count":0,"jobs":[]}`)}, bodies...)
 		}
 	}
-	if err := e.verifyJobs(t.Context()); err != nil {
+	if err := e.verifyJobs(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainVerification(t, e)
@@ -98,7 +98,7 @@ func TestControllerVerificationRetryAndCentralImmutability(t *testing.T) {
 		t.Fatal("REST lag enabled cache")
 	}
 	e.verificationRetries[l.ID].next = time.Time{}
-	if err := e.verifyJobs(t.Context()); err != nil {
+	if err := e.verifyJobs(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	drainVerification(t, e)

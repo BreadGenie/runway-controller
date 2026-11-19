@@ -33,6 +33,7 @@ type pilotGitHub interface {
 
 type pilotEngine struct {
 	metrics             *controllerMetrics
+	logTrace            func(controllerTrace)
 	verificationResults chan controllerVerificationResult
 	verificationRetries map[string]*controllerVerificationRetry
 	verificationBusy    bool
@@ -113,7 +114,7 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 			return err
 		}
 	}
-	if err := e.verifyJobs(ctx); err != nil {
+	if err := e.verifyJobs(ctx, message); err != nil {
 		return err
 	}
 	if err := e.resolveAssignments(ctx); err != nil {
@@ -125,7 +126,7 @@ func (e *pilotEngine) Handle(ctx context.Context, message *scaleset.RunnerScaleS
 // Reconcile executes at most one provisioning step per lease; Central returns
 // every durable phase after restart. JIT material exists only during one call.
 func (e *pilotEngine) Reconcile(ctx context.Context) error {
-	if err := e.verifyJobs(ctx); err != nil {
+	if err := e.verifyJobs(ctx, nil); err != nil {
 		return err
 	}
 	if err := e.resolveAssignments(ctx); err != nil {
