@@ -156,6 +156,9 @@ func (l controllerLifecycle) Run(parent context.Context) (runErr error) {
 }
 
 func (l controllerLifecycle) listen(ctx context.Context, session controllerSession, lastError *atomic.Value, report func(error)) error {
+	if l.engine.jobWorkerReady == nil {
+		l.engine.jobWorkerReady = make(chan struct{}, 1)
+	}
 	sessionCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	deliveries := make(chan pilotDelivery)
@@ -210,6 +213,17 @@ func (l controllerLifecycle) listen(ctx context.Context, session controllerSessi
 			}
 			report(err)
 			delivery.result <- err
+		case <-l.engine.jobWorkerReady:
+			err := refresh()
+			if err == nil {
+				err = l.engine.advanceJobEvidence(ctx, nil)
+			}
+			if errors.Is(err, errPoolResumed) || errors.Is(err, errCentralFenceRejected) {
+				stop()
+				<-done
+				return err
+			}
+			report(err)
 		case <-ticker.C:
 			err := refresh()
 			if err == nil {

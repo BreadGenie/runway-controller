@@ -159,7 +159,7 @@ func (e *pilotEngine) resolveAssignments(ctx context.Context) error {
 			run.tries++
 			run.next = e.now().Add(3 * time.Second)
 			e.assignmentBusy = true
-			client, results := e.assignmentREST, e.assignmentResults
+			client, results, ready := e.assignmentREST, e.assignmentResults, e.jobWorkerReady
 			workerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			e.assignmentCancel = cancel
 			e.assignmentLeaseID = lease.ID
@@ -170,6 +170,7 @@ func (e *pilotEngine) resolveAssignments(ctx context.Context) error {
 				attempt := int64(0)
 				_, job, err := authority.confirmREST(workerCtx, cacheGuestBinding{Repository: repository, RunnerName: lease.RunnerName, RunnerID: int64(lease.RunnerID)}, runID, &attempt, true)
 				results <- controllerAssignmentResult{hints: hints, run: runID, leaseID: lease.ID, runnerName: lease.RunnerName, runnerID: lease.RunnerID, job: job, attempt: attempt, err: err}
+				notifyJobWorkerReady(ready)
 			}(id, lease, run)
 			return nil
 		}
