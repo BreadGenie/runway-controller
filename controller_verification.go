@@ -79,9 +79,13 @@ func (e *pilotEngine) verifyJobs(ctx context.Context, delivery *scaleset.RunnerS
 			switch {
 			case l.Phase == "deleted" || l.Phase == "deleting":
 				trace.Reason = "lease_retiring"
+			case !e.now().Before(l.Deadline):
+				trace.Reason = "lease_expired"
+			case !e.snapshot.Pool.Enabled:
+				trace.Reason = "pool_disabled"
 			case l.Verified:
 				trace.Reason = "already_verified"
-			case l.JobID != r.lease.JobID || l.WorkflowRunID != r.lease.WorkflowRunID || l.RunnerID != r.lease.RunnerID || l.RunnerName != r.lease.RunnerName || l.JobWorkflowRef != r.lease.JobWorkflowRef || l.EventName != r.lease.EventName || l.RunAttempt != r.lease.RunAttempt || l.Repository != r.lease.Repository:
+			case l.JobID != r.lease.JobID || l.JobDisplayName != r.lease.JobDisplayName || l.WorkflowRunID != r.lease.WorkflowRunID || l.RunnerID != r.lease.RunnerID || l.RunnerName != r.lease.RunnerName || l.JobWorkflowRef != r.lease.JobWorkflowRef || l.EventName != r.lease.EventName || l.RunAttempt != r.lease.RunAttempt || l.Repository != r.lease.Repository:
 				trace.Reason = "stale_identity"
 			default:
 				if _, err := e.update(ctx, l, "verified", r.fields); err != nil {
@@ -126,7 +130,7 @@ func (e *pilotEngine) verifyJobs(ctx context.Context, delivery *scaleset.RunnerS
 		retry.next = e.now().Add(3 * time.Second)
 		e.verificationBusy = true
 		repository := strings.TrimPrefix(e.snapshot.Pool.RepositoryURL, "https://github.com/")
-		client, results := e.assignmentREST, e.verificationResults
+		client, results, ready := e.assignmentREST, e.verificationResults, e.jobWorkerReady
 		trace := controllerTrace{Event: "controller_verification_scheduled", Attempt: retry.tries, controllerTraceJob: traceLease(l)}
 		if delivery != nil {
 			trace.MessageID = verificationMessageID(delivery, l)
@@ -145,6 +149,7 @@ func (e *pilotEngine) verifyJobs(ctx context.Context, delivery *scaleset.RunnerS
 			e.trace(trace)
 			select {
 			case results <- controllerVerificationResult{lease: l, fields: f, trace: trace}:
+				notifyJobWorkerReady(ready)
 			case <-ctx.Done():
 				trace.Event = "controller_verification_discarded"
 				trace.Reason = "controller_stopped"

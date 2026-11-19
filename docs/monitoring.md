@@ -41,8 +41,10 @@ where present. Verification uses `attempt` for the controller's retry number.
 | `controller_assignment_hint_created`, `controller_assignment_hint_resolved` | Creation to resolution covers waiting for an eligible runner, REST attempts and retries, and the durable assignment write. |
 | `controller_assignment_hint_rejected`, `controller_assignment_hint_expired`, `controller_assignment_hint_exhausted` | Fixed reasons distinguish cases such as `ambiguous_name`, `runner_or_job_mismatch`, `job_not_running`, TTL expiry, and retry exhaustion. REST can report no eligible running job without distinguishing an invisible job from one on a different runner. |
 | `controller_verification_scheduled`, `controller_verification_rest_result` | Evidence to scheduling is the wait for the verifier to become eligible and available. Scheduling to REST result covers worker dispatch and GitHub REST calls. |
-| `controller_verification_applied`, `controller_verification_discarded` | REST result to disposition covers the wait for the engine to consume the result and, if applied, persist it. An applied result can record a failed verification attempt. Discard reasons include `lease_retiring`, `stale_identity`, and `write_failed`. |
+| `controller_verification_applied`, `controller_verification_discarded` | REST result to disposition covers the wait for the engine to consume the result and, if applied, persist it. An applied result can record a failed verification attempt. Discard reasons include `lease_retiring`, `lease_expired`, `pool_disabled`, `stale_identity`, and `write_failed`. |
 | `controller_verification_skipped` | `started_and_completed` marks a message that retired the same job's lease before verification could be scheduled from its start evidence. |
+
+Assignment and verification workers wake the serialized engine when their results are ready. Durable assignment can schedule verification in the same engine turn. The verifier still reads repository policy, the run, and its attempt-specific jobs independently. A result wake refreshes ownership before making a fenced write. The periodic reconcile still drives retries.
 
 ## Send metrics to Atlas
 
