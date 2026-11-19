@@ -134,7 +134,7 @@ func selectRoute(directory string, getenv func(string) string, setup func(time.T
 	}
 	digest := sha256.Sum256([]byte(key))
 	path := filepath.Join(directory, hex.EncodeToString(digest[:]))
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(25 * time.Second)
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return false
@@ -323,6 +323,7 @@ type serviceExchange struct {
 	url      string
 	payload  bytes.Buffer
 	response io.ReadCloser
+	status   int
 }
 
 func (c *serviceExchange) SetDeadline(time.Time) error { return nil }
@@ -339,6 +340,7 @@ func (c *serviceExchange) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		c.response = res.Body
+		c.status = res.StatusCode
 		if res.StatusCode != http.StatusOK {
 			return 0, fmt.Errorf("setup refused")
 		}
@@ -364,15 +366,22 @@ func setupServiceWithRoots(c *serviceConfig, roots *x509.CertPool, deadline time
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: host, MinVersion: tls.VersionTLS12}, DialContext: (&net.Dialer{Timeout: time.Second}).DialContext, TLSHandshakeTimeout: time.Second}
 	defer transport.CloseIdleConnections()
-	ctx, cancel := context.WithDeadline(context.Background(), minDeadline(deadline, time.Now().Add(3*time.Second)))
-	defer cancel()
-	cex := &serviceExchange{client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, ctx: ctx, url: "https://" + c.Service + "/setup"}
-	defer func() {
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for time.Until(deadline) > 0 {
+		attemptDeadline := minDeadline(deadline, time.Now().Add(3*time.Second))
+		ctx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
+		cex := &serviceExchange{client: client, ctx: ctx, url: "https://" + c.Service + "/setup"}
+		enabled := exchange(cex, attemptDeadline, getenv)
 		if cex.response != nil {
 			cex.response.Close()
 		}
-	}()
-	return exchange(cex, deadline, getenv)
+		cancel()
+		if cex.status != http.StatusTooEarly {
+			return enabled
+		}
+		time.Sleep(min(time.Second, time.Until(deadline)))
+	}
+	return false
 }
 
 func setup(deadline time.Time) bool {

@@ -9,13 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestServiceSetup(t *testing.T) {
-	for _, outcome := range []string{"enabled", "disabled", "malformed", "timeout", "wrong-ca", "wrong-name", "plain-http", "redirect"} {
+	for _, outcome := range []string{"enabled", "pending-then-enabled", "pending-timeout", "disabled", "malformed", "timeout", "wrong-ca", "wrong-name", "plain-http", "redirect"} {
 		t.Run(outcome, func(t *testing.T) {
+			var attempts atomic.Int32
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != "POST" || r.URL.Path != "/setup" {
 					t.Error("wrong setup endpoint")
@@ -28,7 +30,15 @@ func TestServiceSetup(t *testing.T) {
 				if json.NewDecoder(r.Body).Decode(&request) != nil || request.Version != 2 {
 					t.Error("wrong wire")
 				}
+				attempt := attempts.Add(1)
 				switch outcome {
+				case "pending-then-enabled", "pending-timeout":
+					if attempt == 1 || outcome == "pending-timeout" {
+						w.WriteHeader(http.StatusTooEarly)
+						return
+					}
+					fmt.Fprintf(w, "{\"version\":2,\"nonce\":%q,\"outcome\":\"enabled\",\"route\":%q}\n", request.Nonce, route)
+					return
 				case "timeout":
 					<-r.Context().Done()
 					return
@@ -59,15 +69,19 @@ func TestServiceSetup(t *testing.T) {
 			}
 			c := &serviceConfig{Service: address}
 			deadline := time.Now().Add(time.Second)
-			if outcome == "timeout" {
+			if outcome == "pending-then-enabled" {
+				deadline = time.Now().Add(3 * time.Second)
+			}
+			if outcome == "timeout" || outcome == "pending-timeout" {
 				deadline = time.Now().Add(60 * time.Millisecond)
 			}
+			wantEnabled := outcome == "enabled" || outcome == "pending-then-enabled"
 			directory := t.TempDir()
 			getenv := func(string) string { return "1" }
-			if got := selectRoute(directory, getenv, func(time.Time) bool { return setupServiceWithRoots(c, roots, deadline, getenv) }); got != (outcome == "enabled") {
+			if got := selectRoute(directory, getenv, func(time.Time) bool { return setupServiceWithRoots(c, roots, deadline, getenv) }); got != wantEnabled {
 				t.Fatalf("enabled=%v", got)
 			}
-			if got := selectRoute(directory, getenv, func(time.Time) bool { t.Fatal("persisted decision retried setup"); return false }); got != (outcome == "enabled") {
+			if got := selectRoute(directory, getenv, func(time.Time) bool { t.Fatal("persisted decision retried setup"); return false }); got != wantEnabled {
 				t.Fatal("decision not persisted")
 			}
 		})
