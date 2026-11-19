@@ -207,7 +207,11 @@ func TestControllerAssignmentStopsOnStarted(t *testing.T) {
 	if err := e.Handle(t.Context(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{JobMessageBase: job, RunnerName: lease.RunnerName, RunnerID: 42}}}); err != nil {
 		t.Fatal(err)
 	}
-	drainAssignment(t, e)
+	// Handle can consume the result if the canceled worker returns before
+	// its assignment reconciliation pass.
+	if e.assignmentBusy {
+		drainAssignment(t, e)
+	}
 	if e.assignmentBusy || !s.snapshot.Leases[0].Started {
 		t.Fatal("worker survived JobStarted")
 	}
