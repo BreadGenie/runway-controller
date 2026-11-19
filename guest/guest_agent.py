@@ -101,7 +101,8 @@ def install_regional_cache(bundle, paths, call):
             raise ValueError('cache service installation failed')
 
     try:
-        if set(bundle) not in ({'service', 'ca', 'allowlist'}, {'service', 'ca', 'allowlist', 'node'}):
+        required = {'service', 'ca', 'allowlist'}
+        if not required <= bundle.keys() <= required | {'node', 'relay'}:
             raise ValueError('invalid cache bundle')
         service = bundle['service']
         if not re.fullmatch(r'(?:internal-[a-z0-9][a-z0-9.-]*|\[fdaa:[a-f0-9:]+\]):[0-9]+', service):
@@ -142,6 +143,8 @@ def install_regional_cache(bundle, paths, call):
             entry = target.lstat()
             if not stat.S_ISREG(entry.st_mode) or entry.st_uid != 0 or entry.st_mode & 0o022:
                 raise ValueError('missing or unsafe baked cache relay/unit; rebuild runner image')
+        if 'relay' in files:
+            replace(root / 'opt/runway/bin/cache-relay', files['relay'], 0o755)
         replace(root / 'etc/runway/cache-ca.pem', files['ca'], 0o644)
         config = {'version': 1, 'mode': 'service', 'service': service, 'ca_file': '/etc/runway/cache-ca.pem'}
         replace(root / 'etc/runway/cache.json', (json.dumps(config) + '\n').encode(), 0o644)

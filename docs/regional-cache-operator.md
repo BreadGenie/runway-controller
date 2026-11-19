@@ -39,6 +39,10 @@ bucket.
    CA, the two Runway cache units are active, and `/var/lib/one-click/ready`
    exists. Enable regional cache on the pool. Use a runner image with
    mesh-address support in its guest agent, cache node and relay.
+   For development qualification with an older baked image, the Metal guest
+   transport accepts `--regional-cache-node` and `--regional-cache-relay`
+   pointing to compatible helpers on the controller. Add them to the controller
+   configuration's `transport_command`. They apply during cache-enabled preparation.
 
 ## Rotate, revoke or replace
 
