@@ -72,7 +72,7 @@ func TestCacheCredentialLifecycle(t *testing.T) {
 		return string(raw)
 	}
 	dropReply.Store(true)
-	if err := run(false); err == nil {
+	if err := run(false); !errors.Is(err, errCacheCredentialUnavailable) {
 		t.Fatal("expected interrupted enrolment")
 	}
 	if err := run(false); err != nil {
@@ -95,6 +95,36 @@ func TestCacheCredentialLifecycle(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatal("rotation attempted to enrol")
+	}
+}
+
+func TestCacheCredentialExchangeClassifiesRejections(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   error
+	}{
+		{http.StatusUnauthorized, errCacheCredentialRejected},
+		{http.StatusForbidden, errCacheCredentialRejected},
+		{http.StatusBadRequest, nil},
+		{http.StatusExpectationFailed, nil},
+		{http.StatusTooManyRequests, errCacheCredentialUnavailable},
+		{http.StatusServiceUnavailable, errCacheCredentialUnavailable},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(test.status)
+			}))
+			defer server.Close()
+			site := cacheCentralHTTPS{origin: server.URL, client: server.Client()}
+			err := site.exchange(t.Context(), "cache_enrol", nil)
+			if test.want == nil {
+				if err == nil || errors.Is(err, errCacheCredentialUnavailable) || errors.Is(err, errCacheCredentialRejected) {
+					t.Fatalf("expected a permanent exchange failure, got %v", err)
+				}
+			} else if !errors.Is(err, test.want) {
+				t.Fatalf("got %v, want %v", err, test.want)
+			}
+		})
 	}
 }
 

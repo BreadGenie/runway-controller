@@ -102,7 +102,10 @@ func readCacheCredential(path string) (string, error) {
 	return token, nil
 }
 
-var errCacheCredentialRejected = errors.New("Runway site rejected cache credential")
+var (
+	errCacheCredentialRejected    = errors.New("Runway site rejected cache credential")
+	errCacheCredentialUnavailable = errors.New("Runway cache credential exchange unavailable")
+)
 
 func (site cacheCentralHTTPS) exchange(ctx context.Context, method string, payload map[string]any) error {
 	if !cacheHTTPSOrigin(site.origin) || site.client == nil {
@@ -126,13 +129,20 @@ func (site cacheCentralHTTPS) exchange(ctx context.Context, method string, paylo
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return errors.New("Runway cache credential exchange unavailable")
+		var certificateError *tls.CertificateVerificationError
+		if errors.As(err, &certificateError) {
+			return errors.New("Runway cache credential TLS verification failed")
+		}
+		return errCacheCredentialUnavailable
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return errCacheCredentialRejected
 	case http.StatusOK:
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return errCacheCredentialUnavailable
 	default:
 		return errors.New("Runway cache credential exchange failed")
 	}
@@ -140,7 +150,10 @@ func (site cacheCentralHTTPS) exchange(ctx context.Context, method string, paylo
 		Credential string `json:"credential"`
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
-	if err != nil || len(raw) > 4096 || json.Unmarshal(raw, &answer) != nil || answer.Credential != payload["credential"] {
+	if err != nil {
+		return errCacheCredentialUnavailable
+	}
+	if len(raw) > 4096 || json.Unmarshal(raw, &answer) != nil || answer.Credential != payload["credential"] {
 		return errors.New("Runway cache credential response invalid")
 	}
 	return nil
