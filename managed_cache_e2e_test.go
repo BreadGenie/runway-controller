@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -41,27 +40,25 @@ func managedPeer(handler http.Handler, peer string) http.Handler {
 }
 
 type managedE2E struct {
-	t                        *testing.T
-	service                  *cacheService
-	data                     *storetest.Service
-	central, operator, guest *httptest.Server
-	configure                *cacheConfigure
-	key                      ed25519.PrivateKey
-	setup                    grant.SetupRequest
-	mu                       sync.Mutex
-	credential               string
-	cachePool                pilotPool
-	lease                    cacheServiceLease
-	buckets                  map[int64]store.GarageConfig
-	provider                 *cacheBucketProvider
-	storage                  map[int64]*managedS3
+	t              *testing.T
+	service        *cacheService
+	data           *storetest.Service
+	central, guest *httptest.Server
+	enrolment      cacheServiceConfig
+	bootstrapped   bool
+	setup          grant.SetupRequest
+	mu             sync.Mutex
+	credential     string
+	cachePool      pilotPool
+	lease          cacheServiceLease
+	buckets        map[int64]store.GarageConfig
+	provider       *cacheBucketProvider
+	storage        map[int64]*managedS3
 }
 
 func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *managedE2E {
 	t.Helper()
-	f := &managedE2E{t: t, credential: "central-e2e-first", buckets: map[int64]store.GarageConfig{}}
-	pub, key, _ := ed25519.GenerateKey(rand.Reader)
-	f.key = key
+	f := &managedE2E{t: t, buckets: map[int64]store.GarageConfig{}}
 	authority := newAuthorityCase(t)
 	gh, github := authority.authority(t)
 	rest := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,12 +99,30 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method != "GET" {
-			w.WriteHeader(405)
-			return
-		}
-		if r.URL.Path == "/api/method/central.api.jwks.get_jwks" {
-			json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]string{"kty": "OKP", "crv": "Ed25519", "kid": "key", "x": base64.RawURLEncoding.EncodeToString(pub)}}})
+		if r.Method == "POST" {
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				w.WriteHeader(400)
+				return
+			}
+			switch r.URL.Path {
+			case "/api/method/runway.api.cache_enrol":
+				if f.bootstrapped || body["token"] != "one-use" || body["region"] != "blr-1" || body["address"] != "fdaa:1::7" || body["ca"] == "" {
+					w.WriteHeader(401)
+					return
+				}
+				f.bootstrapped = true
+			case "/api/method/runway.api.cache_rotate":
+				if f.credential == "" || r.Header.Get("Authorization") != "token "+f.credential {
+					w.WriteHeader(401)
+					return
+				}
+			default:
+				w.WriteHeader(404)
+				return
+			}
+			f.credential = body["credential"].(string)
+			json.NewEncoder(w).Encode(map[string]string{"credential": f.credential})
 			return
 		}
 		if r.Header.Get("Authorization") != "token "+f.credential {
@@ -158,14 +173,13 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 		}
 	}))
 	t.Cleanup(f.central.Close)
-	rotating := &cacheCentralRotating{}
-	f.configure = &cacheConfigure{config: cacheServiceConfig{CentralURL: f.central.URL, CentralJWKSURL: f.central.URL + "/api/method/central.api.jwks.get_jwks", CentralIssuer: "central", CentralRegionID: 1, MeshRegionID: 1, RegionID: "blr-1", CentralTokenFile: filepath.Join(t.TempDir(), "central-token")}, central: rotating, client: f.central.Client(), store: writeCacheCredential}
-	f.operator = httptest.NewTLSServer(managedPeer(f.configure, "[fdaa:1::7]:9000"))
-	t.Cleanup(f.operator.Close)
-	f.provider = &cacheBucketProvider{credential: func() (string, error) {
-		raw, err := os.ReadFile(f.configure.config.CentralTokenFile)
+	f.enrolment = cacheServiceConfig{CentralURL: f.central.URL, Listen: "[fdaa:1::7]:8443", RegionID: "blr-1", CentralTokenFile: filepath.Join(t.TempDir(), "runway-credential")}
+	readCredential := func() (string, error) {
+		raw, err := os.ReadFile(f.enrolment.CentralTokenFile)
 		return string(raw), err
-	}, central: cacheCentralHTTPS{origin: f.central.URL, token: f.credential, client: f.central.Client()}, ca: f.buckets[2].CAPEM}
+	}
+	site := cacheCentralHTTPS{origin: f.central.URL, client: f.central.Client()}
+	f.provider = &cacheBucketProvider{credential: readCredential, central: site, ca: f.buckets[2].CAPEM}
 	f.data = storetest.Start(t, func(c *store.Config) {
 		c.Buckets = f.provider
 		c.QuotaBytes = 32 << 20
@@ -182,20 +196,20 @@ func newManagedE2E(t *testing.T, garageBuckets map[int64]store.GarageConfig) *ma
 	f.data.Restart(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
-	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: rotating, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
+	f.service = &cacheService{ctx: ctx, config: cacheServiceConfig{MeshRegionID: 1, RegionID: "blr-1"}, central: cacheSiteLeaseClient{site: site, credential: readCredential}, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: f.data.Signer.Key, roots: f.data.Client.Transport.(*http.Transport).TLSClientConfig.RootCAs, audience: f.data.Config.PublicOrigin, archiveBytes: 4 << 20, log: func(map[string]any) {}, clock: f.data.Clock.Observe}}
 	f.guest = httptest.NewUnstartedServer(managedPeer(f.service, servicePeer))
 	f.guest.Config.IdleTimeout = 5 * time.Second
 	identity := t.TempDir()
 	c := cacheServiceConfig{CertificateFile: "/cert.pem", PrivateKeyFile: "/key.pem", CacheDataCAFile: "/ca.pem"}
 	local := func(path string) string { return filepath.Join(identity, path) }
-	if err := prepareCacheServiceTLS(c, local, "cache.example.test"); err != nil {
+	if err := prepareCacheServiceTLS(c, local, "fdaa:1::7"); err != nil {
 		t.Fatal(err)
 	}
 	pair, err := tls.LoadX509KeyPair(local(c.CertificateFile), local(c.PrivateKeyFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.configure.config.CacheDataCAFile = local(c.CacheDataCAFile)
+	f.enrolment.CacheDataCAFile = local(c.CacheDataCAFile)
 	f.guest.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
 	f.guest.StartTLS()
 	t.Cleanup(f.guest.Close)
@@ -280,25 +294,16 @@ func managedGarageBuckets(t *testing.T) map[int64]store.GarageConfig {
 	return configs
 }
 
-func (f *managedE2E) enroll(credential string) {
+func (f *managedE2E) enroll(rotate bool) {
 	f.t.Helper()
-	body := configureBody(f.configure, credential)
-	r, _ := http.NewRequest("POST", f.operator.URL+"/configure", strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+configureToken(f.t, f.key, "key", nil))
-	response, err := f.operator.Client().Do(r)
+	if err := exchangeCacheCredential(f.t.Context(), f.enrolment, f.central.Client(), rotate, func() (string, error) { return "one-use", nil }); err != nil {
+		f.t.Fatal(err)
+	}
+	ca, err := os.ReadFile(f.enrolment.CacheDataCAFile)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	defer response.Body.Close()
-	raw, _ := io.ReadAll(response.Body)
-	var configured struct {
-		Configured bool   `json:"configured"`
-		CA         string `json:"ca"`
-	}
-	if response.StatusCode != 200 || json.Unmarshal(raw, &configured) != nil || !configured.Configured || configured.CA == "" {
-		f.t.Fatalf("enrolment: %d %s", response.StatusCode, raw)
-	}
-	request, _ := json.Marshal(map[string]any{"pool": map[string]any{"name": "pool", "regional_cache": true, "fence": 1, "region": "blr-1"}, "region": map[string]string{"cache_service_name": "internal-cache.example.test:8443", "cache_service_ca": configured.CA}})
+	request, _ := json.Marshal(map[string]any{"pool": map[string]any{"name": "pool", "regional_cache": true, "fence": 1, "region": "blr-1"}, "region": map[string]string{"cache_service_name": f.enrolment.Listen, "cache_service_ca": string(ca)}})
 	command := exec.Command(centralContractPython(f.t), "integrations/central/contract_harness.py")
 	command.Stdin = bytes.NewReader(request)
 	output, err := command.CombinedOutput()
@@ -309,9 +314,6 @@ func (f *managedE2E) enroll(credential string) {
 		f.t.Fatalf("Central pool snapshot: %v %s", err, output)
 	}
 	f.cachePool = snapshot.Message.Pool
-	f.mu.Lock()
-	f.credential = credential
-	f.mu.Unlock()
 }
 
 func (f *managedE2E) request(method, path string, body []byte, headers map[string]string) (int, []byte) {
@@ -382,7 +384,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 	t.Run("managed-lifecycle", func(t *testing.T) {
 		f := newManagedE2E(t, nil)
 		f.enable("disabled")
-		f.enroll("central-e2e-first")
+		f.enroll(false)
 		f.enable("enabled")
 		if status, _ := f.lookup("deps-1"); status != 204 {
 			t.Fatal("initial miss", status)
@@ -464,7 +466,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 				t.Fatal("unknown/spoofed peer", got)
 			}
 		}
-		f.enroll("central-e2e-second")
+		f.enroll(true)
 		rotated := httptest.NewTLSServer(managedPeer(f.service, "[fdaa:1:0:2::8]:1234"))
 		defer rotated.Close()
 		f.guest = rotated
@@ -472,7 +474,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 		f.guest = original
 		f.provider.Invalidate(2)
 		if _, err := f.provider.Bucket(t.Context(), 2); err != nil {
-			t.Fatal("managed data retained old Central credential after configure", err)
+			t.Fatal("managed data retained old Central credential after rotation", err)
 		}
 		if err := f.data.Server.Close(context.Background()); err != nil {
 			t.Fatal(err)
@@ -512,7 +514,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 		if f.storage[2].count(oldNamespace) != 0 {
 			t.Fatal("aged stale prefix survived lazy cleanup")
 		}
-		t.Log("unenrolled fallback; early assigned setup; miss/save/exact/prefix bytes; team isolation; unknown/spoofed refusal; restart; configure rotation; recreate passed")
+		t.Log("unenrolled fallback; early assigned setup; miss/save/exact/prefix bytes; team isolation; unknown/spoofed refusal; restart; credential rotation; recreate passed")
 	})
 	if os.Getenv("RUNWAY_MANAGED_E2E_OFFLINE") == "1" {
 		return
@@ -541,7 +543,7 @@ func TestManagedCacheEndToEnd(t *testing.T) {
 	for _, name := range strings.Fields(string(output)) {
 		t.Run(name, func(t *testing.T) {
 			f := newManagedE2E(t, garageBuckets)
-			f.enroll("central-e2e-first")
+			f.enroll(false)
 			ca := filepath.Join(t.TempDir(), "ca.pem")
 			os.WriteFile(ca, []byte(f.cachePool.CacheCA), 0600)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)

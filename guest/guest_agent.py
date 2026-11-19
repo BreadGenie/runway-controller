@@ -104,7 +104,7 @@ def install_regional_cache(bundle, paths, call):
         if set(bundle) not in ({'service', 'ca', 'allowlist'}, {'service', 'ca', 'allowlist', 'node'}):
             raise ValueError('invalid cache bundle')
         service = bundle['service']
-        if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', service):
+        if not re.fullmatch(r'(?:internal-[a-z0-9][a-z0-9.-]*|\[fdaa:[a-f0-9:]+\]):[0-9]+', service):
             raise ValueError('invalid service name')
         if not 1 <= int(service.rsplit(':', 1)[1]) <= 65535:
             raise ValueError('invalid service port')

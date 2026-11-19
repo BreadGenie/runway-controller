@@ -46,6 +46,12 @@ func run() error {
 	journal := flag.String("journal", "", "durable single-job journal for listen; parent directory must be private")
 	timeout := flag.Duration("timeout", 20*time.Minute, "maximum listener duration")
 	flag.Parse()
+	if *action == "cache-service-enrol" || *action == "cache-service-rotate" {
+		if *config == "" || flag.NArg() != 0 {
+			return errors.New("cache credential management requires --config")
+		}
+		return manageCacheCredential(*config, *action == "cache-service-rotate")
+	}
 	if *action == "cache-service-check" || *action == "cache-service-init" {
 		if *config == "" || flag.NArg() != 0 {
 			return errors.New("cache-service initialization requires --config")

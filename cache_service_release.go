@@ -11,6 +11,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -40,10 +42,7 @@ func prepareCacheService(path string, check bool) error {
 	}
 	root := os.Getenv("RUNWAY_ROOT")
 	local := func(path string) string { return filepath.Join(root, path) }
-	domain := os.Getenv("RUNWAY_DOMAIN")
-	if domain == "" {
-		return errors.New("RUNWAY_DOMAIN required")
-	}
+	addr, _ := netip.ParseAddrPort(c.Listen)
 	for _, dir := range []string{filepath.Dir(c.SigningKeyFile), filepath.Dir(c.PrivateKeyFile), "/var/lib/runway-cache", "/var/lib/runway-cache/spools"} {
 		if err := os.MkdirAll(local(dir), 0700); err != nil {
 			return err
@@ -53,7 +52,7 @@ func prepareCacheService(path string, check bool) error {
 	if err != nil {
 		return err
 	}
-	if err := prepareCacheServiceTLS(c, local, domain); err != nil {
+	if err := prepareCacheServiceTLS(c, local, addr.Addr().String()); err != nil {
 		return err
 	}
 	public := key.Public().(ed25519.PublicKey)
@@ -101,10 +100,14 @@ func prepareCacheServiceTLS(c cacheServiceConfig, local func(string) string, dom
 		if err != nil {
 			return err
 		}
-		internal := "internal-" + domain
-		template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: domain}, DNSNames: []string{domain, internal}, IPAddresses: nil, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: domain}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(10, 0, 0), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 		// The loopback data connection verifies the same certificate by IP.
-		template.IPAddresses = append(template.IPAddresses, []byte{127, 0, 0, 1})
+		template.IPAddresses = []net.IP{net.IPv4(127, 0, 0, 1)}
+		if ip := net.ParseIP(domain); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = []string{domain, "internal-" + domain}
+		}
 		der, err := x509.CreateCertificate(rand.Reader, template, template, pub, private)
 		if err != nil {
 			return err
@@ -135,7 +138,7 @@ func prepareCacheServiceTLS(c cacheServiceConfig, local func(string) string, dom
 		return errors.New("invalid TLS identity")
 	}
 	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil || leaf.VerifyHostname(domain) != nil || leaf.VerifyHostname("internal-"+domain) != nil || leaf.VerifyHostname("127.0.0.1") != nil {
+	if err != nil || leaf.VerifyHostname(domain) != nil || leaf.VerifyHostname("127.0.0.1") != nil {
 		return errors.New("TLS identity does not cover service names")
 	}
 	if err = releaseReplace(local(c.CacheDataCAFile), cert); err != nil {

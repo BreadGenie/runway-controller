@@ -25,6 +25,9 @@ Create a separate API-key user on Runway for the controller and assign it to the
 
 ## Prepare the pool
 
+Give a new Team Central's entry trust tier before provisioning runners.
+Central can reject `create_server` with `TRUST_TIER_LIMIT` until the tier is set.
+
 Publish an Available System image using the [baked runner image recipe](image-building.md). It includes the official runner, Docker, and a compatible Firecracker kernel; it must contain no registration, JIT material, SSH host identity, or operator credentials. Verify a fresh clone before selecting the image for a pool. The installer is an image-build step, not a controller boot step.
 
 Create a dedicated scale set with an existing administrator credential or GitHub App configuration described in [development](development.md):
@@ -97,20 +100,13 @@ Build a cache-capable runner image using [the image recipe](image-building.md).
 The controller checkout supplies the current `cmd/cache-node/allowlist.json`;
 merged allowlist-bot PRs reach fresh managed guests with the next controller
 deploy, without rebuilding the image.
-Append these arguments to the controller's `transport_command`:
-
-```json
-"--regional-cache", "internal-cache:443",
-"--regional-cache-ca", "/srv/runway/private/cache-ca.pem"
-```
-
-The CA PEM path is on the controller. Deploy the repository files together;
-the transport sends its current allowlist JSON and the pinned CA through the
-existing JSON-over-SSH stdin channel via Metal, only on `prepare`. No service
-credential or storage key reaches the guest.
-The service must resolve by its mesh `internal-` name, present a certificate for
-that name signed by the pinned CA, and expose setup and translator routes on
-that one TLS port.
+Enrol the operator-managed VM using the [regional cache runbook](regional-cache-operator.md).
+Enable regional cache on the pool. The controller receives the mesh endpoint
+and CA from the Runway pool snapshot. Remove any old static
+`--regional-cache` and `--regional-cache-ca` flags from `transport_command`.
+On `prepare`, the transport sends that
+endpoint, the CA and the allowlist to the guest through its existing SSH
+channel. Jobs use GitHub's cache when enrolment details are absent.
 
 This is off by default and applies only to an unregistered fresh clone reporting
 `installed`. Preparation validates both baked wrappers against the shipped

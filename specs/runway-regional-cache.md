@@ -141,7 +141,7 @@ pre-serve reset. Background marker refresh and lazy cleanup reclaim stale other
 instances as described below; standalone `prototype/` objects remain untouched.
 An existing journal verifies only indexed objects and never adopts unknown objects.
 The provider must honor deadlines and support concurrent credential lookups,
-including rotation. The Central provider and process configuration are described below. The CLI's
+including rotation. The Runway site provider and process configuration are described below. The CLI's
 standalone Garage config accepts optional `ca_pem` for HTTPS; managed service
 wiring supplies the provider through `store.Config`. Old standalone journals
 and object keys require no migration. A store instance selects one mode and
@@ -150,7 +150,7 @@ refuses grants from the other mode.
 ## Service mode
 
 `runway --action cache-service --config /etc/runway/cache-service.json` serves
-a direct guest mesh TLS listener and a separate operator mesh TLS listener.
+a direct guest mesh TLS listener.
 `POST /setup` carries the existing newline-framed
 setup wire v2 request and response; cache v1 `/_apis/artifactcache/...` and
 `/download/...` retain their paths on the same listener. The future guest relay
@@ -164,103 +164,54 @@ Configuration is a version-1 JSON object with exactly these required keys:
   "version": 1,
   "region_id": "blr-1",
   "mesh_region_id": 1,
-  "operator_listen": "[fdaa:1::10]:8445",
-  "central_issuer": "central",
-  "central_jwks_url": "https://central.example.com/api/method/central.api.jwks.get_jwks",
-  "central_region_id": 1,
-  "central_ca_file": "",
+  "runway_ca_file": "",
   "listen": "[fdaa:1::10]:8443",
   "audience": "https://cache-data.example.internal:8444",
   "certificate_file": "/etc/runway/service.crt",
   "private_key_file": "/etc/runway/service.key",
   "signing_key_file": "/var/lib/runway-cache/signing.key",
   "cache_data_ca_file": "/etc/runway/cache-data-ca.crt",
-  "central_url": "https://central.example.com",
-  "central_token_file": "/etc/runway/central-region-token",
+  "runway_url": "https://runway.example.com",
+  "runway_credential_file": "/etc/runway/credential",
   "archive_bytes": 1073741824
 }
 ```
 
-`mesh_region_id` is the numeric 16-bit mesh region; `region_id` is Central's
-region name and the grant region. `listen` must be a literal mesh IPv6 address
+`mesh_region_id` is the numeric 16-bit mesh region; `region_id` is the Runway Region
+name and the grant region. `listen` must be a literal mesh IPv6 address
 in that numeric region with a nonzero port. All file paths are absolute and
 clean. Config, keys and tokens are root-owned private single-link regular files;
 certificates and CA files may be readable but cannot be group/world writable.
 The signing key is generated locally on first start in an existing root-owned
 private directory and atomically published without replacing an existing key.
 Only its public key belongs in cache-data's trusted issuers; no private key or
-Central token goes to a guest. Central HTTPS (including JWKS) uses system roots
-when `central_ca_file` is empty, or exclusively the PEM roots in that protected
+Runway credential goes to a guest. Runway HTTPS uses system roots
+when `runway_ca_file` is empty, or exclusively the PEM roots in that protected
 CA file when set. Redirects are refused. TLS ingress requires TLS 1.3.
 
-Atlas setup pins `central_url` (HTTPS origin), `central_issuer` (the actual
-Central JWT issuer, currently `central`), `central_jwks_url` (the pinned origin's
-`/api/method/central.api.jwks.get_jwks`), `central_region_id` (numeric Central
-Region ID, 0–65535), and `region_id` (Central Region name). The numeric Central
-ID is independent of the mesh region ID.
+The cache VM enrols outbound through `runway.api.cache_enrol` on the Runway
+site. A one-use 15-minute token authorizes publication of its tenant-0 mesh
+address, port and public CA on the Runway Region. The client generates the
+read credential and the site stores it encrypted. The same regional
+credential authenticates the lease and bucket reads and credential rotation
+through `runway.api.cache_rotate`. The VM persists a proposed credential
+before either exchange so it can recover after losing the response.
+Revocation clears the published endpoint and invalidates the credential.
 
-`operator_listen` must bind the same literal mesh address as `listen`, on a
-separate nonzero port. The service address must belong to tenant 0 in this
-mesh region. Central reaches it through the region's Atlas HTTP proxy, a
-privileged tenant-0 VM, over the WG mesh, like Cargo's route. Atlas must provision
-that route with TLS passthrough or TLS re-encryption to the operator port and
-the matching certificate name.
-
-Before reading any body or validating a token, the handler requires the actual
-connection peer to be an IPv6 mesh address with prefix `fdaa:<mesh_region_id>`
-and tenant bits equal to zero. Non-zero tenants, other regions, IPv4 (including
-mapped IPv4), loopback and scoped addresses are refused. Forwarded headers are
-ignored. Optional `operator_peers` is an array of literal in-region tenant-0
-IPv6 addresses; omitted or empty permits any such peer, while a nonempty list
-further restricts access to those exact addresses. For example,
-`"operator_peers": ["fdaa:1::7"]`. The network check and full JWT validation
-are independent requirements. Only this listener accepts `POST /configure`;
-the guest listener explicitly refuses that path, including for established sessions.
-
-Configure requires `Authorization: Bearer <JWT>` with an EdDSA signature from
-Central's JWKS, the exact pinned `iss`, a scalar `aud` equal to
-`runway-cache:<central_region_id>`, and exact scope `runway-cache-configure`.
-Cargo audiences, audience arrays, and `X-Cargo-Access-Token` authentication are
-refused. Both `iat` and `exp` are required: lifetime is at most five minutes,
-with 30 seconds of clock skew. JWKS responses are bounded to 64 KiB / 64 keys,
-cached for five minutes, and refetched on an unknown `kid`; fetch attempts are
-serialized and limited to one per second, including failed fetches.
-
-The JSON body has exactly `central_url`, `region`, and `credential`, with no
-null, duplicate, missing, or extra keys. Origin and Region name must exactly
-match configuration. Success is HTTP 200 with exactly `{"configured": true, "ca": "<public service CA PEM>"}`.
-The opaque credential is never logged. It is written to a mode-0600 temporary
-file in the existing root-owned private token directory, fsynced, renamed over
-`central_token_file`, and the directory fsynced before publishing an immutable
-Central client snapshot. In-flight requests finish using their original client;
-later requests use the replacement. A persistence error leaves the current
-in-memory client unchanged and refuses enrolment. A directory-fsync failure
-following rename may leave the new file on disk; operators must retry enrolment.
-
-An absent, unreadable, or invalid credential at startup leaves setup disabled
-while the operator listener remains available. No `cache_lease` or `cache_bucket`
-request is made before enrolment. Central read failures during rotation disable
-setup so jobs fall back to GitHub's cache.
-
-Caller identity comes exclusively from the direct connection's IPv6 peer,
-never forwarding headers. The layout is `fdaa | region (16) | tenant (32) |
-padding (48) | VM (16)`; other prefixes, regions, IPv4 and tenant zero are
-refused. Central must return that exact address, tenant and configured region,
-an unexpired lease and job evidence. Missing, ambiguous, malformed or failed
-lookups disable setup. The controller confirms the runner's in-progress job,
-display name, run and attempt, repository, event, branch, SHA, same-repository
-head and workflow ref using GitHub REST. Setup requires verified lease fields
-to match the guest context. Renewal rechecks the same active verified lease
-and job in Central. One enabled setup and nonce replay
-fences remain per lease until its deadline; requests and live session counts
-are bounded. A service restart clears in-memory setup fences, as standalone
-host restart does. Setup work shares the existing 2.5-second budget.
+Caller identity comes from the direct connection's IPv6 peer, ignoring
+forwarded headers. The layout is `fdaa | region (16) | tenant (32) |
+padding (48) | VM (16)`. The service refuses other prefixes, other regions,
+IPv4 and tenant zero. The Runway site must return the same address, tenant
+and region, with an unexpired lease and verified job evidence matching the
+guest context. Renewal rechecks the same lease and job. Setup shares a
+2.5-second deadline. Each lease permits one enabled setup. The service keeps
+bounded nonce and session state until lease expiry or process restart.
 
 ## Regional process layout (managed storage)
 
 Run two systemd units on the regional service VM. This reuses the existing TLS
 boundary and gives cache-data sole custody of its journal and staging disk.
-The service signs grants with the positive tenant from the verified Central
+The service signs grants with the positive tenant from the verified Runway
 lease; managed cache-data rejects standalone grants. No changes to main's two
 actions are needed.
 
@@ -285,8 +236,8 @@ with this required `managed` object (the two cannot coexist):
 ```json
 {
   "managed": {
-    "central_url": "https://central.example.com",
-    "central_token_file": "/etc/runway/central-region-token",
+    "central_url": "https://runway.example.com",
+    "central_token_file": "/etc/runway/credential",
     "storage_ca_file": "/etc/runway/garage-ca.crt",
     "cleanup_stale_hours": 24
   }
@@ -298,7 +249,7 @@ Managed objects live under `managed/<service-id>/<tenant>/…`. The random
 service id is created with the first journal and has the same durability and
 custody: upgrades and migrations retain it, while VM recreation without a
 journal gets a new id and never reads or adopts older objects. Startup needs no
-reset or tenant enumeration. Enabling a pool in Central is sufficient; no team
+reset or tenant enumeration. Enabling a pool in Runway is sufficient; no team
 registry or service configuration change is needed.
 
 On bucket use, background maintenance writes a secret-free timestamp marker at
@@ -313,7 +264,7 @@ outside `managed/`; logs contain deletion counts only. Fresh instances preserve
 each other's objects. Idle retired prefixes are reclaimed when a bucket is
 next used. Keep the journal during in-place upgrades and migrations.
 
-Central responses use the same bounded HTTPS token client and exact JSON
+Runway responses use the same bounded HTTPS token client and exact JSON
 contract as leases; redirects are refused. Signed positive `tenant_id` selects
 `cache_bucket?tenant_id=…`; the response tenant must match.
 Each tenant's endpoint, region, bucket and credentials are cached for
@@ -321,63 +272,33 @@ at most 30 seconds, with no stale-on-error behavior. Storage 401/403 or S3
 authentication errors invalidate that tenant's credentials, causing a re-read
 on the next operation. Failed writes are not automatically replayed. Explicit
 rotation can also be picked up by restarting cache-data, or within the TTL.
-Storage uses the locally pinned CA file, never ambient roots. Credentials stay
+Storage uses the locally pinned CA file or system roots when it is empty. Credentials stay
 in process memory and are absent from journals, grants and logs.
 
-Setup and renewal freshly check Central bucket availability as well as lease
+Setup and renewal freshly check Runway bucket availability as well as lease
 authority. Data API authorization checks bucket availability (using the bounded
 credential cache); errors refuse requests. Downloads still require their
 short-lived journaled ticket, the redeeming grant's bearer, and a successful
 tenant-routed storage read; the ticket's tenant must equal both the redeeming
 grant's tenant and the entry's routed tenant, and the entry must belong to the
-redeeming grant's repository. Central provisioning, Atlas
-deployment and the guest TLS relay remain separate issues; no live regional
-deployment is qualified here.
+redeeming grant's repository.
 
-Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Central, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.
+Q25: The controller verifies branch push/workflow_dispatch runs and the bound in-progress job using its App credential. It records immutable verified `ref`, `sha`, `event_name`, `run_attempt`, `job_workflow_ref`, `repository_id`, and `default_branch` on the lease. Failed verification records `verified: false` and a short `verify_reason`. The service requires `job.verified`, matching guest context and mesh tenant; renewal rechecks the same active lease and job in Runway, without GitHub. The exact `cache_lease` job keys add `ref`, `sha`, `verified`; top-level keys add `repository_id`, `default_branch`.
 
 ## Service release and installation
 
-Build a tagged, clean commit with `scripts/build-cache-service-release.sh /tmp/runway-cache.tar.gz`
-using the Go version in go.mod (GNU tar and gzip required). The script builds the
-current tree, including uncommitted changes for local testing; publish only a
-clean tagged tree. Upload the archive manually to a GitHub release, then pin its
-HTTPS URL and the printed SHA256 in Atlas. There is no separate release workflow.
-Identical source, Go toolchain and dependencies produce identical archive bytes.
-The archive contains only `runway-cache/bin/runway`, `setup.sh`, two `systemd/`
-units, `SOURCE_COMMIT`, and `SHA256SUMS` (hashes all other files).
+Build a pinned tarball with `scripts/build-cache-service-release.sh /tmp/runway-cache.tar.gz`.
+The archive contains the Linux amd64 binary, both systemd units, the source
+commit and a checksum manifest. The operator-only `runway-cache` template
+verifies the download and installs the release. First boot generates and
+preserves the local signing key and TLS identity, derives cache-data config,
+enrols the VM with the Runway site, and starts both units. Cache data listens
+at `https://127.0.0.1:18445`. Use the
+[operator runbook](../docs/regional-cache-operator.md) for provisioning and
+credential management.
 
-Atlas verifies the archive hash before extracting and invokes `runway-cache/setup.sh`
-without arguments. Setup requires root, Bash and standard coreutils, and makes no
-network requests. Inputs are `RUNWAY_CONFIG` (default
-`/etc/runway/cache-service.json`), `RUNWAY_STORAGE_CA_FILE` (default
-`/etc/runway/storage-ca.pem`), and required `RUNWAY_DOMAIN`. `RUNWAY_ROOT` prefixes
-filesystem operations for offline tests; it does not redirect systemctl, so tests
-must supply a fake systemctl on PATH. Exit 0 means installed/unchanged; nonzero
-means refused or failed (2 for invalid arguments). No configuration secrets are
-printed. Setup copies an alternate RUNWAY_CONFIG to the canonical config location used
-by the units.
-
-Setup installs `/usr/local/bin/runway`, units, private state directories and a
-private release environment file. Changed files retain `.previous` copies;
-unchanged setup does not restart units. The data unit's ExecStartPre runs
-`cache-service-init`: Runway generates its signing key on first startup, preserves
-it on upgrades, creates the local TLS identity covering the operator domain,
-`internal-<operator-domain>` and loopback IP, and derives `/etc/runway/cache-data.json`
-with public signing-key trust. State and spools remain under `/var/lib/runway-cache`.
-The managed backend starts before enrolment and reads the credential on each
-bucket lookup. Central and storage CA trust are separate; empty storage CA uses
-system roots. Partial TLS identity is refused. Back up keys and journal together.
-
-Atlas supplies the HTTPS loopback data origin `https://127.0.0.1:18445` as
-`audience`. Setup owns restarts when installed files or configuration change.
-Atlas's matching-package-hash shortcut skips setup and does not restart services;
-changes to derived config inputs require rerunning setup or changing the pin.
-
-Central enrolment stores the public CA and the configured guest endpoint
-`cache_service_name` (`internal-<operator-domain>:<guest-port>`) on Region.
-Only pools with `regional_cache` receive `regional_cache`, `cache_service` and
-`cache_ca` in their pool snapshot. The controller writes a temporary local CA
-file for prepare and removes it after transport exits. Missing endpoint or CA
-omits regional cache for that VM. The transport includes the checked-in cache
-allowlist and uses the cache-node binary baked into the guest image.
+The controller gets `cache_service` and `cache_ca` in cache-enabled pool
+snapshots. It writes a temporary CA file for guest preparation and removes it
+after the transport exits. Missing endpoint or CA skips regional cache for
+that guest. The transport includes the checked-in allowlist and uses the
+cache-node binary baked into the guest image.
