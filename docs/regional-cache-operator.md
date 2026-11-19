@@ -2,8 +2,8 @@
 
 Create one cache VM per region. Build the operator-only `runway-cache`
 one-click template with a pinned HTTPS URL and SHA-256 for the tarball from
-`scripts/build-cache-service-release.sh`. Give the VM at least 20 GiB of
-disk for cache-data state and spools. Each Team's objects live in its Cargo
+`scripts/build-cache-service-release.sh`. The template requires at least 8 GiB of disk.
+Use 20 GiB or more in production for cache-data state and spools. Each Team's objects live in its Cargo
 bucket.
 
 ## Create and enrol
