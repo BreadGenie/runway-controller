@@ -21,7 +21,7 @@ def app_file(path):
 
 
 def load_functions(path, names, namespace):
-    # Parse only the tested functions. Other Central code uses Python 3.14
+    # Parse only the tested functions. The full Runway app can use Python 3.14
     # syntax; the lease contract itself can be exercised with older Python 3.
     source = app_file(path)
     starts = list(re.finditer(r'^def (\w+)\(', source, re.MULTILINE))

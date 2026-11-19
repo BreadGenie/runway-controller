@@ -34,7 +34,7 @@ Before creating a runner, verify:
 - Atlas can reach Metal's authenticated API, and Metal can download Atlas's image and binary artifacts. A local control plane may need SSH tunnels; endpoints and credentials are environment-specific.
 - A compatible System image is available, schedulers and workers run, and Atlas's ten-second reconciliation jobs have an appropriate bench scheduler tick.
 
-Complete the Atlas installation hooks and scheduler synchronization before using the region. Install the [Runway Frappe app](../integrations/central/README.md) on the Central site.
+Complete the Atlas installation hooks and scheduler synchronization before using the region. Install the [Runway Frappe app](../integrations/central/README.md) on its own Frappe site. Configure its Central HTTPS origin and use one Central service user per Team.
 
 ## Prepare a compatible image
 
