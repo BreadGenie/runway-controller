@@ -66,6 +66,7 @@ class PrepareTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths, bundle = self.fixture(root)
+            bundle['service'] = '[fdaa:1::7]:8443'
             self.assertEqual(self.run_guest(paths, None)[0], (0, {'state': 'installed'}))
             self.assertFalse((root / 'etc/runway/cache.json').exists())
             for _ in range(2):
@@ -75,7 +76,7 @@ class PrepareTests(unittest.TestCase):
                     self.assertEqual(node.read_bytes(), b'\x7fELFnew wrapper')
                     self.assertEqual(node.with_name('node.real').read_bytes(), version.encode())
             self.assertEqual(json.loads((root / 'etc/runway/cache.json').read_text()),
-                             {'version': 1, 'mode': 'service', 'service': 'internal-cache:443', 'ca_file': '/etc/runway/cache-ca.pem'})
+                             {'version': 1, 'mode': 'service', 'service': '[fdaa:1::7]:8443', 'ca_file': '/etc/runway/cache-ca.pem'})
 
     def test_unconfigured_prepare_disables_and_stops_baked_relay(self):
         with tempfile.TemporaryDirectory() as directory:

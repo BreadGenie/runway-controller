@@ -30,8 +30,7 @@ observation can lose its latest events.
 Use the local Vector instance on the controller host, including when that
 host is operator-managed. Use a regional Datum write token scoped to a stable,
 unique controller resource ID. Keep the token in the Vector service
-environment. Atlas configures the cache VM's own Vector through service-node
-telemetry.
+environment. For the operator-managed cache VM, configure a local collector separately.
 
 ```yaml
 sources:

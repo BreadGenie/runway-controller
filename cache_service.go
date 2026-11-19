@@ -27,37 +27,29 @@ import (
 )
 
 type cacheServiceConfig struct {
-	MetricsListen     string   `json:"metrics_listen,omitempty"`
-	DataMetricsListen string   `json:"data_metrics_listen,omitempty"`
-	OperatorListen    string   `json:"operator_listen"`
-	OperatorPeers     []string `json:"operator_peers,omitempty"`
-	CentralIssuer     string   `json:"central_issuer"`
-	CentralJWKSURL    string   `json:"central_jwks_url"`
-	CentralRegionID   int      `json:"central_region_id"`
-	CentralCAFile     string   `json:"central_ca_file"`
-	Version           int      `json:"version"`
-	RegionID          string   `json:"region_id"`
-	MeshRegionID      uint16   `json:"mesh_region_id"`
-	Listen            string   `json:"listen"`
-	Audience          string   `json:"audience"`
-	CertificateFile   string   `json:"certificate_file"`
-	PrivateKeyFile    string   `json:"private_key_file"`
-	SigningKeyFile    string   `json:"signing_key_file"`
-	CacheDataCAFile   string   `json:"cache_data_ca_file"`
-	CentralURL        string   `json:"central_url"`
-	CentralTokenFile  string   `json:"central_token_file"`
-	ArchiveBytes      int64    `json:"archive_bytes"`
+	MetricsListen     string `json:"metrics_listen,omitempty"`
+	DataMetricsListen string `json:"data_metrics_listen,omitempty"`
+	CentralCAFile     string `json:"runway_ca_file"`
+	Version           int    `json:"version"`
+	RegionID          string `json:"region_id"`
+	MeshRegionID      uint16 `json:"mesh_region_id"`
+	Listen            string `json:"listen"`
+	Audience          string `json:"audience"`
+	CertificateFile   string `json:"certificate_file"`
+	PrivateKeyFile    string `json:"private_key_file"`
+	SigningKeyFile    string `json:"signing_key_file"`
+	CacheDataCAFile   string `json:"cache_data_ca_file"`
+	CentralURL        string `json:"runway_url"`
+	CentralTokenFile  string `json:"runway_credential_file"`
+	ArchiveBytes      int64  `json:"archive_bytes"`
 }
 
 func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 	var c cacheServiceConfig
-	fields := []string{"operator_listen", "central_issuer", "central_jwks_url", "central_region_id", "central_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "central_url", "central_token_file", "archive_bytes"}
+	fields := []string{"runway_ca_file", "version", "region_id", "mesh_region_id", "listen", "audience", "certificate_file", "private_key_file", "signing_key_file", "cache_data_ca_file", "runway_url", "runway_credential_file", "archive_bytes"}
 	var object map[string]json.RawMessage
 	if json.Unmarshal(data, &object) != nil {
 		return c, grant.ErrInvalid
-	}
-	if _, ok := object["operator_peers"]; ok {
-		fields = append(fields, "operator_peers")
 	}
 	for _, name := range []string{"metrics_listen", "data_metrics_listen"} {
 		if _, ok := object[name]; ok {
@@ -72,27 +64,15 @@ func decodeCacheServiceConfig(data []byte) (cacheServiceConfig, error) {
 			return c, grant.ErrInvalid
 		}
 	}
-	operator, err := netip.ParseAddrPort(c.OperatorListen)
-	if err != nil || operator.Port() == 0 || c.CentralIssuer == "" || c.CentralRegionID < 0 || c.CentralRegionID > 65535 || c.CentralJWKSURL != strings.TrimSuffix(c.CentralURL, "/")+"/api/method/central.api.jwks.get_jwks" || (c.CentralCAFile != "" && (!filepath.IsAbs(c.CentralCAFile) || filepath.Clean(c.CentralCAFile) != c.CentralCAFile)) {
+	if c.CentralCAFile != "" && (!filepath.IsAbs(c.CentralCAFile) || filepath.Clean(c.CentralCAFile) != c.CentralCAFile) {
 		return c, grant.ErrInvalid
 	}
 	addr, err := netip.ParseAddrPort(c.Listen)
 	if err != nil || addr.Port() == 0 || !cacheHTTPSOrigin(c.CentralURL) || c.Version != 1 || c.ArchiveBytes <= 0 || c.ArchiveBytes > 1<<30 {
 		return c, grant.ErrInvalid
 	}
-	ip := addr.Addr()
-	raw := ip.As16()
-	if !ip.Is6() || ip.Is4In6() || ip.Zone() != "" || raw[0] != 0xfd || raw[1] != 0xaa || binary.BigEndian.Uint16(raw[2:4]) != c.MeshRegionID {
+	if !cacheServiceMeshAddress(addr.Addr(), c.MeshRegionID) || addr.Port() < 1024 {
 		return c, grant.ErrInvalid
-	}
-	if operator.Addr() != ip || operator.Port() == addr.Port() || !cacheOperatorMeshAddress(ip, c.MeshRegionID) {
-		return c, grant.ErrInvalid
-	}
-	for _, peer := range c.OperatorPeers {
-		ip, err := netip.ParseAddr(peer)
-		if err != nil || !cacheOperatorMeshAddress(ip, c.MeshRegionID) {
-			return c, grant.ErrInvalid
-		}
 	}
 	if _, err = grant.NewVerifier(map[string]ed25519.PublicKey{grant.KeyID(make([]byte, 32)): make([]byte, 32)}, c.Audience, c.RegionID); err != nil {
 		return c, err
@@ -181,8 +161,9 @@ type cacheServiceSession struct {
 }
 
 func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/configure" {
-		http.Error(w, "configure refused", 403)
+	if r.URL.Path != "/setup" && !strings.HasPrefix(r.URL.Path, "/_apis/artifactcache/") &&
+		!strings.HasPrefix(r.URL.Path, "/download/") {
+		http.NotFound(w, r)
 		return
 	}
 	select {
@@ -311,22 +292,16 @@ func runCacheService(path string) error {
 	if !roots.AppendCertsFromPEM(ca) {
 		return grant.ErrInvalid
 	}
-	token, err := readProtectedCacheFile(c.CentralTokenFile, true)
-	// Missing or unreadable credentials leave setup disabled until enrolment.
-	if err != nil {
-		token = nil
-	}
-	centralClient, err := cacheCentralClient(c)
+	site, err := cacheCentralClient(c)
 	if err != nil {
 		return err
 	}
-	rotating := &cacheCentralRotating{}
-	if value := strings.TrimSpace(string(token)); len(token) <= 4096 && value != "" && !strings.ContainsAny(value, " \t\r\n") {
-		rotating.current.Store(&cacheCentralWithBuckets{cacheCentralHTTPS{origin: c.CentralURL, token: value, client: centralClient}})
-	}
+	authority := cacheSiteLeaseClient{site: cacheCentralHTTPS{origin: c.CentralURL, client: site}, credential: func() (string, error) {
+		return readCacheCredential(c.CentralTokenFile)
+	}}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	service := &cacheService{config: c, ctx: ctx, central: rotating, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
+	service := &cacheService{config: c, ctx: ctx, central: authority, sessions: map[string]*cacheServiceSession{}, slots: make(chan struct{}, 64), template: cacheSessionConfig{key: key, roots: roots, clock: newCacheHostClock().observe, audience: c.Audience, archiveBytes: c.ArchiveBytes, log: cacheHostLogger(os.Stdout)}}
 	closeMetrics, err := startMetrics(c.MetricsListen, service.writeMetrics)
 	if err != nil {
 		return err
@@ -338,18 +313,8 @@ func runCacheService(path string) error {
 	}
 	defer listener.Close()
 	server := &http.Server{Handler: service, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: cacheSessionRequestLimit, WriteTimeout: cacheSessionRequestLimit, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
-	operatorListener, err := net.Listen("tcp", c.OperatorListen)
-	if err != nil {
-		return err
-	}
-	defer operatorListener.Close()
-	operatorServer := &http.Server{Handler: &cacheConfigure{config: c, central: rotating, client: centralClient}, TLSConfig: server.TLSConfig.Clone(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 16384}
-	operatorErrors := make(chan error, 1)
-	go func() { operatorErrors <- operatorServer.ServeTLS(operatorListener, "", ""); _ = server.Close() }()
-	defer operatorServer.Close()
 	go func() {
 		<-ctx.Done()
-		_ = operatorServer.Close()
 		_ = server.Close()
 		service.mu.Lock()
 		defer service.mu.Unlock()
@@ -358,13 +323,6 @@ func runCacheService(path string) error {
 		}
 	}()
 	err = server.ServeTLS(listener, "", "")
-	select {
-	case operatorErr := <-operatorErrors:
-		if !errors.Is(operatorErr, http.ErrServerClosed) {
-			return operatorErr
-		}
-	default:
-	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

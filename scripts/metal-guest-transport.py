@@ -181,7 +181,7 @@ def main() -> int:
     # only on an unregistered fresh clone. The passwordless sudo it grants is the
     # disposable Firecracker guest's own root: it reaches no Metal host path, no
     # network namespace and no control-plane or GitHub credential.
-    parser.add_argument('--regional-cache', help='Pinned TLS cache internal-name:port (prepare only)')
+    parser.add_argument('--regional-cache', help='Pinned TLS cache mesh endpoint (host:port) (prepare only)')
     parser.add_argument('--regional-cache-ca', type=Path, help='CA PEM on the controller')
     parser.add_argument('--regional-cache-node', type=Path, help='Development override: cache-node binary on the controller')
     parser.add_argument('--allow-guest-sudo', action='store_true',
@@ -236,8 +236,8 @@ def main() -> int:
     if any((args.regional_cache, args.regional_cache_ca, args.regional_cache_node)):
         if not all((args.regional_cache, args.regional_cache_ca)):
             parser.error('Regional cache requires --regional-cache and --regional-cache-ca')
-        if not re.fullmatch(r'internal-[a-z0-9][a-z0-9.-]*:[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
-            parser.error('Regional cache requires internal-name:port')
+        if not re.fullmatch(r'(?:internal-[a-z0-9][a-z0-9.-]*|\[fdaa:[a-f0-9:]+\]):[0-9]+', args.regional_cache) or not 1 <= int(args.regional_cache.rsplit(':', 1)[1]) <= 65535:
+            parser.error('Regional cache requires mesh endpoint (host:port)')
     if not re.fullmatch(r'vm-[0-9]+(?:-[0-9]+)?', args.vm_id):
         parser.error('Expected an Atlas vm-<digits> or vm-<tenant>-<digits> identifier')
     if not re.fullmatch(r'runway-[a-z0-9-]{1,56}', args.runner_name):

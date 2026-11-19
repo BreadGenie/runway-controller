@@ -78,6 +78,7 @@ func TestServiceConfig(t *testing.T) {
 	for _, raw := range []string{
 		`{}`, `{"version":1,"mode":"service","service":"http://internal-cache:443","ca_file":"/etc/runway/cache-ca.pem"}`,
 		`{"version":1,"mode":"service","service":"internal-cache:0","ca_file":"/etc/runway/cache-ca.pem"}`,
+		`{"version":1,"mode":"service","service":"[2001:db8::7]:8443","ca_file":"/etc/runway/cache-ca.pem"}`,
 		`{"version":1,"mode":"service","service":"internal-cache:65536","ca_file":"/etc/runway/cache-ca.pem"}`,
 		`{"version":1,"mode":"service","service":"internal-cache:443","ca_file":"/tmp/ca"}`,
 		`{"version":1,"mode":"vsock","extra":1}`,
@@ -87,6 +88,10 @@ func TestServiceConfig(t *testing.T) {
 		}
 	}
 	c, err := decodeServiceConfig([]byte(`{"version":1,"mode":"service","service":"internal-cache:443","ca_file":"/etc/runway/cache-ca.pem"}`))
+	if err != nil || c == nil {
+		t.Fatal(c, err)
+	}
+	c, err = decodeServiceConfig([]byte(`{"version":1,"mode":"service","service":"[fdaa:1::7]:8443","ca_file":"/etc/runway/cache-ca.pem"}`))
 	if err != nil || c == nil {
 		t.Fatal(c, err)
 	}

@@ -15,9 +15,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -274,14 +276,20 @@ func decodeServiceConfig(data []byte) (*serviceConfig, error) {
 	if c.Mode == "vsock" && c.Service == "" && c.CAFile == "" {
 		return nil, nil
 	}
-	if c.Mode != "service" || !regexp.MustCompile(`^internal-[a-z0-9][a-z0-9.-]*:[0-9]+$`).MatchString(c.Service) || c.CAFile != "/etc/runway/cache-ca.pem" {
+	if c.Mode != "service" || c.CAFile != "/etc/runway/cache-ca.pem" {
 		return nil, fmt.Errorf("invalid cache service")
 	}
-	_, port, err := net.SplitHostPort(c.Service)
+	host, port, err := net.SplitHostPort(c.Service)
 	if err != nil {
 		return nil, err
 	}
-	if p, err := net.LookupPort("tcp", port); err != nil || p < 1 {
+	if !regexp.MustCompile(`^internal-[a-z0-9][a-z0-9.-]*$`).MatchString(host) {
+		ip, err := netip.ParseAddr(host)
+		if err != nil || ip.Zone() != "" || !netip.MustParsePrefix("fdaa::/16").Contains(ip) {
+			return nil, fmt.Errorf("invalid cache service")
+		}
+	}
+	if p, err := strconv.ParseUint(port, 10, 16); err != nil || p == 0 {
 		return nil, fmt.Errorf("invalid port")
 	}
 	return &c, nil

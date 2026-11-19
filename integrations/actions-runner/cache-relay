@@ -192,13 +192,13 @@ def connector(path=CONFIG):
         return connect_host
     if (set(config) != {"version", "mode", "service", "ca_file"}
             or config["version"] != 1 or config["mode"] != "service"
-            or not re.fullmatch(r"internal-[a-z0-9][a-z0-9.-]*:[0-9]+", config["service"])
+            or not re.fullmatch(r"(?:internal-[a-z0-9][a-z0-9.-]*|\[fdaa:[a-f0-9:]+\]):[0-9]+", config["service"])
             or config["ca_file"] != "/etc/runway/cache-ca.pem"):
         raise ValueError("invalid cache configuration")
     host, port = config["service"].rsplit(":", 1)
     if not 1 <= int(port) <= 65535:
         raise ValueError("invalid cache port")
-    return tls_connector(host, int(port), trusted_read(config["ca_file"]))
+    return tls_connector(host.strip("[]"), int(port), trusted_read(config["ca_file"]))
 
 
 def tls_connector(host, port, ca):
