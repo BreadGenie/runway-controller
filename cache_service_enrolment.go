@@ -196,6 +196,7 @@ func exchangeCacheCredential(ctx context.Context, c cacheServiceConfig, client *
 	pending := path + ".pending"
 	raw, err := os.ReadFile(pending)
 	candidate := string(raw)
+	recovering := err == nil
 	if errors.Is(err, os.ErrNotExist) {
 		var secret [32]byte
 		if _, err := rand.Read(secret[:]); err != nil {
@@ -210,8 +211,10 @@ func exchangeCacheCredential(ctx context.Context, c cacheServiceConfig, client *
 	}
 	site := cacheCentralHTTPS{origin: c.CentralURL, client: client, token: candidate}
 	payload := map[string]any{"credential": candidate}
-	err = site.exchange(ctx, "cache_rotate", payload)
-	if errors.Is(err, errCacheCredentialRejected) {
+	if recovering {
+		err = site.exchange(ctx, "cache_rotate", payload)
+	}
+	if !recovering || errors.Is(err, errCacheCredentialRejected) {
 		site.token = token
 		method := "cache_rotate"
 		if !rotate {
