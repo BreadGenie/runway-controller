@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 // verifyCacheWorkflowRun binds the untrusted frozen context to GitHub's exact run.

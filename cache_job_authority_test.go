@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 // Fixtures in testdata/cache-github are trimmed recordings of the GitHub REST

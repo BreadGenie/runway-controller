@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/store"
-	"github.com/BreadGenie/runway/cache/store/storetest"
+	"github.com/BreadGenie/runway-controller/cache/store"
+	"github.com/BreadGenie/runway-controller/cache/store/storetest"
 )
 
 type buckets map[int64]store.GarageConfig

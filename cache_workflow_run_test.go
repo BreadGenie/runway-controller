@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 func TestCacheWorkflowRunRefMustComeFromAuthenticatedRun(t *testing.T) {

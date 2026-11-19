@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 )

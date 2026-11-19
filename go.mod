@@ -1,4 +1,4 @@
-module github.com/BreadGenie/runway
+module github.com/BreadGenie/runway-controller
 
 go 1.26.3
 

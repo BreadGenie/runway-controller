@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 type cachePolicyTestTransport struct {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/store/storetest"
+	"github.com/BreadGenie/runway-controller/cache/store/storetest"
 )
 
 // storeFront runs a translator for bearer in front of a real store.

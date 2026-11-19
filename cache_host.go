@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 	"golang.org/x/sys/unix"
 )
 

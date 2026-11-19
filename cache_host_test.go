@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 type fakeBindings struct {

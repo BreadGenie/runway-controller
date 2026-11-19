@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BreadGenie/runway/cache/grant"
+	"github.com/BreadGenie/runway-controller/cache/grant"
 )
 
 const servicePeer = "[fdaa:1:0:2::7]:1234"
