@@ -206,6 +206,10 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lease, err := s.central.lease(ctx, address)
+	if err == nil && s.liveLease(lease, address, tenant) && (lease.Job == nil || !lease.Job.Verified) {
+		http.Error(w, "assignment pending", http.StatusTooEarly)
+		return
+	}
 	if err != nil || !s.validLease(lease, address, tenant) {
 		_ = grant.WriteSetupResponse(w, request, false)
 		return
@@ -253,11 +257,15 @@ func (s *cacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = grant.WriteSetupResponse(w, request, reason == "")
 	s.template.log(map[string]any{"event": "setup", "lease": lease.Lease, "tenant_id": tenant, "enabled": reason == "", "reason": reason})
 }
-func (s *cacheService) validLease(l cacheServiceLease, address netip.Addr, tenant uint32) bool {
+func (s *cacheService) liveLease(l cacheServiceLease, address netip.Addr, tenant uint32) bool {
 	ip, err := netip.ParseAddr(l.MeshAddress)
-	j := l.Job
 	b := cacheGuestBinding{service: true, TenantID: l.TenantID, VMID: l.VMID, RunnerID: l.RunnerID, RunnerName: l.RunnerName, Repository: l.Repository, ExpiresAt: l.Deadline}
-	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.Verified && j.RunAttempt > 0 && l.RepositoryID > 0 && l.DefaultBranch != "" && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
+	return err == nil && ip == address && l.TenantID == tenant && l.Region == s.config.RegionID && l.Lease != "" && l.Team != "" && b.validate() == nil && time.Now().Before(l.Deadline)
+}
+
+func (s *cacheService) validLease(l cacheServiceLease, address netip.Addr, tenant uint32) bool {
+	j := l.Job
+	return s.liveLease(l, address, tenant) && j != nil && canonicalCacheUUID(j.JobID) && j.RequestID >= 0 && j.RunID > 0 && j.Verified && j.RunAttempt > 0 && l.RepositoryID > 0 && l.DefaultBranch != "" && j.DisplayName != "" && strings.HasPrefix(j.WorkflowRef, l.Repository+"/.github/workflows/") && (j.EventName == "push" || j.EventName == "workflow_dispatch")
 }
 func runCacheService(path string) error {
 	data, err := readProtectedCacheFile(path, true)

@@ -95,11 +95,18 @@ func TestCacheServiceAttributionAndFallback(t *testing.T) {
 			}
 		})
 	}
-	for _, edit := range []func(*cacheServiceLease){func(l *cacheServiceLease) { l.TenantID = 3 }, func(l *cacheServiceLease) { l.MeshAddress = "fdaa:1:0:2::8" }, func(l *cacheServiceLease) { l.Job = nil }, func(l *cacheServiceLease) { l.Region = "other" }} {
+	for _, edit := range []func(*cacheServiceLease){func(l *cacheServiceLease) { l.TenantID = 3 }, func(l *cacheServiceLease) { l.MeshAddress = "fdaa:1:0:2::8" }, func(l *cacheServiceLease) { l.Region = "other" }} {
 		s, test := serviceFixture(t, edit, 200, false)
 		if got := serviceSetup(t, s, test.setup, servicePeer); got != "disabled" {
 			t.Fatal(got)
 		}
+	}
+	s, test := serviceFixture(t, func(l *cacheServiceLease) { l.Job = nil }, 200, false)
+	if got := serviceSetup(t, s, test.setup, servicePeer); got != http.StatusText(http.StatusTooEarly) {
+		t.Fatal(got)
+	}
+	if len(s.sessions) != 0 {
+		t.Fatal("created a session before assignment verification")
 	}
 }
 
@@ -254,8 +261,12 @@ func TestCacheServiceVerifiedContext(t *testing.T) {
 					*p = &bad
 				}
 			}
-			if got := serviceSetup(t, s, a.setup, servicePeer); got != "disabled" {
-				t.Fatal("context mismatch enabled", got)
+			want := "disabled"
+			if field == "unverified" {
+				want = http.StatusText(http.StatusTooEarly)
+			}
+			if got := serviceSetup(t, s, a.setup, servicePeer); got != want {
+				t.Fatalf("setup = %q, want %q", got, want)
 			}
 		})
 	}
