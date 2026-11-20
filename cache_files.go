@@ -87,6 +87,10 @@ func cacheGitHubClient(scopeURL, path string, options ...scaleset.HTTPOption) (*
 // readProtectedCacheFile reads a root-owned, single-link regular file that is
 // not group or world writable (nor readable at all when private).
 func readProtectedCacheFile(path string, private bool) ([]byte, error) {
+	return readProtectedCacheFileLimit(path, private, 4096)
+}
+
+func readProtectedCacheFileLimit(path string, private bool, limit int64) ([]byte, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errCacheInvalid
 	}
@@ -103,7 +107,7 @@ func readProtectedCacheFile(path string, private bool) ([]byte, error) {
 	if !ok || metadata.Uid != 0 || metadata.Nlink != 1 {
 		return nil, errCacheInvalid
 	}
-	return io.ReadAll(io.LimitReader(file, 4097))
+	return io.ReadAll(io.LimitReader(file, limit+1))
 }
 
 // cacheSocketDirectoryGroup admits only the jailed Firecracker's group (mode

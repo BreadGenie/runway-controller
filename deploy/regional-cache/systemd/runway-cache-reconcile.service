@@ -1,0 +1,16 @@
+[Unit]
+Description=Runway regional cache provisioner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/runway-controller --action cache-reconcile --config /etc/runway/cache-reconcile.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=runway/cache-reconcile
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

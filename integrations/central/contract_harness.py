@@ -85,7 +85,22 @@ if __name__ == '__main__':
         sys.exit(f'{APP_ENV} must point to the Runway Frappe app checkout')
     try:
         request = json.load(sys.stdin)
-        if 'pool' in request:
+        if 'cache_status' in request:
+            document = Document(request['cache_status'])
+
+            def get_region(doctype, name):
+                if doctype != 'Runway Region' or name != document.region:
+                    raise ContractError('Unknown cache region')
+                return document
+
+            namespace = {'frappe': SimpleNamespace(only_for=lambda roles: None, get_doc=get_region),
+                         'PROVISIONER_ROLES': ('System Manager', 'Runway Cache Provisioner'),
+                         'iso_utc': lambda value: value}
+            load_functions('runway/cache.py', ['status'], namespace)
+            routes = {'cache': SimpleNamespace(status=namespace['status'])}
+            load_functions('runway/api.py', ['cache_status'], routes)
+            result = routes['cache_status'](document.region)
+        elif 'pool' in request:
             namespace = {'frappe': SimpleNamespace(db=SimpleNamespace(get_value=lambda *args, **kwargs: request['region'])),
                          'iso_utc': lambda value: value, 'active_leases': lambda **kwargs: []}
             load_functions('runway/pools.py', ['pool_snapshot'], namespace)

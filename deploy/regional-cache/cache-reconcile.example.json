@@ -1,0 +1,28 @@
+{
+  "state_dir": "/var/lib/runway/cache-reconcile",
+  "metrics_listen": "127.0.0.1:18448",
+  "regions": [
+    {
+      "region": "blr-1",
+      "runway_url": "https://runway.example.com",
+      "runway_api_key_file": "/etc/runway/credentials/blr-1-runway",
+      "atlas_url": "https://atlas-blr-1.example.com",
+      "atlas_token_file": "/etc/runway/credentials/blr-1-atlas",
+      "image_id": "cargo-built-runway-cache-image-id",
+      "cpu_millicores": 2000,
+      "memory_mib": 2048,
+      "disk_mib": 20480,
+      "enrolment_timeout_seconds": 600,
+      "firewall": {
+        "enabled": true,
+        "inbound": [
+          {"protocol": "tcp", "ports": "8443", "cidrs": ["fdaa::/16"]},
+          {"protocol": "icmp", "cidrs": ["fdaa::/16"]}
+        ],
+        "outbound": [
+          {"protocol": "any", "cidrs": ["0.0.0.0/0", "::/0"]}
+        ]
+      }
+    }
+  ]
+}

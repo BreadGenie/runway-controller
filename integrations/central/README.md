@@ -26,5 +26,6 @@ RUNWAY_FRAPPE_APP=/path/to/runway-frappe-app python3 -m unittest discover -s scr
 
 The tests skip when the app path is unset. The Go tests also skip when Python 3
 is unavailable. The harness runs the app's transition and snapshot functions
-with local storage, fencing and time substitutes. Run the app's integration
+with local storage, fencing and time substitutes. It also runs the cache
+status route against a pending enrolment record. Run the app's integration
 suite on a separate Frappe site to verify database behavior and authorization.

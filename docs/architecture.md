@@ -129,8 +129,10 @@ details.
 
 ### The managed cache server
 
-An operator creates one cache VM per region, as a privileged tenant-0 VM built
-from the `runway-cache` one-click template. It needs no inbound route from
+The cache reconciler runs on the controller host and creates and replaces one
+privileged tenant-0 VM per configured region from the `runway-cache` one-click
+template. The controller host holds the regional Atlas operator credential.
+The cache VM needs no inbound route from
 Central or a proxy. On first boot it enrols outbound with the `runway` site
 using a one-use token, retrying for up to three minutes. It then holds a
 credential it can rotate. See the [operator runbook](regional-cache-operator.md).
