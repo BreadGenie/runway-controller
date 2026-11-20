@@ -35,7 +35,7 @@ See [development](docs/development.md) for the separate infrastructure and GitHu
 | --- | --- |
 | [Internal pilot](docs/pilot.md) | Install, configure, operate, and recover the durable controller |
 | [Image building](docs/image-building.md) | Bake and verify a clean runner image |
-| [Architecture](docs/architecture.md) | Ownership and proposed integration boundaries |
+| [Architecture](docs/architecture.md) | How the parts fit together, with diagrams |
 | [Proof of concept results](docs/poc-results.md) | Live evidence, fixes, and limits |
 | [Frappe performance](docs/frappe-performance.md) | Runner timing against GitHub-hosted, and what limits the test phase |
 | [Development](docs/development.md) | Prerequisites and operator workflow |
