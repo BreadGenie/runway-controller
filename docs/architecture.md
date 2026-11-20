@@ -18,7 +18,7 @@ flowchart LR
 
     GH <-->|job demand, JIT runner| C
     C -->|leases, fenced RPCs| R
-    R -->|teams, VMs, buckets| CE
+    R -->|HTTP API: servers, buckets| CE
     CE -->|create / delete VM| A
     A --> M
     M --> VM
@@ -29,8 +29,8 @@ flowchart LR
 | Part | What it does |
 | --- | --- |
 | **Runway controller** (this repo, `--action controller`) | Watches GitHub for queued jobs, asks the `runway` app for capacity, boots the runner, and cleans up afterwards |
-| **`runway` app** (a separate Frappe app) | Stores Runner Pools and Runner Leases, checks who may act, counts capacity, and deletes expired VMs |
-| **Central** | Teams, permissions and billing; creates and deletes VMs and buckets for the `runway` app |
+| **`runway` app** (a Frappe app on its own site) | Stores Runner Pools and Runner Leases, checks who may act, counts capacity, deletes expired VMs, and enrols the regional cache |
+| **Central** | Teams, permissions and billing. The `runway` app calls Central's HTTP API as each Team's service user to create and delete VMs and buckets. People sign in to the `runway` site with Central OIDC |
 | **Atlas and Metal** | Place VMs, manage images and disks, and run Firecracker |
 | **Guest agent** (`guest/guest_agent.py`) | Runs inside the VM: prepares it, starts the one-job runner, reports status, collects diagnostics |
 | **Cargo** | Provides the storage bucket behind the managed cache |
@@ -48,14 +48,14 @@ sequenceDiagram
 
     GH->>C: job queued (scale-set message)
     C->>R: admit lease (fenced)
-    R->>CE: create VM from baked image
+    R->>CE: create_server from baked image
     CE->>VM: (through Atlas)
     C->>VM: prepare, then send one-use JIT config
     VM->>GH: runner takes the job and runs it
     GH->>C: job started / completed
     C->>VM: collect diagnostics, stop
     C->>R: delete VM
-    R->>CE: delete VM
+    R->>CE: terminate, then refresh until gone
     C->>GH: remove runner registration
     C->>R: lease done, capacity freed
 ```
@@ -68,9 +68,11 @@ confirmed gone.
 - **Write intent first.** The controller records a lease, job and JIT attempt
   in the `runway` app before calling anything remote. After a crash it picks up from
   that record.
-- **Never retry blindly.** A VM create that timed out is found again by its
-  tags, not created twice. If it can't be found, the lease stays blocked for
-  an operator.
+- **Never retry blindly.** The `runway` app stores a request key and the
+  original payload before it asks Central for a VM. If the reply is lost, it
+  replays the same request and reads Central's action status, so the VM is
+  never created twice. If the outcome stays unknown, the lease stays blocked
+  for an operator.
 - **Deleting isn't done until it's gone.** An accepted DELETE only starts
   deletion. Runway checks the VM is actually absent.
 - **One owner at a time.** The controller holds a fenced ownership claim in
@@ -102,9 +104,9 @@ flowchart LR
         D1 --> G1[(Garage)]
     end
     subgraph Managed[Managed path]
-        S[cache-service<br/>Atlas cache VM] --> D2[cache-data]
-        D2 --> B[(Team bucket<br/>via Cargo)]
-        S -->|lease and bucket lookup| RA[runway app]
+        S[cache-service<br/>regional cache VM] --> D2[cache-data]
+        D2 --> B[(Team bucket<br/>via Central and Cargo)]
+        S -->|enrol, lease and bucket lookup| RA[runway app]
     end
     R -->|vsock| H
     R -->|TLS internal-cache:443| S
@@ -115,15 +117,37 @@ There are two ways to run it:
 | | Standalone | Managed |
 | --- | --- | --- |
 | Runners | Launched directly on the blr-1 host | Created by the controller through the `runway` app |
-| Who checks the job | `cache-host`, using job records the host observes itself | `cache-service`, using the `runway` app's lease records |
-| Storage | Garage on the host | A per-Team bucket that Central creates through Cargo for the `runway` app |
-| Status | Qualified live (98% hit rate) | Built and tested; first live cache hit waits for the production trial |
+| Who checks the job | `cache-host`, using job records the host observes itself | `cache-service`, using lease records the controller has confirmed with GitHub |
+| Storage | Garage on the host | A per-Team bucket that the `runway` app creates through Central's storage API, backed by Cargo |
+| Status | Qualified live (98% hit rate) | Qualified in dev: 15 of 15 jobs used the cache. A trial with real workloads is next |
 
 In both, the host decides which job a guest is running. A guest's own claims
 never unlock the cache. Grants are signed, scoped to one repository, ref and
 job, and expire with the job. Archives are checked by size and SHA256 before
 they're served. See the [cache spec](../specs/runway-regional-cache.md) for the
 details.
+
+### The managed cache server
+
+An operator creates one cache VM per region, as a privileged tenant-0 VM built
+from the `runway-cache` one-click template. It needs no inbound route from
+Central or a proxy. On first boot it enrols outbound with the `runway` site
+using a one-use token, retrying for up to three minutes. It then holds a
+credential it can rotate. See the [operator runbook](regional-cache-operator.md).
+
+### How a job is confirmed
+
+The cache serves a runner only after its job is confirmed:
+
+1. The controller learns which job a runner took, from the scale-set
+   `JobStarted` message or, when that is late, from GitHub's REST API.
+2. A separate REST check confirms the job is running on that runner. The
+   controller records the result on the lease with a fenced write.
+3. Until then the cache answers HTTP 425. The guest retries for up to 25
+   seconds, then falls back to GitHub's cache.
+
+`JobStarted` can arrive 20 seconds or more after the job starts, so the REST
+path matters. [Monitoring](monitoring.md) lists the trace events for each step.
 
 ## Where the code lives
 
@@ -135,7 +159,7 @@ details.
 | `guest/` | Guest agent and runner scripts |
 | `scripts/` | Guest transport, image building and VM tools |
 | `deploy/` | systemd units and setup for the standalone guest, regional cache and Garage |
-| `integrations/` | Central contract tests, cache relay and cache client tests |
+| `integrations/` | Contract tests for the `runway` app, cache relay and cache client tests |
 
 ## Limits today
 
@@ -143,7 +167,8 @@ details.
 - Trusted internal workflows only. Network isolation for untrusted or fork-PR
   jobs isn't proven yet.
 - No customer dashboard, billing or usage ledger.
-- The `runway` app isn't published yet.
+- The `runway` app, the `runway-cache` template and this repository are private
+  for now.
 
 Monitoring is described in [monitoring](monitoring.md), and day-to-day
 operation in [pilot operations](pilot.md).
