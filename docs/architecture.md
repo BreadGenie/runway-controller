@@ -137,6 +137,13 @@ Central or a proxy. On first boot it enrols outbound with the `runway` site
 using a one-use token, retrying for up to three minutes. It then holds a
 credential it can rotate. See the [operator runbook](regional-cache-operator.md).
 
+The data service journals its index locally and checkpoints published entries
+in each Team's Cargo bucket. With an empty state directory, it becomes ready
+without reading the buckets. The first authenticated lookup or reservation
+for a Team loads its checkpoint using the existing bucket provider. A lookup
+verifies the selected restored archive's size and digest before issuing a new
+download ticket. Checkpoints contain neither credentials nor read tickets.
+
 ### How a job is confirmed
 
 The cache serves a runner only after its job is confirmed:

@@ -16,6 +16,7 @@ func TestCleanupIsolation(t *testing.T) {
 	old := now.Add(-48 * time.Hour)
 	objects := map[string]time.Time{
 		"managed/current/1/a":      old,
+		checkpointKey(1):           old,
 		"managed/stale/.owner":     old,
 		"managed/stale/1/a":        old,
 		"managed/fresh/.owner":     now,
@@ -75,7 +76,7 @@ func TestCleanupIsolation(t *testing.T) {
 	if err != nil || n != 3 {
 		t.Fatalf("cleanup: count=%d err=%v", n, err)
 	}
-	for _, key := range []string{"managed/current/1/a", "managed/fresh/.owner", "managed/fresh/1/a", "managed/unmarked-new/1/a", "prototype/old/a", "unrelated/a"} {
+	for _, key := range []string{checkpointKey(1), "managed/current/1/a", "managed/fresh/.owner", "managed/fresh/1/a", "managed/unmarked-new/1/a", "prototype/old/a", "unrelated/a"} {
 		if _, ok := objects[key]; !ok {
 			t.Errorf("deleted protected key %s", key)
 		}
@@ -109,14 +110,14 @@ func TestOwnerRefreshBoundedAfterCacheEviction(t *testing.T) {
 	}))
 	defer server.Close()
 	config := GarageConfig{Endpoint: server.URL, Region: "test", Bucket: "cache", AccessKey: "key", SecretKey: "secret"}
-	managed := &garageStore{prefix: "managed/current/", budget: DefaultStorageBudget, maintenance: map[string]time.Time{}, maintenanceRunning: map[string]bool{}}
-	managed.touch(config, "managed/current/1/1")
+	managed := &garageStore{budget: DefaultStorageBudget, maintenance: map[string]time.Time{}, maintenanceRunning: map[string]bool{}}
+	managed.touch(config, "managed/current/", "managed/current/1/1")
 	managed.maintenanceWG.Wait()
 	// Eviction must not cause another marker write within the refresh interval.
 	managed.maintenanceMu.Lock()
 	clear(managed.maintenance)
 	managed.maintenanceMu.Unlock()
-	managed.touch(config, "managed/current/1/2")
+	managed.touch(config, "managed/current/", "managed/current/1/2")
 	managed.close()
 	if puts != 1 {
 		t.Fatal("unbounded marker writes", puts)

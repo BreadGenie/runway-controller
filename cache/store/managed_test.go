@@ -106,8 +106,8 @@ func TestManagedBucketsNamespaceAndRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.Restart(t)
-	if status, _ := service.Lookup(t, main, "deps"); status != 204 {
-		t.Fatal("recreated service adopted objects", status)
+	if status, _ := service.Lookup(t, main, "deps"); status != 200 {
+		t.Fatal("recreated service missed checkpointed objects", status)
 	}
 	newJournal, _ := os.ReadFile(filepath.Join(service.Config.StateDir, "state.json"))
 	var fresh struct{ Namespace string }
@@ -204,6 +204,8 @@ func TestManagedTLSRejectsUntrustedServer(t *testing.T) {
 	config.CAPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: config} })
 	token := service.Signer.Grant(t, storetest.Job{TenantID: 1, Write: "refs/heads/main"})
+	// Exercise the archive PUT independently of fresh-VM checkpoint recovery.
+	service.Restart(t)
 	status, id := service.Reserve(t, token, "deps", 7)
 	if status != 201 {
 		t.Fatal("reserve", status)

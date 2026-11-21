@@ -66,7 +66,6 @@ type garageStore struct {
 	maintenanceActive  int
 	staleAfter         time.Duration
 	provider           BucketProvider
-	prefix             string
 	budget             StorageBudget
 	client             *s3.Client
 	bucket             string

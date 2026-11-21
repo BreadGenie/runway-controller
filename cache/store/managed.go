@@ -21,26 +21,50 @@ type BucketProvider interface {
 	Bucket(context.Context, int64) (GarageConfig, error)
 }
 
-func (store *garageStore) route(ctx context.Context, key string) (*garageStore, error) {
-	part, _, ok := strings.Cut(strings.TrimPrefix(key, store.prefix), "/")
+func managedObjectScope(key string) (string, int64) {
+	root, rest, _ := strings.Cut(key, "/")
+	namespace, rest, _ := strings.Cut(rest, "/")
+	part, _, ok := strings.Cut(rest, "/")
+	prefix := root + "/" + namespace + "/"
 	tenant, err := strconv.ParseInt(part, 10, 64)
-	if !strings.HasPrefix(key, store.prefix) || !ok || err != nil || tenant <= 0 || tenant > 4294967295 || strconv.FormatInt(tenant, 10) != part {
+	if root != "managed" || !validNamespace(prefix, "managed/") || !ok || err != nil || tenant <= 0 || tenant > 4294967295 || strconv.FormatInt(tenant, 10) != part {
+		return "", 0
+	}
+	return prefix, tenant
+}
+
+func (store *garageStore) route(ctx context.Context, key string) (*garageStore, error) {
+	namespace, tenant := managedObjectScope(key)
+	if tenant == 0 {
 		return nil, errors.New("invalid managed object scope")
 	}
+	config, err := store.teamBucket(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	store.touch(config, namespace, key)
+	return newGarageStore(config, store.budget), nil
+}
+
+func (store *garageStore) teamBucket(ctx context.Context, tenant int64) (GarageConfig, error) {
 	config, err := store.provider.Bucket(ctx, tenant)
 	if err != nil {
-		return nil, errors.New("team bucket unavailable")
+		return GarageConfig{}, errors.New("team bucket unavailable")
 	}
 	if config.validate() != nil || !strings.HasPrefix(config.Endpoint, "https://") {
-		return nil, errors.New("invalid team bucket configuration")
+		return GarageConfig{}, errors.New("invalid team bucket configuration")
 	}
-	store.touch(config, key)
-	return newGarageStore(config, store.budget), nil
+	return config, nil
 }
 
 // Auth failures never use stale credentials on the next operation. Failed PUTs
 // are not replayed automatically: the caller can retry with a fresh reservation.
 func (store *garageStore) invalidateAuth(key string, err error) {
+	_, tenant := managedObjectScope(key)
+	store.invalidateTeamAuth(tenant, err)
+}
+
+func (store *garageStore) invalidateTeamAuth(tenant int64, err error) {
 	var api smithy.APIError
 	var response interface{ HTTPStatusCode() int }
 	auth := errors.As(err, &response) && (response.HTTPStatusCode() == 401 || response.HTTPStatusCode() == 403)
@@ -54,15 +78,13 @@ func (store *garageStore) invalidateAuth(key string, err error) {
 		return
 	}
 	if provider, ok := store.provider.(interface{ Invalidate(int64) }); ok {
-		part, _, _ := strings.Cut(strings.TrimPrefix(key, store.prefix), "/")
-		tenant, _ := strconv.ParseInt(part, 10, 64)
 		provider.Invalidate(tenant)
 	}
 }
 
 // Maintenance is bounded independently of request latency. A
 // process only remembers a bounded set of buckets; eviction merely retries work.
-func (store *garageStore) touch(config GarageConfig, objectKey string) {
+func (store *garageStore) touch(config GarageConfig, namespace, objectKey string) {
 	store.maintenanceMu.Lock()
 	defer store.maintenanceMu.Unlock()
 	now := time.Now()
@@ -93,7 +115,7 @@ func (store *garageStore) touch(config GarageConfig, objectKey string) {
 		defer target.close()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		marker := store.prefix + ".owner"
+		marker := namespace + ".owner"
 		// Object timestamps also bound writes after local cache eviction.
 		owner, err := target.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &target.bucket, Key: &marker})
 		if err != nil && !lostArchive(err) {
@@ -112,7 +134,7 @@ func (store *garageStore) touch(config GarageConfig, objectKey string) {
 		if stale == 0 {
 			stale = 24 * time.Hour
 		}
-		count, err := target.cleanup(ctx, store.prefix, now.Add(-stale))
+		count, err := target.cleanup(ctx, namespace, now.Add(-stale))
 		store.invalidateAuth(objectKey, err)
 		if err == nil && count > 0 {
 			log.Printf("managed cache cleanup deleted %d objects", count)
@@ -134,7 +156,7 @@ func (store *garageStore) cleanup(ctx context.Context, current string, cutoff ti
 		for _, group := range page.CommonPrefixes {
 			prefix := aws.ToString(group.Prefix)
 			id := strings.TrimSuffix(strings.TrimPrefix(prefix, root), "/")
-			if prefix == current || id == "" || strings.Contains(id, "/") || prefix != root+id+"/" {
+			if prefix == current || prefix == checkpointPrefix || id == "" || strings.Contains(id, "/") || prefix != root+id+"/" {
 				continue
 			}
 			n, err := store.cleanupPrefix(ctx, prefix, cutoff, 1000-count)

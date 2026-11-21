@@ -106,3 +106,17 @@ fresh token to `/etc/runway/enrolment-token` as a root-owned mode-0600 file.
 Run `cache-service-enrol` using the same binary and config, remove the one-use
 token file after success, and verify the Runway Region record again. The
 Team buckets stay in Cargo.
+
+The cache keeps a local index in `state.json`. On a VM with an empty state
+directory, the first authenticated lookup or reservation for a Team loads its
+published-entry checkpoint from `managed/index/<tenant>.json` in that Team's
+Cargo bucket. Lookups verify the archive they select before issuing a download
+ticket. A missing or invalid checkpoint starts that Team cold. A storage error
+produces a miss and a later request can retry after backoff. A reboot with
+`state.json` uses the local index.
+
+The data service logs checkpoint write failures, tenant recovery counts and
+entries dropped during verification. Checkpoint writes run after publication,
+so a crash can lose recent index updates. When upgrading a running cache,
+allow the new data service to open its existing journal and write checkpoints
+before replacing that VM.

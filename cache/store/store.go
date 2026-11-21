@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -91,10 +92,11 @@ type Scope struct {
 }
 
 type entry struct {
-	id, size                               int64
+	id, size, objectID                     int64
 	repository, ref, key, version, subject string
 	created, accessed                      time.Time
 	published, hidden, finalizing          bool
+	needsVerification                      bool
 	objectKey                              string
 	digest                                 [32]byte
 	spool                                  *spool // upload staging; released after publication
@@ -135,7 +137,12 @@ type Server struct {
 	stateErr  error // a failed journal write fences the service until restart
 	closed    bool
 
-	sweep sweeper
+	sweep              sweeper
+	freshManaged       bool
+	checkpointTeams    map[int64]diskTeam
+	checkpointLoads    map[int64]*checkpointLoad
+	checkpointDirty    map[int64]uint64
+	checkpointRevision uint64
 }
 
 // New opens the journal, wipes stale staging files, verifies every indexed
@@ -174,8 +181,11 @@ func New(config Config) (*Server, error) {
 }
 
 // Close stops the sweeper and persists the index; objects stay in Garage.
-func (s *Server) Close(context.Context) error {
+func (s *Server) Close(ctx context.Context) error {
 	s.sweep.stop()
+	s.sweep.run_.Lock()
+	defer s.sweep.run_.Unlock()
+	s.flushCheckpoints(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -255,8 +265,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/_apis/artifactcache/cache" && r.Method == http.MethodGet:
+		if !s.restoreTeam(r.Context(), scope.Tenant) {
+			s.misses.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		s.lookup(w, r, scope)
 	case r.URL.Path == "/_apis/artifactcache/caches" && r.Method == http.MethodPost:
+		if !s.restoreTeam(r.Context(), scope.Tenant) {
+			fail(w, http.StatusConflict)
+			return
+		}
 		s.reserve(w, r, scope)
 	case strings.HasPrefix(r.URL.Path, "/_apis/artifactcache/caches/") && r.Method == http.MethodPatch:
 		s.uploadChunk(w, r, scope)
@@ -313,7 +332,7 @@ func (s *Server) collect() {
 	hidden := false
 	for _, e := range s.entries {
 		if e.pins == 0 && !e.hidden && (!e.published && !now.Before(s.uploadDeadline(e)) || e.published && now.Sub(e.accessed) >= idleLifetime) {
-			e.hidden = true
+			s.hide(e)
 		}
 		hidden = hidden || e.hidden
 	}
@@ -374,7 +393,7 @@ func (s *Server) evict(repository string, size int64) (fits, possible bool) {
 		if oldest == nil {
 			return false, false
 		}
-		oldest.hidden = true
+		s.hide(oldest)
 	}
 }
 
@@ -405,7 +424,8 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request, scope Scope) {
 			}
 		}
 		fits, possible := s.evict(scope.Repository, input.Size)
-		if fits && len(s.entries) < maxEntries {
+		hasSlot := len(s.entries) < maxEntries
+		if fits && hasSlot {
 			s.reserveLocked(w, r, scope, input.Key, input.Version, input.Size)
 			s.mu.Unlock()
 			return
@@ -413,7 +433,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request, scope Scope) {
 		s.mu.Unlock()
 		// Eviction frees space only once the sweeper deletes the objects. Run
 		// one sweep now (it honours the outage backoff), then retry once.
-		if attempt > 0 || !possible && len(s.entries) < maxEntries {
+		if attempt > 0 || !possible && hasSlot {
 			fail(w, http.StatusConflict)
 			return
 		}
@@ -422,6 +442,10 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request, scope Scope) {
 }
 
 func (s *Server) reserveLocked(w http.ResponseWriter, r *http.Request, scope Scope, key, version string, size int64) {
+	if s.nextID == math.MaxInt64 {
+		fail(w, http.StatusServiceUnavailable)
+		return
+	}
 	staged, err := s.pool.create(size)
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable)
@@ -556,7 +580,20 @@ func (s *Server) publish(ctx context.Context, e *entry, scope Scope) int {
 		return http.StatusUnauthorized
 	}
 	// Journal the object intent before the PUT so a crash leaves it deletable.
-	e.digest, e.objectKey = digest, s.objectKey(e.repository, e.id)
+	objectID := e.id
+	if tenant, _ := repositoryTenant(e.repository); s.checkpointTeams[tenant].Namespace != "" {
+		team := s.checkpointTeams[tenant]
+		if team.NextObjectID == math.MaxInt64 {
+			e.hidden = true
+			s.mu.Unlock()
+			return http.StatusServiceUnavailable
+		}
+		objectID = max(objectID, team.NextObjectID+1)
+		team.NextObjectID = objectID
+		s.checkpointTeams[tenant] = team
+		e.objectID = objectID
+	}
+	e.digest, e.objectKey = digest, s.objectKey(e.repository, objectID)
 	persisted := s.persist() == nil
 	s.mu.Unlock()
 	if !persisted {
@@ -582,6 +619,7 @@ func (s *Server) publish(ctx context.Context, e *entry, scope Scope) int {
 	if s.persist() != nil {
 		return http.StatusServiceUnavailable
 	}
+	s.markCheckpoint(e.repository)
 	// The published bytes live in Garage; release the upload's physical charge.
 	s.pool.remove(e.spool)
 	e.spool = nil
@@ -628,7 +666,12 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request, scope Scope) {
 				}
 			}
 			if match != nil {
-				s.issueTicket(w, scope, ref, match)
+				if s.verifyLookup(r.Context(), match) {
+					s.issueTicket(w, scope, ref, match)
+					return
+				}
+				s.misses.Add(1)
+				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 		}
@@ -743,7 +786,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, clock grant.Cl
 	if err != nil {
 		if r.Context().Err() == nil && lostArchive(err) {
 			s.mu.Lock()
-			e.hidden = true // a lost or different object becomes a miss
+			s.hide(e)
 			s.mu.Unlock()
 		}
 		fail(w, http.StatusServiceUnavailable)
@@ -753,18 +796,16 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, clock grant.Cl
 }
 
 func (s *Server) objectKey(repository string, id int64) string {
-	if s.config.Buckets != nil {
-		var parts []string
-		if json.Unmarshal([]byte(repository), &parts) != nil || len(parts) != 3 || parts[0] != "managed" {
-			return ""
-		}
-		tenant, err := strconv.ParseInt(parts[1], 10, 64)
-		repo, repoErr := strconv.ParseInt(parts[2], 10, 64)
-		canonical, _ := json.Marshal(parts)
-		if err != nil || repoErr != nil || tenant <= 0 || tenant > 4294967295 || repo <= 0 || parts[1] != strconv.FormatInt(tenant, 10) || parts[2] != strconv.FormatInt(repo, 10) || string(canonical) != repository {
-			return ""
-		}
-		return s.namespace + parts[1] + "/" + strconv.FormatInt(id, 10)
+	if s.config.Buckets == nil {
+		return s.namespace + strconv.FormatInt(id, 10)
 	}
-	return s.namespace + strconv.FormatInt(id, 10)
+	tenant, ok := repositoryTenant(repository)
+	if !ok || tenant == 0 {
+		return ""
+	}
+	return managedObjectKey(s.teamNamespace(tenant), tenant, id)
+}
+
+func managedObjectKey(namespace string, tenant, id int64) string {
+	return namespace + strconv.FormatInt(tenant, 10) + "/" + strconv.FormatInt(id, 10)
 }

@@ -43,6 +43,11 @@ func (sw *sweeper) start(s *Server) {
 			sw.run_.Lock()
 			wait := time.Until(sw.retryAt)
 			sw.run_.Unlock()
+			s.mu.Lock()
+			if len(s.checkpointDirty) != 0 {
+				wait = time.Second
+			}
+			s.mu.Unlock()
 			timer.Reset(max(wait, time.Second))
 		}
 	}()
@@ -70,14 +75,27 @@ func (sw *sweeper) wake() {
 func (sw *sweeper) run(ctx context.Context) {
 	sw.run_.Lock()
 	defer sw.run_.Unlock()
+	s := sw.server
+	checkpointCtx, cancel := context.WithTimeout(ctx, checkpointTimeout)
+	s.flushCheckpoints(checkpointCtx)
+	cancel()
 	if time.Now().Before(sw.retryAt) {
 		return
 	}
-	s := sw.server
 	s.mu.Lock()
+	if s.closed || s.stateErr != nil {
+		s.mu.Unlock()
+		return
+	}
 	var victims []*entry
 	for _, e := range s.entries {
-		if e.hidden && e.pins == 0 {
+		if !e.hidden || e.pins != 0 {
+			continue
+		}
+		// First retire the reference from the durable checkpoint. If its
+		// write failed, a fresh VM may still need this archive.
+		tenant, _ := repositoryTenant(e.repository)
+		if !e.published || s.checkpointDirty[tenant] == 0 {
 			victims = append(victims, e)
 		}
 	}

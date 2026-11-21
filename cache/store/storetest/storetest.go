@@ -32,15 +32,19 @@ import (
 // Garage is an in-memory S3 endpoint. Hold Mu while changing its fields.
 type Garage struct {
 	*httptest.Server
-	Mu       sync.Mutex
-	Objects  map[string][]byte
-	Puts     int
-	Requests map[string]int // by method, including failed ones
-	Fail     bool           // answer every request with 503
-	PutDelay time.Duration  // wait before reading a PUT body
-	OnPut    func()         // called after a PUT is stored
-	Gate     chan struct{}  // when set, GETs of GateKey (or all, if empty) stall after the first byte
-	GateKey  string
+	Mu                sync.Mutex
+	Objects           map[string][]byte
+	Puts              int
+	Requests          map[string]int // by method, including failed ones
+	Fail              bool           // answer every request with 503
+	CheckpointGets    int
+	CheckpointPuts    int
+	FailCheckpointGet bool          // fail only checkpoint reads
+	FailCheckpointPut bool          // fail only checkpoint writes
+	PutDelay          time.Duration // wait before reading a PUT body
+	OnPut             func()        // called after a PUT is stored
+	Gate              chan struct{} // when set, GETs of GateKey (or all, if empty) stall after the first byte
+	GateKey           string
 }
 
 func NewGarage(t testing.TB) *Garage {
@@ -58,7 +62,16 @@ func (g *Garage) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	g.Mu.Lock()
 	g.Requests[r.Method]++
-	if g.Fail {
+	checkpoint := strings.Contains(r.URL.Path, "/managed/index/")
+	if checkpoint {
+		switch r.Method {
+		case http.MethodGet:
+			g.CheckpointGets++
+		case http.MethodPut:
+			g.CheckpointPuts++
+		}
+	}
+	if g.Fail || checkpoint && (r.Method == http.MethodGet && g.FailCheckpointGet || r.Method == http.MethodPut && g.FailCheckpointPut) {
 		g.Mu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -85,6 +98,11 @@ func (g *Garage) serve(w http.ResponseWriter, r *http.Request) {
 			hook()
 		}
 		w.Header().Set("ETag", `"fixture"`)
+	case http.MethodHead:
+		if _, ok := g.Objects[r.URL.Path]; !ok {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		g.Mu.Unlock()
 	case http.MethodGet:
 		if r.URL.Query().Get("list-type") == "2" {
 			type item struct{ Key string }
