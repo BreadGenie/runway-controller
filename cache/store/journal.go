@@ -24,6 +24,8 @@ const objectPrefix = "prototype/"
 // ignored.
 type diskEntry struct {
 	ID, Size                                       int64
+	ObjectID                                       int64  `json:",omitempty"`
+	ObjectNamespace                                string `json:",omitempty"`
 	Repository, Ref, Key, Version, Subject, Object string
 	Created, Accessed                              time.Time
 	Published, Hidden                              bool
@@ -41,14 +43,23 @@ type diskTicket struct {
 
 type diskStorage struct{ Endpoint, Region, Bucket string }
 
-type diskState struct {
-	Version      int
-	Storage      diskStorage
-	PublicOrigin string
+// Recovered Teams keep their archive namespace and sequence independently of
+// the VM-local IDs exposed in reservation and download URLs.
+type diskTeam struct {
 	Namespace    string
-	NextID       int64
-	Entries      []diskEntry
-	Tickets      map[string]diskTicket
+	NextObjectID int64
+}
+
+type diskState struct {
+	Version         int
+	Storage         diskStorage
+	PublicOrigin    string
+	Namespace       string
+	NextID          int64
+	Entries         []diskEntry
+	Tickets         map[string]diskTicket
+	CheckpointTeams map[int64]diskTeam `json:",omitempty"`
+	ResolvedTeams   map[int64]bool     `json:",omitempty"`
 }
 
 func ticketKey(token string) string {
@@ -60,7 +71,11 @@ func (s *Server) storage() diskStorage {
 	if s.config.Buckets != nil {
 		return diskStorage{Endpoint: "managed", Bucket: "managed/"}
 	}
-	return diskStorage{Endpoint: s.config.Garage.Endpoint, Region: s.config.Garage.Region, Bucket: s.config.Garage.Bucket}
+	return storageIdentity(s.config.Garage)
+}
+
+func storageIdentity(config GarageConfig) diskStorage {
+	return diskStorage{Endpoint: config.Endpoint, Region: config.Region, Bucket: config.Bucket}
 }
 
 // openState takes exclusive ownership of the state directory and recovers it.
@@ -90,9 +105,13 @@ func (s *Server) openState() error {
 // shared budget. A lost or different object becomes a hidden miss; any other
 // storage failure refuses startup and leaves the journal for a later attempt.
 func (s *Server) recover() error {
+	if s.config.Buckets != nil {
+		s.resolvedTeams = make(map[int64]bool)
+		s.checkpointLoads = make(map[int64]*checkpointLoad)
+		s.checkpointDirty = make(map[int64]uint64)
+	}
 	f, err := openStateFile(s.stateDir, "state.json", syscall.O_RDONLY)
 	if os.IsNotExist(err) {
-
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
 			return err
@@ -102,7 +121,6 @@ func (s *Server) recover() error {
 			prefix = "managed/"
 		}
 		s.namespace = prefix + hex.EncodeToString(random) + "/"
-		s.store.prefix = s.namespace
 		return s.persist()
 	}
 	if err != nil {
@@ -111,27 +129,50 @@ func (s *Server) recover() error {
 	var d diskState
 	err = json.NewDecoder(io.LimitReader(f, 2<<20)).Decode(&d)
 	f.Close()
-	hexPart := strings.TrimSuffix(strings.TrimPrefix(d.Namespace, objectPrefix), "/")
-	_, hexErr := hex.DecodeString(hexPart)
-	validNamespace := hexErr == nil && len(hexPart) == 32 && d.Namespace == objectPrefix+hexPart+"/"
+	prefix := objectPrefix
 	if s.config.Buckets != nil {
-		part := strings.TrimSuffix(strings.TrimPrefix(d.Namespace, "managed/"), "/")
-		_, err := hex.DecodeString(part)
-		validNamespace = err == nil && len(part) == 32 && d.Namespace == "managed/"+part+"/"
+		prefix = "managed/"
 	}
-	if err != nil || !validNamespace ||
+	if err != nil || !validNamespace(d.Namespace, prefix) ||
 		d.Version != 1 || d.Storage != s.storage() || d.PublicOrigin != s.config.PublicOrigin || len(d.Entries) > maxEntries || len(d.Tickets) > maxTickets || d.NextID < 0 {
 		return errors.New("invalid cache state")
 	}
-	s.namespace, s.nextID = d.Namespace, d.NextID
-	s.store.prefix = s.namespace
+	for tenant, resolved := range d.ResolvedTeams {
+		if s.config.Buckets == nil || tenant <= 0 || tenant > 4294967295 || !resolved {
+			return errors.New("invalid resolved cache team")
+		}
+		s.resolvedTeams[tenant] = true
+	}
+	for tenant, team := range d.CheckpointTeams {
+		if s.config.Buckets == nil || tenant <= 0 || tenant > 4294967295 || !validNamespace(team.Namespace, prefix) || team.NextObjectID <= 0 {
+			return errors.New("invalid cache team namespace")
+		}
+		s.resolvedTeams[tenant] = true
+	}
+	s.namespace, s.nextID, s.checkpointTeams = d.Namespace, d.NextID, d.CheckpointTeams
+	seenObjects := make(map[string]bool)
 	objects, bytes := 0, int64(0)
 	for _, v := range d.Entries {
-		if s.objectKey(v.Repository, v.ID) == "" || v.ID <= 0 || v.ID > d.NextID || s.entries[v.ID] != nil || v.Size <= 0 || v.Size > s.config.MaxArchiveBytes || v.Repository == "" || v.Ref == "" || v.Subject == "" || !validKey(v.Key) || v.Version == "" || v.Created.IsZero() || v.Accessed.IsZero() || v.Object != "" && v.Object != s.objectKey(v.Repository, v.ID) || v.Published && v.Object == "" {
+		objectID := v.ID
+		if v.ObjectID != 0 {
+			objectID = v.ObjectID
+		}
+		tenant, _ := repositoryTenant(v.Repository)
+		objectLimit := max(d.NextID, d.CheckpointTeams[tenant].NextObjectID)
+		object := s.objectKey(v.Repository, objectID)
+		if v.ObjectNamespace != "" {
+			if s.config.Buckets == nil || tenant == 0 || !validNamespace(v.ObjectNamespace, "managed/") || v.ObjectID == 0 || v.Object == "" {
+				return errors.New("invalid cache entry namespace")
+			}
+			object = managedObjectKey(v.ObjectNamespace, tenant, objectID)
+			objectLimit = objectID
+		}
+		if !s.validDiskEntry(v, d.NextID, object) || objectID <= 0 || objectID > objectLimit || s.entries[v.ID] != nil || v.Object != "" && seenObjects[v.Object] {
 			return errors.New("invalid cache entry")
 		}
+		seenObjects[v.Object] = true
 		// No upload resumes across a restart: unpublished entries stay hidden.
-		e := &entry{id: v.ID, size: v.Size, repository: v.Repository, ref: v.Ref, key: v.Key, version: v.Version, subject: v.Subject, objectKey: v.Object, created: v.Created, accessed: v.Accessed, published: v.Published, hidden: v.Hidden || !v.Published, digest: v.Digest}
+		e := entryFromDisk(v)
 		s.entries[e.id] = e
 		if !e.hidden {
 			objects, bytes = objects+1, bytes+e.size
@@ -161,19 +202,46 @@ func (s *Server) recover() error {
 		if e.hidden {
 			continue
 		}
-		staged, err := s.pool.create(e.size)
-		if err != nil {
-			return err
-		}
-		err = s.store.get(ctx, e.objectKey, staged, e.digest)
-		s.pool.remove(staged)
+		err := s.verifyArchive(ctx, e)
 		if err != nil && ctx.Err() == nil && lostArchive(err) {
-			e.hidden = true // Garage is not the source of truth: this is a miss
+			s.hide(e)
 		} else if err != nil {
 			return errors.New("cache recovery storage unavailable")
 		}
 	}
+	for _, e := range s.entries {
+		if e.published {
+			s.markCheckpoint(e.repository)
+		}
+	}
 	return s.persist()
+}
+
+func (s *Server) verifyArchive(ctx context.Context, e *entry) error {
+	staged, err := s.pool.create(e.size)
+	if err != nil {
+		return err
+	}
+	defer s.pool.remove(staged)
+	return s.store.get(ctx, e.objectKey, staged, e.digest)
+}
+
+func validNamespace(namespace, prefix string) bool {
+	part := strings.TrimSuffix(strings.TrimPrefix(namespace, prefix), "/")
+	_, err := hex.DecodeString(part)
+	return err == nil && len(part) == 32 && namespace == prefix+part+"/"
+}
+
+func (s *Server) validDiskEntry(v diskEntry, nextID int64, object string) bool {
+	return object != "" && v.ID > 0 && v.ID <= nextID && v.Size > 0 && v.Size <= s.config.MaxArchiveBytes && v.Repository != "" && v.Ref != "" && v.Subject != "" && validKey(v.Key) && v.Version != "" && !v.Created.IsZero() && !v.Accessed.IsZero() && (v.Object == "" || v.Object == object) && (!v.Published || v.Object != "")
+}
+
+func entryFromDisk(v diskEntry) *entry {
+	return &entry{id: v.ID, objectID: v.ObjectID, size: v.Size, repository: v.Repository, ref: v.Ref, key: v.Key, version: v.Version, subject: v.Subject, objectKey: v.Object, created: v.Created, accessed: v.Accessed, published: v.Published, hidden: v.Hidden || !v.Published, digest: v.Digest}
+}
+
+func (e *entry) diskEntry() diskEntry {
+	return diskEntry{ID: e.id, ObjectID: e.objectID, Size: e.size, Repository: e.repository, Ref: e.ref, Key: e.key, Version: e.version, Subject: e.subject, Object: e.objectKey, Created: e.created, Accessed: e.accessed, Published: e.published, Hidden: e.hidden, Digest: e.digest}
 }
 
 // persist atomically replaces the journal. Any failure fences the service
@@ -183,9 +251,16 @@ func (s *Server) persist() error {
 	if s.stateErr != nil {
 		return s.stateErr
 	}
-	d := diskState{Version: 1, Storage: s.storage(), PublicOrigin: s.config.PublicOrigin, Namespace: s.namespace, NextID: s.nextID, Tickets: make(map[string]diskTicket)}
+	d := diskState{Version: 1, Storage: s.storage(), PublicOrigin: s.config.PublicOrigin, Namespace: s.namespace, NextID: s.nextID, CheckpointTeams: s.checkpointTeams, ResolvedTeams: s.resolvedTeams, Tickets: make(map[string]diskTicket)}
 	for _, e := range s.entries {
-		d.Entries = append(d.Entries, diskEntry{ID: e.id, Size: e.size, Repository: e.repository, Ref: e.ref, Key: e.key, Version: e.version, Subject: e.subject, Object: e.objectKey, Created: e.created, Accessed: e.accessed, Published: e.published, Hidden: e.hidden, Digest: e.digest})
+		v := e.diskEntry()
+		if tenant, _ := repositoryTenant(e.repository); tenant != 0 && v.Object != "" {
+			namespace, _ := managedObjectScope(v.Object)
+			if namespace != s.teamNamespace(tenant) {
+				v.ObjectNamespace = namespace
+			}
+		}
+		d.Entries = append(d.Entries, v)
 	}
 	for k, v := range s.tickets {
 		tenant := v.tenant
