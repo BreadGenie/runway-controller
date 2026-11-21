@@ -36,7 +36,6 @@ type teamCheckpoint struct {
 
 type checkpointLoad struct {
 	done    chan struct{}
-	ready   bool
 	retryAt time.Time
 	backoff time.Duration
 }
@@ -77,26 +76,27 @@ func (s *Server) markCheckpoint(repository string) {
 }
 
 func (s *Server) restoreTeam(ctx context.Context, tenant int64) bool {
-	if !s.freshManaged {
+	if s.config.Buckets == nil {
 		return true
 	}
 	s.mu.Lock()
+	if s.resolvedTeams[tenant] {
+		s.mu.Unlock()
+		return true
+	}
 	load := s.checkpointLoads[tenant]
 	if load == nil {
 		load = &checkpointLoad{}
 		s.checkpointLoads[tenant] = load
 	}
 	switch {
-	case load.ready:
-		s.mu.Unlock()
-		return true
 	case load.done != nil:
 		done := load.done
 		s.mu.Unlock()
 		select {
 		case <-done:
 			s.mu.Lock()
-			ready := load.ready
+			ready := s.resolvedTeams[tenant]
 			s.mu.Unlock()
 			return ready
 		case <-ctx.Done():
@@ -120,7 +120,15 @@ func (s *Server) restoreTeam(ctx context.Context, tenant int64) bool {
 		if checkpoint != nil {
 			err = s.mergeCheckpoint(*checkpoint)
 		}
-		load.ready = err == nil
+		if err == nil {
+			s.resolvedTeams[tenant] = true
+			err = s.persist()
+			if err != nil {
+				delete(s.resolvedTeams, tenant)
+			} else {
+				delete(s.checkpointLoads, tenant)
+			}
+		}
 	}
 	if err != nil {
 		log.Printf("managed cache checkpoint load failed for tenant %d", tenant)
@@ -129,7 +137,7 @@ func (s *Server) restoreTeam(ctx context.Context, tenant int64) bool {
 	}
 	close(load.done)
 	load.done = nil
-	return load.ready
+	return s.resolvedTeams[tenant]
 }
 
 func (s *Server) readCheckpoint(ctx context.Context, tenant int64) (*teamCheckpoint, error) {
@@ -157,20 +165,25 @@ func (s *Server) readCheckpoint(ctx context.Context, tenant int64) (*teamCheckpo
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if len(data) >= checkpointLimit || decoder.Decode(&d) != nil || decoder.Decode(new(any)) != io.EOF ||
-		d.Version != 1 || d.Tenant != tenant || d.Storage != storageIdentity(config) || d.PublicOrigin != s.config.PublicOrigin ||
+		(d.Version != 1 && d.Version != 2) || d.Tenant != tenant || d.Storage != storageIdentity(config) || d.PublicOrigin != s.config.PublicOrigin ||
 		!validNamespace(d.Namespace, "managed/") || d.NextID < 0 || d.NextID > math.MaxInt64-maxEntries || len(d.Entries) > maxEntries {
 		log.Printf("managed cache checkpoint refused for tenant %d", tenant)
 		return nil, nil
 	}
-	seen := make(map[int64]bool)
+	seen := make(map[string]bool)
 	for _, v := range d.Entries {
 		entryTenant, ok := repositoryTenant(v.Repository)
-		if !ok || entryTenant != tenant || v.ObjectID != 0 || !v.Published || v.Hidden || seen[v.ID] ||
-			!s.validDiskEntry(v, d.NextID, managedObjectKey(d.Namespace, tenant, v.ID)) {
+		namespace, limit := d.Namespace, d.NextID
+		if d.Version == 2 && v.ObjectNamespace != "" {
+			namespace, limit = v.ObjectNamespace, v.ID
+		}
+		if !ok || entryTenant != tenant || v.ObjectID != 0 || !v.Published || v.Hidden || seen[v.Object] ||
+			!validNamespace(namespace, "managed/") || d.Version == 1 && v.ObjectNamespace != "" ||
+			!s.validDiskEntry(v, limit, managedObjectKey(namespace, tenant, v.ID)) {
 			log.Printf("managed cache checkpoint refused for tenant %d", tenant)
 			return nil, nil
 		}
-		seen[v.ID] = true
+		seen[v.Object] = true
 	}
 	return &d, nil
 }
@@ -183,10 +196,22 @@ func (s *Server) mergeCheckpoint(d teamCheckpoint) error {
 		log.Printf("managed cache checkpoint restored tenant %d: 0 entries restored, 0 dropped", d.Tenant)
 		return nil
 	}
+	type cacheKey struct{ repository, ref, key, version string }
+	keys := make(map[cacheKey]bool)
+	objects := make(map[string]bool)
+	for _, e := range s.entries {
+		keys[cacheKey{e.repository, e.ref, e.key, e.version}] = true
+		objects[e.objectKey] = true
+	}
 	if s.checkpointTeams == nil {
 		s.checkpointTeams = make(map[int64]diskTeam)
 	}
-	s.checkpointTeams[d.Tenant] = diskTeam{Namespace: d.Namespace, NextObjectID: d.NextID}
+	// Keep local archives under their existing keys. Restored entries may
+	// retain a different namespace when merging into an older journal.
+	team := diskTeam{Namespace: d.Namespace, NextObjectID: max(d.NextID, s.nextID)}
+	if d.Namespace != s.namespace && s.hasTeamEntries(d.Tenant) {
+		team = diskTeam{Namespace: s.namespace, NextObjectID: s.nextID}
+	}
 	// Restore newest entries first when the regional index is already near
 	// capacity. Allocate IDs oldest first to retain prefix-match precedence.
 	slices.SortFunc(d.Entries, func(a, b diskEntry) int {
@@ -195,6 +220,10 @@ func (s *Server) mergeCheckpoint(d teamCheckpoint) error {
 	var accepted []diskEntry
 	_, total := s.usage("")
 	for _, v := range d.Entries {
+		key := cacheKey{v.Repository, v.Ref, v.Key, v.Version}
+		if keys[key] || objects[v.Object] {
+			continue
+		}
 		repo, _ := s.usage(v.Repository)
 		if len(s.entries)+len(accepted) >= maxEntries || total+v.Size > s.config.TotalBytes || repo+v.Size > s.config.QuotaBytes {
 			continue
@@ -207,9 +236,16 @@ func (s *Server) mergeCheckpoint(d teamCheckpoint) error {
 		}
 		if repo+v.Size <= s.config.QuotaBytes {
 			accepted = append(accepted, v)
+			keys[key] = true
 			total += v.Size
 		}
 	}
+	for _, v := range d.Entries {
+		if namespace, _ := managedObjectScope(v.Object); namespace == team.Namespace {
+			team.NextObjectID = max(team.NextObjectID, v.ID)
+		}
+	}
+	s.checkpointTeams[d.Tenant] = team
 	slices.SortFunc(accepted, func(a, b diskEntry) int { return cmp.Compare(a.ID, b.ID) })
 	for _, v := range accepted {
 		s.nextID++
@@ -218,11 +254,17 @@ func (s *Server) mergeCheckpoint(d teamCheckpoint) error {
 		e.needsVerification = true
 		s.entries[e.id] = e
 	}
-	if err := s.persist(); err != nil {
-		return err
-	}
 	log.Printf("managed cache checkpoint restored tenant %d: %d entries restored, %d dropped", d.Tenant, len(accepted), len(d.Entries)-len(accepted))
 	return nil
+}
+
+func (s *Server) hasTeamEntries(tenant int64) bool {
+	for _, e := range s.entries {
+		if owner, _ := repositoryTenant(e.repository); owner == tenant {
+			return true
+		}
+	}
+	return false
 }
 
 // Only the sweeper writes checkpoints. Publish marks a dirty revision after
@@ -239,6 +281,11 @@ func (s *Server) flushCheckpoints(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Older journals may have local entries but lack resolution metadata.
+		// Reconcile those entries before replacing the remote checkpoint.
+		if !s.restoreTeam(ctx, tenant) {
+			continue
+		}
 		s.mu.Lock()
 		if s.stateErr != nil || s.closed {
 			s.mu.Unlock()
@@ -254,6 +301,10 @@ func (s *Server) flushCheckpoints(ctx context.Context) {
 				v := e.diskEntry()
 				if v.ObjectID != 0 {
 					v.ID, v.ObjectID = v.ObjectID, 0
+				}
+				if namespace, _ := managedObjectScope(v.Object); namespace != d.Namespace {
+					d.Version = 2
+					v.ObjectNamespace = namespace
 				}
 				d.Entries = append(d.Entries, v)
 			}
@@ -332,4 +383,21 @@ func (s *Server) verifyLookup(ctx context.Context, e *entry) bool {
 		log.Printf("managed cache checkpoint dropped 1 entry after integrity verification")
 	}
 	return false
+}
+
+// A nil result defers managed namespace collection until checkpoint recovery
+// can identify all namespaces that contain live archives for this Team.
+func (s *Server) protectedNamespaces(tenant int64) map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.resolvedTeams[tenant] {
+		return nil
+	}
+	protected := map[string]bool{s.teamNamespace(tenant): true}
+	for _, e := range s.entries {
+		if namespace, owner := managedObjectScope(e.objectKey); owner == tenant {
+			protected[namespace] = true
+		}
+	}
+	return protected
 }

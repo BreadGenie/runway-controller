@@ -42,7 +42,12 @@ func (store *garageStore) route(ctx context.Context, key string) (*garageStore, 
 	if err != nil {
 		return nil, err
 	}
-	store.touch(config, namespace, key)
+	var protected map[string]bool
+	if store.protectedNamespaces == nil {
+		store.touch(config, namespace, key, nil)
+	} else if protected = store.protectedNamespaces(tenant); protected != nil {
+		store.touch(config, namespace, key, protected)
+	}
 	return newGarageStore(config, store.budget), nil
 }
 
@@ -84,7 +89,7 @@ func (store *garageStore) invalidateTeamAuth(tenant int64, err error) {
 
 // Maintenance is bounded independently of request latency. A
 // process only remembers a bounded set of buckets; eviction merely retries work.
-func (store *garageStore) touch(config GarageConfig, namespace, objectKey string) {
+func (store *garageStore) touch(config GarageConfig, namespace, objectKey string, protected map[string]bool) {
 	store.maintenanceMu.Lock()
 	defer store.maintenanceMu.Unlock()
 	now := time.Now()
@@ -134,7 +139,7 @@ func (store *garageStore) touch(config GarageConfig, namespace, objectKey string
 		if stale == 0 {
 			stale = 24 * time.Hour
 		}
-		count, err := target.cleanup(ctx, namespace, now.Add(-stale))
+		count, err := target.cleanup(ctx, namespace, now.Add(-stale), protected)
 		store.invalidateAuth(objectKey, err)
 		if err == nil && count > 0 {
 			log.Printf("managed cache cleanup deleted %d objects", count)
@@ -144,7 +149,7 @@ func (store *garageStore) touch(config GarageConfig, namespace, objectKey string
 
 // Limit each pass to 1000 deletions, in batches of at most 100. Unknown or
 // incomplete timestamps fail closed. Recheck the owner before each batch.
-func (store *garageStore) cleanup(ctx context.Context, current string, cutoff time.Time) (int, error) {
+func (store *garageStore) cleanup(ctx context.Context, current string, cutoff time.Time, protected map[string]bool) (int, error) {
 	root, delimiter := "managed/", "/"
 	var token *string
 	count := 0
@@ -156,7 +161,7 @@ func (store *garageStore) cleanup(ctx context.Context, current string, cutoff ti
 		for _, group := range page.CommonPrefixes {
 			prefix := aws.ToString(group.Prefix)
 			id := strings.TrimSuffix(strings.TrimPrefix(prefix, root), "/")
-			if prefix == current || prefix == checkpointPrefix || id == "" || strings.Contains(id, "/") || prefix != root+id+"/" {
+			if prefix == current || prefix == checkpointPrefix || protected[prefix] || id == "" || strings.Contains(id, "/") || prefix != root+id+"/" {
 				continue
 			}
 			n, err := store.cleanupPrefix(ctx, prefix, cutoff, 1000-count)

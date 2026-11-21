@@ -138,7 +138,7 @@ type Server struct {
 	closed    bool
 
 	sweep              sweeper
-	freshManaged       bool
+	resolvedTeams      map[int64]bool
 	checkpointTeams    map[int64]diskTeam
 	checkpointLoads    map[int64]*checkpointLoad
 	checkpointDirty    map[int64]uint64
@@ -161,7 +161,7 @@ func New(config Config) (*Server, error) {
 		return nil, errors.New("cache time observation unavailable")
 	}
 	if config.Buckets != nil {
-		s.store = &garageStore{provider: config.Buckets, budget: budget, staleAfter: config.CleanupStaleAfter, maintenance: make(map[string]time.Time), maintenanceRunning: make(map[string]bool)}
+		s.store = &garageStore{provider: config.Buckets, protectedNamespaces: s.protectedNamespaces, budget: budget, staleAfter: config.CleanupStaleAfter, maintenance: make(map[string]time.Time), maintenanceRunning: make(map[string]bool)}
 	} else {
 		s.store = newGarageStore(config.Garage, budget)
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -141,7 +142,7 @@ func TestCheckpointRefusesInvalidEntries(t *testing.T) {
 			case "origin":
 				checkpoint["PublicOrigin"] = json.RawMessage(`"https://other.example"`)
 			case "version":
-				checkpoint["Version"] = json.RawMessage(`2`)
+				checkpoint["Version"] = json.RawMessage(`99`)
 			}
 			g.Objects[key], _ = json.Marshal(checkpoint)
 			g.Mu.Unlock()
@@ -270,5 +271,132 @@ func TestCheckpointExcludesEvictedEntryBeforeDeletion(t *testing.T) {
 	defer g.Mu.Unlock()
 	if bytes.Contains(g.Objects[key], []byte(`"Key":"old"`)) || !bytes.Contains(g.Objects[key], []byte(`"Key":"new"`)) {
 		t.Fatal("checkpoint retained the evicted entry or lost the new entry")
+	}
+}
+
+func checkpointGets(g *storetest.Garage) int {
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	return g.CheckpointGets
+}
+
+func TestCheckpointResolutionSurvivesRestart(t *testing.T) {
+	for _, older := range []bool{false, true} {
+		t.Run(fmt.Sprintf("older-journal=%t", older), func(t *testing.T) {
+			a, ac := teamGarage(t)
+			b, bc := teamGarage(t)
+			service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: ac, 2: bc} })
+			teamA, teamB := teamGrant(t, service, 1), teamGrant(t, service, 2)
+			service.Save(t, teamA, "deps", "first")
+			service.Save(t, teamB, "deps", "second")
+			waitForCheckpoint(t, a, 1)
+			waitForCheckpoint(t, b, 2)
+			replaceStore(t, service)
+			if older {
+				editJournal(t, service, func(d map[string]json.RawMessage) {
+					delete(d, "ResolvedTeams")
+					delete(d, "CheckpointTeams")
+				})
+			} else {
+				service.Restart(t)
+			}
+			aBefore, bBefore := checkpointGets(a), checkpointGets(b)
+			if status, data := service.Restore(t, teamA, "deps"); status != 200 || data != "first" {
+				t.Fatal("Team A after pre-traffic restart", status, data)
+			}
+			if checkpointGets(a) != aBefore+1 || checkpointGets(b) != bBefore {
+				t.Fatal("expected one Team A checkpoint GET")
+			}
+			service.Restart(t)
+			if status, data := service.Restore(t, teamB, "deps"); status != 200 || data != "second" {
+				t.Fatal("Team B after Team A's restart", status, data)
+			}
+			if status, _ := service.Lookup(t, teamA, "deps"); status != 200 {
+				t.Fatal("resolved Team A missed", status)
+			}
+			if checkpointGets(a) != aBefore+1 || checkpointGets(b) != bBefore+1 {
+				t.Fatal("only unresolved Team B should have loaded a checkpoint")
+			}
+		})
+	}
+}
+
+func TestMissingCheckpointResolutionSurvivesRestart(t *testing.T) {
+	g, config := teamGarage(t)
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: config} })
+	token := teamGrant(t, service, 1)
+	for range 2 {
+		if status, _ := service.Lookup(t, token, "deps"); status != 204 {
+			t.Fatal("missing checkpoint should be a miss", status)
+		}
+		service.Restart(t)
+	}
+	if got := checkpointGets(g); got != 1 {
+		t.Fatalf("checkpoint GETs = %d, want 1", got)
+	}
+}
+
+func editJournal(t *testing.T, service *storetest.Service, edit func(map[string]json.RawMessage)) {
+	t.Helper()
+	if err := service.Server.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service.Server = nil
+	path := filepath.Join(service.Config.StateDir, "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var journal map[string]json.RawMessage
+	if err := json.Unmarshal(data, &journal); err != nil {
+		t.Fatal(err)
+	}
+	edit(journal)
+	data, err = json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	service.Restart(t)
+}
+
+func TestOlderJournalKeepsLocalEntryWhenMergingCheckpoint(t *testing.T) {
+	g, config := teamGarage(t)
+	service := storetest.Start(t, func(c *store.Config) { c.Buckets = buckets{1: config} })
+	token := teamGrant(t, service, 1)
+	service.Save(t, token, "duplicate", "remote")
+	service.Save(t, token, "remote-only", "restored")
+	key, _ := waitForCheckpoint(t, g, 1)
+	replaceStore(t, service)
+	g.Mu.Lock()
+	original := g.Objects[key]
+	delete(g.Objects, key)
+	g.Mu.Unlock()
+	service.Save(t, token, "duplicate", "local")
+	if err := service.Server.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g.Mu.Lock()
+	g.Objects[key] = original
+	g.Mu.Unlock()
+
+	editJournal(t, service, func(d map[string]json.RawMessage) {
+		delete(d, "ResolvedTeams")
+		delete(d, "CheckpointTeams")
+	})
+	for attempt := range 3 {
+		for key, want := range map[string]string{"duplicate": "local", "remote-only": "restored"} {
+			if status, data := service.Restore(t, token, key); status != 200 || data != want {
+				t.Fatalf("%s: status %d, data %q, want %q", key, status, data, want)
+			}
+		}
+		switch attempt {
+		case 0:
+			service.Restart(t)
+		case 1:
+			replaceStore(t, service)
+		}
 	}
 }

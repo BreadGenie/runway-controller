@@ -24,7 +24,8 @@ const objectPrefix = "prototype/"
 // ignored.
 type diskEntry struct {
 	ID, Size                                       int64
-	ObjectID                                       int64 `json:",omitempty"`
+	ObjectID                                       int64  `json:",omitempty"`
+	ObjectNamespace                                string `json:",omitempty"`
 	Repository, Ref, Key, Version, Subject, Object string
 	Created, Accessed                              time.Time
 	Published, Hidden                              bool
@@ -58,6 +59,7 @@ type diskState struct {
 	Entries         []diskEntry
 	Tickets         map[string]diskTicket
 	CheckpointTeams map[int64]diskTeam `json:",omitempty"`
+	ResolvedTeams   map[int64]bool     `json:",omitempty"`
 }
 
 func ticketKey(token string) string {
@@ -104,12 +106,12 @@ func (s *Server) openState() error {
 // storage failure refuses startup and leaves the journal for a later attempt.
 func (s *Server) recover() error {
 	if s.config.Buckets != nil {
+		s.resolvedTeams = make(map[int64]bool)
 		s.checkpointLoads = make(map[int64]*checkpointLoad)
 		s.checkpointDirty = make(map[int64]uint64)
 	}
 	f, err := openStateFile(s.stateDir, "state.json", syscall.O_RDONLY)
 	if os.IsNotExist(err) {
-		s.freshManaged = s.config.Buckets != nil
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
 			return err
@@ -135,10 +137,17 @@ func (s *Server) recover() error {
 		d.Version != 1 || d.Storage != s.storage() || d.PublicOrigin != s.config.PublicOrigin || len(d.Entries) > maxEntries || len(d.Tickets) > maxTickets || d.NextID < 0 {
 		return errors.New("invalid cache state")
 	}
+	for tenant, resolved := range d.ResolvedTeams {
+		if s.config.Buckets == nil || tenant <= 0 || tenant > 4294967295 || !resolved {
+			return errors.New("invalid resolved cache team")
+		}
+		s.resolvedTeams[tenant] = true
+	}
 	for tenant, team := range d.CheckpointTeams {
 		if s.config.Buckets == nil || tenant <= 0 || tenant > 4294967295 || !validNamespace(team.Namespace, prefix) || team.NextObjectID <= 0 {
 			return errors.New("invalid cache team namespace")
 		}
+		s.resolvedTeams[tenant] = true
 	}
 	s.namespace, s.nextID, s.checkpointTeams = d.Namespace, d.NextID, d.CheckpointTeams
 	seenObjects := make(map[string]bool)
@@ -150,7 +159,15 @@ func (s *Server) recover() error {
 		}
 		tenant, _ := repositoryTenant(v.Repository)
 		objectLimit := max(d.NextID, d.CheckpointTeams[tenant].NextObjectID)
-		if !s.validDiskEntry(v, d.NextID, s.objectKey(v.Repository, objectID)) || objectID <= 0 || objectID > objectLimit || s.entries[v.ID] != nil || v.Object != "" && seenObjects[v.Object] {
+		object := s.objectKey(v.Repository, objectID)
+		if v.ObjectNamespace != "" {
+			if s.config.Buckets == nil || tenant == 0 || !validNamespace(v.ObjectNamespace, "managed/") || v.ObjectID == 0 || v.Object == "" {
+				return errors.New("invalid cache entry namespace")
+			}
+			object = managedObjectKey(v.ObjectNamespace, tenant, objectID)
+			objectLimit = objectID
+		}
+		if !s.validDiskEntry(v, d.NextID, object) || objectID <= 0 || objectID > objectLimit || s.entries[v.ID] != nil || v.Object != "" && seenObjects[v.Object] {
 			return errors.New("invalid cache entry")
 		}
 		seenObjects[v.Object] = true
@@ -234,9 +251,16 @@ func (s *Server) persist() error {
 	if s.stateErr != nil {
 		return s.stateErr
 	}
-	d := diskState{Version: 1, Storage: s.storage(), PublicOrigin: s.config.PublicOrigin, Namespace: s.namespace, NextID: s.nextID, CheckpointTeams: s.checkpointTeams, Tickets: make(map[string]diskTicket)}
+	d := diskState{Version: 1, Storage: s.storage(), PublicOrigin: s.config.PublicOrigin, Namespace: s.namespace, NextID: s.nextID, CheckpointTeams: s.checkpointTeams, ResolvedTeams: s.resolvedTeams, Tickets: make(map[string]diskTicket)}
 	for _, e := range s.entries {
-		d.Entries = append(d.Entries, e.diskEntry())
+		v := e.diskEntry()
+		if tenant, _ := repositoryTenant(e.repository); tenant != 0 && v.Object != "" {
+			namespace, _ := managedObjectScope(v.Object)
+			if namespace != s.teamNamespace(tenant) {
+				v.ObjectNamespace = namespace
+			}
+		}
+		d.Entries = append(d.Entries, v)
 	}
 	for k, v := range s.tickets {
 		tenant := v.tenant
