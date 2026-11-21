@@ -419,25 +419,58 @@ func TestCacheHostSharesResolutionAndBoundsConnections(t *testing.T) {
 	if refused := strings.Count(host.logsText(), `"event":"confirm_refused"`); refused != 1 {
 		t.Fatal("confirmations run:", refused)
 	}
-	var held []net.Conn
+
+	t.Run("connection limit", checkCacheHostSetupConnectionLimit)
+}
+
+func checkCacheHostSetupConnectionLimit(t *testing.T) {
+	test := newAuthorityCase(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	entered := make(chan struct{}, cacheHostSlots[1026])
+	host := startCacheHostFixture(t, test, func(host *cacheHost) {
+		host.peer = func(net.Conn) (*unix.Ucred, error) {
+			// Authentication runs with a slot held. Block here so the socket
+			// I/O deadline cannot free the slot while we check rejection.
+			entered <- struct{}{}
+			<-ctx.Done()
+			return nil, grant.ErrInvalid
+		}
+	})
+	dialer := net.Dialer{}
 	for range cacheHostSlots[1026] {
-		conn, err := net.Dial("unix", host.uds+"_1026")
+		conn, err := dialer.DialContext(ctx, "unix", host.uds+"_1026")
 		if err != nil {
 			t.Fatal(err)
 		}
-		held = append(held, conn)
+		t.Cleanup(func() { conn.Close() })
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(conn).Encode(test.setup); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal("setup did not reach authentication:", ctx.Err())
+		}
 	}
-	time.Sleep(50 * time.Millisecond)
-	extra, err := net.Dial("unix", host.uds+"_1026")
+	extra, err := dialer.DialContext(ctx, "unix", host.uds+"_1026")
 	if err != nil {
 		t.Fatal(err)
 	}
-	extra.SetReadDeadline(time.Now().Add(time.Second))
+	defer extra.Close()
+	if err := extra.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatal("connection beyond the setup slots was not closed", err)
 	}
-	for _, conn := range append(held, extra) {
-		conn.Close()
+	// An admitted connection would also close after its setup read timed out.
+	if strings.Contains(host.logsText(), `"event":"setup_malformed"`) {
+		t.Fatal("connection beyond the setup slots reached the setup handler")
 	}
 }
 
