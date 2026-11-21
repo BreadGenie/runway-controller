@@ -6,7 +6,51 @@ one-click template with a pinned HTTPS URL and SHA-256 for the tarball from
 Use 20 GiB or more in production for cache-data state and spools. Each Team's objects live in its Cargo
 bucket.
 
-## Create and enrol
+## Reconcile on the controller host
+
+1. Migrate the Runway site and create a **Runway Region** record matching each
+   configured region. Give a dedicated local API user only the **Runway Cache
+   Provisioner** role. Save its Frappe `api_key:api_secret` in a root-owned
+   mode-0600 file. Save the regional Atlas operator bearer token in a separate
+   root-owned mode-0600 file on the controller host. The service rereads these
+   files on each request.
+2. Install [the example config](../deploy/regional-cache/cache-reconcile.example.json)
+   as `/etc/runway/cache-reconcile.json`, owned by root with mode 0600. Set the
+   Runway and Atlas HTTPS origins, image ID and VM shape for each region. Keep
+   the mesh-only firewall in the example. For private TLS trust, set
+   `runway_site_ca_base64` or `runway_storage_ca_base64` to the base64-encoded
+   public PEM bundle. The former also configures the reconciler's trust in
+   the Runway site.
+3. Install [runway-cache-reconcile.service](../deploy/regional-cache/systemd/runway-cache-reconcile.service)
+   on the controller host and enable it with
+   `systemctl enable --now runway-cache-reconcile.service`. Install the service
+   on one controller host and preserve its state directory across restarts.
+   For a custom `state_dir`, create the directory with root ownership and mode 0700.
+4. Confirm that Runway Region lists the VM's mesh endpoint and public CA and
+   that the token is consumed. Enable regional cache on the pool. See
+   [monitoring](monitoring.md) for the reconcile metrics.
+
+The service tags its VMs with `role=runway-cache`, `region=<region>` and a
+unique attempt ID. It waits two minutes for an unconfirmed create to become
+visible. If enrolment takes longer than ten minutes or the VM goes down or
+drifts from its configured shape, it revokes the cache credential, terminates
+the journalled VM, and waits for Atlas to confirm absence before creating
+again. During replacement jobs can fall back to GitHub's cache.
+
+If duplicate tagged VMs appear, the service reports `duplicate_vms` and
+pauses writes for the region. Check the journal for the tracked VM and resolve
+the duplicate in Atlas. An existing manually managed VM or enrolment requires
+operator migration. Revoke and terminate the manual VM, confirm absence, then
+start the service. Stop the reconciler before manually changing the region's
+enrolment or switching its Runway or Atlas origin. Atlas and Metal receive the
+one-use token in cloud-init user data. Treat access to that user data as
+sensitive until the token is consumed or expires.
+
+## Manual fallback
+
+Stop the reconciler for the region before using the manual procedure.
+
+### Create and enrol
 
 1. On the Runway site, create the **Runway Region** record matching the pool's
    region name. As System Manager, select **Issue Cache Enrolment Token**. The
@@ -44,7 +88,7 @@ bucket.
    pointing to compatible helpers on the controller. Add them to the controller
    configuration's `transport_command`. They apply during cache-enabled preparation.
 
-## Rotate, revoke or replace
+### Rotate, revoke or replace
 
 Run `sudo runway-controller --action cache-service-rotate --config /etc/runway/cache-service.json`
 on the cache VM. If the reply is interrupted, repeat the same command. Both

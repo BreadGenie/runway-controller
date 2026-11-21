@@ -51,7 +51,17 @@ Assignment and verification workers wake the serialized engine when their result
 Use the local Vector instance on the controller host, including when that
 host is operator-managed. Use a regional Datum write token scoped to a stable,
 unique controller resource ID. Keep the token in the Vector service
-environment. For the operator-managed cache VM, configure a local collector separately.
+environment. Configure a local collector for the managed cache VM separately.
+
+Set `metrics_listen` in the controller host's cache-reconcile configuration
+to a loopback address such as `127.0.0.1:18448` to scrape `/metrics`.
+
+| Metric | Meaning |
+|---|---|
+| `runway_cache_reconcile_current_vm` | The journalled VM for the region, including while its deletion is pending. |
+| `runway_cache_reconcile_attempts_total` | Create attempts recorded before Atlas submission. |
+| `runway_cache_reconcile_replacements_total` | Replacement sequences started by the reconciler. |
+| `runway_cache_reconcile_last_error` | Error class from the latest reconciliation for the region, or `none` after a successful pass. |
 
 ```yaml
 sources:

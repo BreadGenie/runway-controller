@@ -36,8 +36,8 @@ func main() {
 }
 
 func run() error {
-	action := flag.String("action", "", "create, lookup, jit, listen, controller, cache-data, cache-service, cache-host, cache-assignments, or delete (all except lookup and cache-* modify GitHub)")
-	config := flag.String("config", "", "private configuration JSON for controller, cache-data, cache-service, cache-host, or cache-assignments")
+	action := flag.String("action", "", "create, lookup, jit, listen, controller, cache-data, cache-service, cache-host, cache-assignments, cache-reconcile, or delete (all except lookup and cache-* modify GitHub)")
+	config := flag.String("config", "", "private configuration JSON for controller, cache-data, cache-service, cache-host, cache-assignments, or cache-reconcile")
 	vmID := flag.String("vm-id", "", "standalone VM whose vsock sockets cache-host serves")
 	url := flag.String("url", "", "https://github.com/OWNER/REPO; repository scope only")
 	name := flag.String("name", "", "runway-prefixed scale-set name for create/lookup; runner name for jit/listen")
@@ -46,6 +46,15 @@ func run() error {
 	journal := flag.String("journal", "", "durable single-job journal for listen; parent directory must be private")
 	timeout := flag.Duration("timeout", 20*time.Minute, "maximum listener duration")
 	flag.Parse()
+	if *action == "cache-reconcile" {
+		if flag.NArg() != 0 {
+			return errors.New("cache-reconcile accepts no positional arguments")
+		}
+		if *config == "" {
+			*config = "/etc/runway/cache-reconcile.json"
+		}
+		return runCacheReconcile(*config)
+	}
 	if *action == "cache-service-enrol" || *action == "cache-service-rotate" {
 		if *config == "" || flag.NArg() != 0 {
 			return errors.New("cache credential management requires --config")
